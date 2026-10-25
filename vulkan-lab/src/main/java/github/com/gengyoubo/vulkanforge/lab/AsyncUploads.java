@@ -39,6 +39,14 @@ final class AsyncUploads implements AutoCloseable {
         } catch (Throwable error) { close(); throw error; }
     }
 
+    /** Nonblocking admission for interactive updates; callers keep their dirty state and retry on the next frame. */
+    boolean available(int count, long bytes) {
+        poll();
+        if (count > SLOTS || (pendingBytes != 0 && pendingBytes + bytes > BYTE_BUDGET)) return false;
+        for (int i = 0; i < count; i++) if (slots[(cursor + i) % SLOTS].ticket > completed) return false;
+        return true;
+    }
+
     long submit(byte[] data, Recorder recorder) {
         poll();
         Slot slot = slots[cursor];

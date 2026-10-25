@@ -26,7 +26,7 @@ public final class WorldClientSmoke {
     private static int stage, ticks, firstHash;
     private static long firstEpoch;
     private static double dayBrightness, nightBrightness;
-    private static long lightBaseline, glyphBaseline;
+    private static long lightBaseline, glyphBaseline, movingBuilds;
     private static int originalWidth, originalHeight, swapchainBaseline;
     private static long minimizedFrames, screenBaseline;
     private static long bridgeLaunches;
@@ -35,7 +35,7 @@ public final class WorldClientSmoke {
 
     @SubscribeEvent public static void glyphs(net.minecraftforge.client.event.ScreenEvent.Render.Post event) {
         if (Boolean.getBoolean("vulkanforge.worldSmoke") && (stage == 40 || stage == 41) && ticks > 10) {
-            event.getGuiGraphics().drawString(Minecraft.getInstance().font, "P11 ¶¯Ì¬×ÖÐÎ ¦¸ §¨ ¤¢ h", 8, 8, -1);
+            event.getGuiGraphics().drawString(Minecraft.getInstance().font, "P11 åŠ¨æ€å­—å½¢ Î© Ð– ã‚ æ¼¢", 8, 8, -1);
         }
     }
 
@@ -190,8 +190,22 @@ public final class WorldClientSmoke {
                 stage = 41; ticks = 0;
             } else if (stage == 41 && ++ticks > 5) {
                 verifyCapture(report.resolve("inventory-swapchain.png"), mc.getWindow().getWidth(), mc.getWindow().getHeight());
-                mc.setScreen(null);
-                stage = 4; ticks = 0;
+                mc.setScreen(null); movingBuilds = VulkanPreview.rebuiltSections();
+                stage = 42; ticks = 0;
+            } else if (stage == 42) {
+                ticks++;
+                if (ticks % 12 == 0 && ticks <= 48) {
+                    double x = ticks == 48 ? .5 : ticks * 4 + .5;
+                    var server = mc.getSingleplayerServer(); var uuid = mc.player.getUUID();
+                    server.execute(() -> server.getPlayerList().getPlayer(uuid).teleportTo(server.overworld(), x, 68, 9, 130, 18));
+                }
+                if (ticks > 110 && VulkanPreview.capturedSections() == 45) {
+                    require(VulkanPreview.rebuiltSections() > movingBuilds, "Movement did not schedule new section captures");
+                    long[] schedule = VulkanPreview.schedulerStats();
+                    require(schedule[5] > 1, "Empty sections are still throttled to one per frame");
+                    log("PASS fast movement rebuild scheduling: " + java.util.Arrays.toString(schedule));
+                    stage = 4; ticks = 0;
+                }
             } else if (stage == 4 && ++ticks > 60) {
                 require(VulkanPreview.saveWorldFrame(report.resolve("camera.png")) != firstHash, "Camera rotation did not change Vulkan frame");
                 log("PASS camera rotation");
@@ -332,6 +346,8 @@ public final class WorldClientSmoke {
             require(VulkanPreview.directWorld() && OffscreenBridge.launches() == bridgeLaunches, "Terrain switched back to the RGBA subprocess");
             require(NativeMainWindow.acquiresBeforeInput() > NativeMainWindow.presentedFrames() * .9,
                     "Most acquisitions still happen after camera rendering");
+            log("PASS memory pool: " + java.util.Arrays.toString(NativeMainWindow.memoryStats()));
+            log("PASS GUI descriptor/batch counters: " + java.util.Arrays.toString(NativeMainWindow.guiBindingStats()));
             log("PASS acquire before input=" + NativeMainWindow.acquiresBeforeInput() + ", fallback acquire after render=" + NativeMainWindow.acquiresAfterRender());
         }
         log("STATUS=OK"); stage = 99;

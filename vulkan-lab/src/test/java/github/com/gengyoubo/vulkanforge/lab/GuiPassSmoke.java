@@ -38,6 +38,11 @@ final class GuiPassSmoke {
         image = ImageIO.read(third.toFile());
         near(image.getRGB(320, 240), 0, 0, 255, "HUD -> screen depth clear");
         if (backend.guiPasses() < 3) throw new AssertionError("GUI did not draw after blit");
+        long[] bindings = backend.guiBindingStats();
+        if (bindings[4] == 0) throw new AssertionError("Compatible adjacent GUI draws were not batched");
+        if (backend.pushDescriptorsEnabled() && (bindings[0] > 2 || bindings[1] == 0 || bindings[2] > 2))
+            throw new AssertionError("Vulkan 1.4 push descriptors / persistent uniform descriptors not exercised: " + java.util.Arrays.toString(bindings));
+        System.out.println("GUI_BINDING_SMOKE=OK " + java.util.Arrays.toString(bindings));
         System.out.println("GUI_SWAPCHAIN_SMOKE=OK (alpha, scissor, depth, depth clear, incremental texture patch, no world renderer)");
     }
     private static Object[] quad(int format, int variant, int flags, int texture, int color, float z) {

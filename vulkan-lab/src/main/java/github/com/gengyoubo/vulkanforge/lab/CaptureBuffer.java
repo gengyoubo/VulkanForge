@@ -46,11 +46,8 @@ final class CaptureBuffer implements AutoCloseable {
         vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pBufferMemoryBarriers(host));
     }
     void save(String path, int width, int height, int format) throws IOException {
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            var pointer = stack.mallocPointer(1);
-            check(vkMapMemory(storage.context.device, storage.memory, 0, size, 0, pointer), "map swapchain screenshot");
-            try {
-                var data = MemoryUtil.memByteBuffer(pointer.get(0), size);
+        {
+                var data = storage.hostView(size);
                 var image = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
                 boolean bgra = format == VK_FORMAT_B8G8R8A8_UNORM;
                 for (int y = 0; y < height; y++) for (int x = 0; x < width; x++) {
@@ -60,7 +57,6 @@ final class CaptureBuffer implements AutoCloseable {
                 }
                 Path target = Path.of(path).toAbsolutePath(); Files.createDirectories(target.getParent());
                 ImageIO.write(image, "png", target.toFile());
-            } finally { vkUnmapMemory(storage.context.device, storage.memory); }
         }
     }
     @Override public void close() { storage.close(); }

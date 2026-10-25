@@ -61,5 +61,13 @@ tasks.register('smokePresent', JavaExec) {
     if (rootProject.hasProperty('legacyGpuSmoke')) {
         systemProperty 'vulkanforge.disableGpuDriven', 'true'
         systemProperty 'vulkanforge.disableUploadTimeline', 'true'
+        systemProperty 'vulkanforge.disablePushDescriptors', 'true'
     }
+}
+
+tasks.register('smokeResources', JavaExec) {
+    dependsOn 'testClasses'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.lab.ResourceSmoke'
+    if (rootProject.hasProperty('validationSmoke')) systemProperty 'vulkanforge.requireValidation', 'true'
 }

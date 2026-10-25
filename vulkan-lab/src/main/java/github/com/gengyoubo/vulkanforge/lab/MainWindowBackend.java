@@ -98,6 +98,7 @@ public final class MainWindowBackend implements AutoCloseable {
     public long lateAcquires() { return lateAcquires; }
     public boolean gpuDrivenEnabled() { return world != null && world.gpuDrivenEnabled(); }
     public long[] optimizationStats() { return world == null ? new long[4] : world.optimizationStats(); }
+    public long[] memoryStats() { return context.memory.stats(); }
     public long[] uploadStats() { return context.uploads.stats(); }
     public int validationErrors() { return context.validationErrors(); }
     public boolean gpuTimingsEnabled() { return timers != null && timers.enabled(); }
@@ -108,6 +109,14 @@ public final class MainWindowBackend implements AutoCloseable {
     public Consumer<Object[]> worldCommands(Function<long[], Consumer<int[]>> terrainImporter) {
         this.terrainImporter = terrainImporter;
         return packet -> world().apply(dev.vulkanforge.bridge.WorldProtocol.unpack(packet));
+    }
+    public boolean tryWorldCommand(Object[] packet) {
+        var command = dev.vulkanforge.bridge.WorldProtocol.unpack(packet);
+        int count = 0; long bytes = 0;
+        if (command instanceof dev.vulkanforge.bridge.WorldProtocol.TexturePatch patch) { count = 1; bytes = patch.rgba().length; }
+        if (command instanceof dev.vulkanforge.bridge.WorldProtocol.Mesh mesh && mesh.vertices().length > 0) { count = 2; bytes = mesh.vertices().length; }
+        if (count > 0 && !context.uploads.available(count, bytes)) return false;
+        world().apply(command); return true;
     }
     private SharedWorldRenderer world() {
         if (world == null) {
@@ -130,6 +139,8 @@ public final class MainWindowBackend implements AutoCloseable {
         for (Object packet : packets) list.add((Object[]) packet);
         guiPackets = list;
     }
+    public long[] guiBindingStats() { return gui == null ? new long[5] : gui.bindingStats(); }
+    public boolean pushDescriptorsEnabled() { return context.pushDescriptors; }
     public long guiPasses() { return gui == null ? 0 : gui.passes(); }
     public long[] worldStats() { return world == null ? new long[25] : world.stats(); }
     /** P7-P9: packets are EntityPass Object[]s; returns {color, depth} GL textures leased until finishOverlay, or null. */
@@ -145,14 +156,14 @@ public final class MainWindowBackend implements AutoCloseable {
     public void finishOverlay() { if (world != null) world.finishOverlay(); }
     /** {Integer glId, Integer width, Integer height, Integer flags, byte[] rgba}; false when no world renderer exists. */
     public boolean entityTexture(Object[] texture) {
-        if (gui == null) return false;
+        if (gui == null || !context.uploads.available(world == null ? 1 : 2, ((byte[]) texture[4]).length * (world == null ? 1L : 2L))) return false;
         gui.texture(texture);
         mirroredTextures.put((Integer) texture[0], texture.clone());
         if (world != null) world.entityTexture((Integer) texture[0], (Integer) texture[1], (Integer) texture[2], (Integer) texture[3], (byte[]) texture[4]);
         return true;
     }
     public boolean entityTexturePatch(Object[] patch) {
-        if (gui == null) return false;
+        if (gui == null || !context.uploads.available(world == null ? 1 : 2, ((byte[]) patch[5]).length * (world == null ? 1L : 2L))) return false;
         gui.patch(patch);
         Object[] texture = mirroredTextures.get((Integer) patch[0]);
         byte[] pixels = ((byte[]) texture[4]).clone(), data = (byte[]) patch[5];
@@ -396,7 +407,7 @@ public final class MainWindowBackend implements AutoCloseable {
             closeWorld();
             finishGL.run(); drainAcquired(); check(vkDeviceWaitIdle(context.device), "wait presentation shutdown");
             if (timers != null) { timers.collectAll(); timers.report(this::log); timers.close(); }
-            if (gui != null) { log("GUI_SWAPCHAIN_PASSES=" + gui.passes()); gui.close(); gui = null; }
+            if (gui != null) { log("GUI_SWAPCHAIN_PASSES=" + gui.passes()); log("GUI_BINDINGS=" + java.util.Arrays.toString(gui.bindingStats())); gui.close(); gui = null; }
             destroySwapchain();
             if (pool != 0) { vkDestroyCommandPool(context.device, pool, null); pool = 0; }
             for (FrameSlot slot : slots) {
@@ -413,6 +424,7 @@ public final class MainWindowBackend implements AutoCloseable {
         if (skippedExtents > 0 || abandonedFrames > 0) log("ZERO_EXTENT_FRAMES=" + skippedExtents + " ABANDONED_FRAMES=" + abandonedFrames);
         log("PRESENT_GRAPH passes=" + graphPasses + " imageBarriers=" + graphBarriers);
         if (context.uploads != null) log("ASYNC_UPLOADS=" + java.util.Arrays.toString(context.uploads.stats()));
+        if (context.memory != null) log("GPU_MEMORY=" + java.util.Arrays.toString(context.memory.stats()));
         context.close(); log("FINAL_PRESENTED_FRAMES=" + frames); log("VALIDATION_ERRORS=" + context.validationErrors());
         if (report != null) { report.close(); report = null; }
     }

@@ -417,6 +417,7 @@ final class SharedWorldRenderer implements AutoCloseable {
         log.accept("WORLD_RGBA_READBACK_BYTES=0");
         if (entities != null) {
             long[] entity = entities.stats();
+            log.accept("WORLD_BINDINGS=" + java.util.Arrays.toString(entities.bindingStats()));
             log.accept("WORLD_OVERLAYS passes=" + overlayPasses + " skyDraws=" + skyDraws + " draws=" + entity[0] + " vertices=" + entity[1] + " textures=" + entity[2] + " uploads=" + entity[3] + " missingTextures=" + entity[4]);
             entities.close(); entities = null;
         }

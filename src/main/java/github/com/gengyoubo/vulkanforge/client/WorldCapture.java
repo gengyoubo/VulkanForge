@@ -35,8 +35,18 @@ final class WorldCapture {
     private long completedBuilds;
     private final BufferBuilder builder = new BufferBuilder(262144), translucentBuilder = new BufferBuilder(65536);
     private ClientLevel level;
-    private long epoch, nextBuild;
-    private int cursor, textureCursor;
+    private long epoch;
+    private int textureCursor;
+    private static final long FRAME_BUILD_BUDGET = 1_500_000L;
+    private List<SectionPos> wanted = List.of();
+    private final Set<Long> wantedKeys = new HashSet<>();
+    private final Map<Long, Long> queuedAt = new HashMap<>();
+    private int wantedX = Integer.MIN_VALUE, wantedY, wantedZ, wantedRadius;
+    private long cancelledBuilds, deferredPublishes, completedThisFrame, maxFrameBuildNanos, maxCompletedPerFrame;
+    private final long[] frameSamples = new long[1024];
+    private int frameSampleCount;
+    private SectionPos pendingSection;
+    private byte[][] pendingVertices;
     private boolean atlasSent;
     private TextureCapture.Snapshot atlasSnapshot;
     private byte[] lightSnapshot;
@@ -59,6 +69,7 @@ final class WorldCapture {
         final boolean empty;
         int next;
         boolean bufferOpen;
+        TriangleCopy opaqueCopy, translucentCopy;
         SectionBuild(SectionPos section) {
             this.section = section;
             states = level.getChunk(section.x(), section.z()).getSection(level.getSectionIndexFromSectionY(section.y()));
@@ -75,9 +86,19 @@ final class WorldCapture {
             builder.end().release(); builder.discard();
             translucentBuilder.end().release(); translucentBuilder.discard();
         }
+        if (build != null) {
+            if (build.opaqueCopy != null) build.opaqueCopy.close();
+            if (build.translucentCopy != null) build.translucentCopy.close();
+            cancelledBuilds++;
+        }
         build = null;
     }
 
+    long[] schedulerStats() {
+        long[] sample = Arrays.copyOf(frameSamples, Math.min(frameSampleCount, frameSamples.length)); Arrays.sort(sample);
+        long p95 = sample.length == 0 ? 0 : sample[(sample.length - 1) * 95 / 100];
+        return new long[]{completedBuilds, cancelledBuilds, deferredPublishes, queuedAt.size(), maxFrameBuildNanos, maxCompletedPerFrame, p95};
+    }
     long epoch() { return epoch; }
     int sections() { return sent.size(); }
     boolean covers(BlockPos origin) {
@@ -96,7 +117,8 @@ final class WorldCapture {
     long fluidBlocks() { return fluidBlocks; }
     void invalidate() { level = null; }
     void close() {
-        cancelBuild(); atlasReadback.close(); lightReadback.close(); invalidate();
+        cancelBuild(); pendingSection = null; pendingVertices = null; queuedAt.clear(); wanted = List.of(); wantedKeys.clear(); wantedX = Integer.MIN_VALUE;
+        atlasReadback.close(); lightReadback.close(); invalidate();
         if (buildSlices > 0) VulkanForge.LOGGER.info("Vulkan mesh capture slices={}, meanMs={}, maxMs={}", buildSlices,
                 buildNanos / (buildSlices * 1_000_000.0), maxBuildNanos / 1_000_000.0);
         buildSlices = buildNanos = maxBuildNanos = 0;
@@ -113,14 +135,17 @@ final class WorldCapture {
             atlasReadback.close(); lightReadback.close();
             level = mc.level;
             epoch = EPOCHS.incrementAndGet();
-            sent.clear(); valid.clear(); invalidated.clear(); dirty.clear(); cursor = 0; atlasSent = false;
+            sent.clear(); valid.clear(); invalidated.clear(); dirty.clear(); queuedAt.clear(); wantedX = Integer.MIN_VALUE;
+            pendingSection = null; pendingVertices = null; atlasSent = false;
             atlasSnapshot = null; lightSnapshot = null; nextTexturePoll = 0; cutoutBlocks = 0; translucentQuads = fluidBlocks = 0;
             textureCursor = 0;
             bridge.reset(epoch);
             VulkanForge.LOGGER.info("Vulkan world capture reset: epoch={}, dimension={}", epoch, level.dimension().location());
         }
         if (!atlasSent) {
-            var snapshot = TextureCapture.read(mc.getTextureManager().getTexture(InventoryMenu.BLOCK_ATLAS).getId());
+            atlasReadback.request(mc.getTextureManager().getTexture(InventoryMenu.BLOCK_ATLAS).getId());
+            var snapshot = atlasReadback.poll();
+            if (snapshot == null) return;
             atlasSent = bridge.send(new WorldProtocol.Atlas(epoch, snapshot.width(), snapshot.height(), snapshot.rgba()));
             if (!atlasSent) return;
             // Published packet bytes are immutable; keep a separate baseline for incremental patches.
@@ -137,13 +162,15 @@ final class WorldCapture {
         int sz = SectionPos.blockToSectionCoord((int) Math.floor(position.z));
         centerX = sx; centerY = sy; centerZ = sz;
         radius = Math.max(1, Math.min(4, (mc.options.renderDistance().get() + 3) / 8));
-        List<SectionPos> wanted = new ArrayList<>((radius * 2 + 1) * (radius * 2 + 1) * 5);
-        for (int x = sx - radius; x <= sx + radius; x++) for (int z = sz - radius; z <= sz + radius; z++) {
-            for (int y = Math.max(sy - 2, level.getMinSection()); y <= Math.min(sy + 2, level.getMaxSection() - 1); y++) wanted.add(SectionPos.of(x, y, z));
+        if (sx != wantedX || sy != wantedY || sz != wantedZ || radius != wantedRadius) {
+            List<SectionPos> nextWanted = new ArrayList<>((radius * 2 + 1) * (radius * 2 + 1) * 5);
+            for (int x = sx - radius; x <= sx + radius; x++) for (int z = sz - radius; z <= sz + radius; z++)
+                for (int y = Math.max(sy - 2, level.getMinSection()); y <= Math.min(sy + 2, level.getMaxSection() - 1); y++) nextWanted.add(SectionPos.of(x, y, z));
+            wanted = nextWanted; wantedKeys.clear(); for (SectionPos section : wanted) wantedKeys.add(section.asLong());
+            queuedAt.keySet().retainAll(wantedKeys);
+            wantedX = sx; wantedY = sy; wantedZ = sz; wantedRadius = radius;
         }
-        wanted.sort(Comparator.comparingDouble(p -> p.center().distToCenterSqr(position)));
-        Set<Long> keys = new HashSet<>();
-        for (SectionPos section : wanted) keys.add(section.asLong());
+        Set<Long> keys = wantedKeys;
         Iterator<Long> old = sent.keySet().iterator();
         while (old.hasNext()) {
             long key = old.next();
@@ -154,38 +181,61 @@ final class WorldCapture {
             valid.remove(key); invalidated.add(key);
         }
         if (build != null && (dirty.contains(build.section.asLong()) || !keys.contains(build.section.asLong()) || !level.hasChunk(build.section.x(), build.section.z()))) cancelBuild();
-        if (build == null) {
-            if (wanted.isEmpty() || System.nanoTime() < nextBuild) return;
-            nextBuild = System.nanoTime() + 50_000_000L;
-            SectionPos selected = null;
-            for (SectionPos section : wanted) if (dirty.contains(section.asLong()) && sent.containsKey(section.asLong()) && level.hasChunk(section.x(), section.z())) { selected = section; break; }
-            for (SectionPos section : wanted) {
-                if (selected == null && !sent.containsKey(section.asLong()) && level.hasChunk(section.x(), section.z())) { selected = section; break; }
+        if (pendingSection != null && (!keys.contains(pendingSection.asLong()) || dirty.contains(pendingSection.asLong())
+                || !level.hasChunk(pendingSection.x(), pendingSection.z()))) { pendingSection = null; pendingVertices = null; }
+        long frameStart = System.nanoTime(), deadline = frameStart + FRAME_BUILD_BUDGET;
+        completedThisFrame = 0;
+        while (completedThisFrame < 16 && System.nanoTime() < deadline) {
+            if (pendingSection != null) {
+                if (!publish(bridge, pendingSection, pendingVertices)) { deferredPublishes++; break; }
+                pendingSection = null; pendingVertices = null;
             }
-            if (selected == null) return;
-            if (!level.hasChunk(selected.x(), selected.z())) {
-                if (bridge.send(new WorldProtocol.Remove(epoch, selected.asLong()))) sent.remove(selected.asLong());
-                return;
+            if (build == null) {
+                SectionPos selected = select(event, frameStart);
+                if (selected == null) break;
+                dirty.remove(selected.asLong()); queuedAt.remove(selected.asLong()); build = new SectionBuild(selected);
             }
-            dirty.remove(selected.asLong());
-            build = new SectionBuild(selected);
+            SectionPos selected = build.section;
+            long start = System.nanoTime();
+            byte[][] vertices = captureSection(mc, build, deadline);
+            long elapsed = System.nanoTime() - start; buildSlices++; buildNanos += elapsed; maxBuildNanos = Math.max(maxBuildNanos, elapsed);
+            if (vertices == null) break;
+            build = null; completedBuilds++; completedThisFrame++;
+            if (dirty.contains(selected.asLong())) continue;
+            if (!publish(bridge, selected, vertices)) { pendingSection = selected; pendingVertices = vertices; deferredPublishes++; break; }
         }
-        SectionPos selected = build.section;
-        long start = System.nanoTime();
-        byte[][] vertices = captureSection(mc, build);
-        long elapsed = System.nanoTime() - start; buildSlices++; buildNanos += elapsed; maxBuildNanos = Math.max(maxBuildNanos, elapsed);
-        if (vertices == null) return;
-        build = null;
-        completedBuilds++;
-        if (dirty.contains(selected.asLong())) return;
-        if ((!valid.contains(selected.asLong()) || !Arrays.deepEquals(sent.get(selected.asLong()), vertices))
-                && bridge.send(new WorldProtocol.Mesh(epoch, selected.asLong(), selected.minBlockX(), selected.minBlockY(), selected.minBlockZ(), vertices[0], vertices[1]))) {
-            sent.put(selected.asLong(), vertices);
-            translucentQuads += vertices[1].length / (6 * WorldProtocol.STRIDE);
-            valid.add(selected.asLong()); invalidated.remove(selected.asLong());
-            if (sent.size() == 1 || sent.size() % 15 == 0) VulkanForge.LOGGER.info("Vulkan world mesh: sections={}, lastVertices={}, translucentVertices={}", sent.size(),
-                    vertices[0].length / WorldProtocol.STRIDE, vertices[1].length / WorldProtocol.STRIDE);
-        } else if (!valid.contains(selected.asLong())) dirty.add(selected.asLong());
+        long frameElapsed = System.nanoTime() - frameStart;
+        maxFrameBuildNanos = Math.max(maxFrameBuildNanos, frameElapsed); maxCompletedPerFrame = Math.max(maxCompletedPerFrame, completedThisFrame);
+        frameSamples[frameSampleCount++ % frameSamples.length] = frameElapsed;
+    }
+
+    /** Edits first, then visible nearby sections; age prevents offscreen work from starving. Missing chunks are never force-loaded. */
+    private SectionPos select(RenderLevelStageEvent event, long now) {
+        SectionPos best = null; double bestScore = Double.POSITIVE_INFINITY;
+        var position = event.getCamera().getPosition();
+        for (SectionPos section : wanted) {
+            long key = section.asLong();
+            if (valid.contains(key) && !dirty.contains(key)) { queuedAt.remove(key); continue; }
+            if (!level.hasChunk(section.x(), section.z())) continue;
+            long since = queuedAt.computeIfAbsent(key, ignored -> now);
+            boolean visible = event.getFrustum() == null || event.getFrustum().isVisible(new net.minecraft.world.phys.AABB(
+                    section.minBlockX(), section.minBlockY(), section.minBlockZ(), section.minBlockX() + 16, section.minBlockY() + 16, section.minBlockZ() + 16));
+            double score = section.center().distToCenterSqr(position) - Math.min(2_000_000, (now - since) / 10_000.0)
+                    - (dirty.contains(key) && sent.containsKey(key) ? 4_000_000 : visible ? 1_000_000 : 0);
+            if (score < bestScore) { best = section; bestScore = score; }
+        }
+        return best;
+    }
+
+    private boolean publish(WorldSink bridge, SectionPos selected, byte[][] vertices) {
+        long key = selected.asLong();
+        if (valid.contains(key) && Arrays.deepEquals(sent.get(key), vertices)) return true;
+        if (!bridge.send(new WorldProtocol.Mesh(epoch, key, selected.minBlockX(), selected.minBlockY(), selected.minBlockZ(), vertices[0], vertices[1]))) return false;
+        sent.put(key, vertices); valid.add(key); invalidated.remove(key); queuedAt.remove(key);
+        translucentQuads += vertices[1].length / (6 * WorldProtocol.STRIDE);
+        if (sent.size() == 1 || sent.size() % 15 == 0) VulkanForge.LOGGER.info("Vulkan world mesh: sections={}, lastVertices={}, translucentVertices={}", sent.size(),
+                vertices[0].length / WorldProtocol.STRIDE, vertices[1].length / WorldProtocol.STRIDE);
+        return true;
     }
 
     private boolean syncTextures(Minecraft mc, WorldSink bridge) {
@@ -228,12 +278,12 @@ final class WorldCapture {
     }
 
     /** Returns {opaque, translucent} triangle vertices, or null when the 1 ms slice ran out. */
-    private byte[][] captureSection(Minecraft mc, SectionBuild job) {
+    private byte[][] captureSection(Minecraft mc, SectionBuild job, long deadline) {
         if (job.empty) return new byte[][]{new byte[0], new byte[0]};
         SectionPos section = job.section;
         var states = job.states; var modelData = job.modelData;
         var poses = job.poses; var random = job.random; var pos = job.pos;
-        long deadline = System.nanoTime() + 1_000_000L;
+        if (job.opaqueCopy != null) return finishCopies(job, deadline);
         ModelBlockRenderer.enableCaching();
         BufferBuilder.RenderedBuffer rendered = null, translucent = null;
         try {
@@ -264,7 +314,9 @@ final class WorldCapture {
             }
             rendered = builder.end(); translucent = translucentBuilder.end();
             job.bufferOpen = false;
-            return new byte[][]{triangles(rendered), triangles(translucent)};
+            job.opaqueCopy = new TriangleCopy(rendered); rendered = null;
+            job.translucentCopy = new TriangleCopy(translucent); translucent = null;
+            return finishCopies(job, deadline);
         } finally {
             if (rendered != null) rendered.release();
             if (translucent != null) translucent.release();
@@ -274,21 +326,37 @@ final class WorldCapture {
 
     private static boolean opaque(RenderType type) { return type == RenderType.solid() || type == RenderType.cutout() || type == RenderType.cutoutMipped(); }
 
-    /** BLOCK-format quads -> 6 protocol vertices per quad (0,1,2 / 2,3,0). */
-    private static byte[] triangles(BufferBuilder.RenderedBuffer rendered) {
-        int vertices = rendered.drawState().vertexCount();
-        int stride = DefaultVertexFormat.BLOCK.getVertexSize();
-        if (vertices % 4 != 0 || (long) vertices / 4 * 6 * WorldProtocol.STRIDE > WorldProtocol.MAX_MESH_BYTES) throw new IllegalStateException("Invalid or oversized section mesh");
-        ByteBuffer input = rendered.vertexBuffer().order(ByteOrder.LITTLE_ENDIAN);
-        ByteBuffer output = ByteBuffer.allocate(vertices / 4 * 6 * WorldProtocol.STRIDE).order(ByteOrder.LITTLE_ENDIAN);
-        int[] corners = {0, 1, 2, 2, 3, 0};
-        for (int quad = 0; quad < vertices; quad += 4) for (int corner : corners) {
-            int offset = (quad + corner) * stride;
-            output.putFloat(input.getFloat(offset)).putFloat(input.getFloat(offset + 4)).putFloat(input.getFloat(offset + 8));
-            output.putInt(input.getInt(offset + 12));
-            output.putFloat(input.getFloat(offset + 16)).putFloat(input.getFloat(offset + 20));
-            output.putShort(input.getShort(offset + 24)).putShort(input.getShort(offset + 26));
+    private byte[][] finishCopies(SectionBuild job, long deadline) {
+        if (!job.opaqueCopy.step(deadline) || !job.translucentCopy.step(deadline)) return null;
+        byte[][] result = {job.opaqueCopy.output.array(), job.translucentCopy.output.array()};
+        job.opaqueCopy.close(); job.translucentCopy.close();
+        return result;
+    }
+
+    /** Incremental conversion also stays inside the frame budget; each original buffer belongs exclusively to this build. */
+    private static final class TriangleCopy implements AutoCloseable {
+        final BufferBuilder.RenderedBuffer rendered;
+        final ByteBuffer input, output;
+        final int vertices, stride = DefaultVertexFormat.BLOCK.getVertexSize();
+        int quad;
+        boolean released;
+        TriangleCopy(BufferBuilder.RenderedBuffer rendered) {
+            this.rendered = rendered; vertices = rendered.drawState().vertexCount(); input = rendered.vertexBuffer();
+            if (vertices % 4 != 0 || (long) vertices / 4 * 6 * WorldProtocol.STRIDE > WorldProtocol.MAX_MESH_BYTES) throw new IllegalStateException("Invalid or oversized section mesh");
+            output = ByteBuffer.allocate(vertices / 4 * 6 * WorldProtocol.STRIDE);
         }
-        return output.array();
+        boolean step(long deadline) {
+            int[] corners = {0, 1, 2, 2, 3, 0};
+            while (quad < vertices) {
+                if ((quad & 255) == 0 && System.nanoTime() >= deadline) return false;
+                for (int corner : corners) {
+                    output.put(output.position(), input, (quad + corner) * stride, WorldProtocol.STRIDE);
+                    output.position(output.position() + WorldProtocol.STRIDE);
+                }
+                quad += 4;
+            }
+            return true;
+        }
+        @Override public void close() { if (!released) { rendered.release(); released = true; } }
     }
 }

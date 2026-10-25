@@ -28,6 +28,7 @@ final class GuiPass implements AutoCloseable {
         this.frame = frame;
         while (!retired.isEmpty() && retired.peek().getKey() <= frame) retired.remove().getValue().run();
     }
+    long[] bindingStats() { return draws.bindingStats(); }
     long passes() { return passes; }
 
     void record(VkCommandBuffer command, MemoryStack stack, int slot, long view, int width, int height, List<Object[]> packets) {

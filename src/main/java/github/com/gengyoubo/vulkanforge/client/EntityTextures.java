@@ -70,7 +70,7 @@ final class EntityTextures {
             if (sent) {
                 if (entry.sent) { revalidations++; if (entry.version > 0) glyphPatches++; }
                 entry.sent = true; entry.sentVersion = entry.version; entry.width = snapshot.width(); entry.height = snapshot.height(); entry.rgba = snapshot.rgba(); uploads++;
-            }
+            } else entry.nextCheck = 0;
         }
         for (var item : entries.entrySet()) {
             if (inFlight >= MAX_READBACKS) break;

@@ -137,6 +137,7 @@ final class VulkanPreview {
     static void toggleInset() { inset = !inset; }
     static long worldEpoch() { return uploadedEpoch == WORLD.epoch() ? uploadedEpoch : 0; }
     static int capturedSections() { return WORLD.sections(); }
+    static long[] schedulerStats() { return WORLD.schedulerStats(); }
     static long rebuiltSections() { return WORLD.builds(); }
     static long atlasPatches() { return WORLD.atlasPatches(); }
     static long lightUpdates() { return WORLD.lightUpdates(); }

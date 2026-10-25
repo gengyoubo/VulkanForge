@@ -24,7 +24,7 @@ public final class NativeMainWindow {
     private static Object backend;
     private static boolean revealed;
     private static Method present, beginFrame, setVsync, frames, generations, capture, close, earlyAcquires, lateAcquires;
-    private static Method renderWorld, renderWorldWithSky, worldStats, finishWorldFrame, closeWorld, renderOverlay, finishOverlay, entityTexture, entityTexturePatch, gui, guiPasses, optimizationStats, uploadStats;
+    private static Method renderWorld, renderWorldWithSky, worldStats, finishWorldFrame, closeWorld, renderOverlay, finishOverlay, entityTexture, entityTexturePatch, gui, guiPasses, optimizationStats, uploadStats, tryWorldCommand, memoryStats, guiBindingStats;
     private static Consumer<Object[]> worldCommands;
 
     private NativeMainWindow() { }
@@ -54,6 +54,8 @@ public final class NativeMainWindow {
             renderWorldWithSky = type.getMethod("renderWorldWithSky", int.class, int.class, Object[].class);
             finishWorldFrame = type.getMethod("finishWorldFrame"); closeWorld = type.getMethod("closeWorld");
             renderOverlay = type.getMethod("renderOverlay", Object[].class, boolean.class); finishOverlay = type.getMethod("finishOverlay");
+            memoryStats = type.getMethod("memoryStats"); guiBindingStats = type.getMethod("guiBindingStats");
+            tryWorldCommand = type.getMethod("tryWorldCommand", Object[].class);
             optimizationStats = type.getMethod("optimizationStats"); uploadStats = type.getMethod("uploadStats");
             gui = type.getMethod("gui", Object[].class); guiPasses = type.getMethod("guiPasses");
             entityTexture = type.getMethod("entityTexture", Object[].class);
@@ -136,13 +138,15 @@ public final class NativeMainWindow {
         }
     }
 
+    static long[] memoryStats() { return active() ? (long[]) call(memoryStats) : new long[5]; }
+    static long[] guiBindingStats() { return active() ? (long[]) call(guiBindingStats) : new long[5]; }
     static long[] optimizationStats() { return active() ? (long[]) call(optimizationStats) : new long[4]; }
     static long[] uploadStats() { return active() ? (long[]) call(uploadStats) : new long[5]; }
     static long guiPasses() { return active() ? ((Number) call(guiPasses)).longValue() : 0; }
     public static long presentedFrames() { return active() ? ((Number) call(frames)).longValue() : 0; }
     static boolean sendWorld(dev.vulkanforge.bridge.WorldProtocol.Command command) {
         if (!active()) return false;
-        worldCommands.accept(dev.vulkanforge.bridge.WorldProtocol.pack(command)); return true;
+        return (Boolean) call(tryWorldCommand, (Object) dev.vulkanforge.bridge.WorldProtocol.pack(command));
     }
     static int renderWorld(int width, int height) { return active() ? ((Number)call(renderWorld, width, height)).intValue() : 0; }
     /** P10: captured sky packets are drawn under the terrain in the same submit. */
@@ -182,7 +186,7 @@ public final class NativeMainWindow {
         catch (Throwable error) { LOGGER.error("Could not close Vulkan main-window resources", cause(error)); }
         finally {
             backend = null; present = beginFrame = setVsync = frames = generations = capture = close = earlyAcquires = lateAcquires = null;
-            renderWorld = renderWorldWithSky = worldStats = finishWorldFrame = closeWorld = renderOverlay = finishOverlay = entityTexture = entityTexturePatch = gui = guiPasses = optimizationStats = uploadStats = null; worldCommands = null;
+            renderWorld = renderWorldWithSky = worldStats = finishWorldFrame = closeWorld = renderOverlay = finishOverlay = entityTexture = entityTexturePatch = gui = guiPasses = optimizationStats = uploadStats = tryWorldCommand = memoryStats = guiBindingStats = null; worldCommands = null;
             try { if (loader != null) loader.close(); } catch (Exception error) { LOGGER.warn("Could not close backend loader", error); }
             loader = null;
         }

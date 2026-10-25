@@ -9,11 +9,12 @@ import static github.com.gengyoubo.vulkanforge.lab.VulkanContext.check;
 final class GpuBuffer implements AutoCloseable {
     final VulkanContext context;
     long buffer, memory;
+    private GpuMemory.Allocation allocation;
     java.nio.ByteBuffer mapped;
     GpuBuffer(VulkanContext context, byte[] bytes, int usage) {
         this(context, bytes.length, usage);
         mapped.put(bytes).clear();
-        vkUnmapMemory(context.device, memory); mapped = null;
+        mapped = null;
     }
     GpuBuffer(VulkanContext context, int capacity, int usage) {
         this(context, capacity, usage, true);
@@ -24,18 +25,15 @@ final class GpuBuffer implements AutoCloseable {
             var handle = stack.mallocLong(1);
             var info = VkBufferCreateInfo.calloc(stack).sType$Default().size(capacity).usage(usage).sharingMode(VK_SHARING_MODE_EXCLUSIVE);
             check(vkCreateBuffer(context.device, info, null, handle), "vkCreateBuffer(world)"); buffer = handle.get(0);
-            var requirements = VkMemoryRequirements.calloc(stack);
-            vkGetBufferMemoryRequirements(context.device, buffer, requirements);
-            var allocation = VkMemoryAllocateInfo.calloc(stack).sType$Default().allocationSize(requirements.size())
-                    .memoryTypeIndex(memoryType(context, stack, requirements.memoryTypeBits(), hostVisible
-                            ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
-            check(vkAllocateMemory(context.device, allocation, null, handle), "vkAllocateMemory(world buffer)"); memory = handle.get(0);
-            check(vkBindBufferMemory(context.device, buffer, memory, 0), "vkBindBufferMemory(world)");
-            if (hostVisible) {
-                var pointer = stack.mallocPointer(1);
-                check(vkMapMemory(context.device, memory, 0, capacity, 0, pointer), "vkMapMemory(world)");
-                mapped = org.lwjgl.system.MemoryUtil.memByteBuffer(pointer.get(0), capacity).order(java.nio.ByteOrder.nativeOrder());
-            }
+            var dedicated = VkMemoryDedicatedRequirements.calloc(stack).sType$Default();
+            var requirements = VkMemoryRequirements2.calloc(stack).sType$Default().pNext(dedicated.address());
+            org.lwjgl.vulkan.VK11.vkGetBufferMemoryRequirements2(context.device, VkBufferMemoryRequirementsInfo2.calloc(stack).sType$Default().buffer(buffer), requirements);
+            allocation = context.memory.allocate(requirements.memoryRequirements(), hostVisible
+                    ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                    false, 0, dedicated.requiresDedicatedAllocation() ? buffer : 0);
+            memory = allocation.memory();
+            check(vkBindBufferMemory(context.device, buffer, memory, allocation.offset), "bind pooled GPU buffer");
+            if (hostVisible) mapped = allocation.mapped(capacity);
         } catch (Throwable error) { close(); throw error; }
     }
 
@@ -46,9 +44,11 @@ final class GpuBuffer implements AutoCloseable {
         throw new IllegalStateException("No Vulkan memory type for flags=" + required);
     }
 
+    java.nio.ByteBuffer hostView(int size) { return allocation.mapped(size); }
+
     @Override public void close() {
-        if (mapped != null) { vkUnmapMemory(context.device, memory); mapped = null; }
+        mapped = null;
         if (buffer != 0) { vkDestroyBuffer(context.device, buffer, null); buffer = 0; }
-        if (memory != 0) { vkFreeMemory(context.device, memory, null); memory = 0; }
+        if (allocation != null) { allocation.close(); allocation = null; memory = 0; }
     }
 }

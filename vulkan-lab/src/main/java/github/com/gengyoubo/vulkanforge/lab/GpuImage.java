@@ -9,6 +9,7 @@ final class GpuImage implements AutoCloseable {
     private final VulkanContext context;
     final int width, height;
     long image, memory, view;
+    private GpuMemory.Allocation allocation;
     GpuImage(VulkanContext context, int width, int height, int format, int usage, int aspect) {
         this.context = context;
         this.width = width; this.height = height;
@@ -21,12 +22,13 @@ final class GpuImage implements AutoCloseable {
                     .extent(e -> e.set(width, height, 1)).mipLevels(1).arrayLayers(1).samples(VK_SAMPLE_COUNT_1_BIT)
                     .tiling(VK_IMAGE_TILING_OPTIMAL).usage(usage).sharingMode(VK_SHARING_MODE_EXCLUSIVE);
             check(vkCreateImage(context.device, info, null, handle), "vkCreateImage(world)"); image = handle.get(0);
-            var requirements = VkMemoryRequirements.calloc(stack);
-            vkGetImageMemoryRequirements(context.device, image, requirements);
-            var allocation = VkMemoryAllocateInfo.calloc(stack).sType$Default().allocationSize(requirements.size())
-                    .memoryTypeIndex(GpuBuffer.memoryType(context, stack, requirements.memoryTypeBits(), VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
-            check(vkAllocateMemory(context.device, allocation, null, handle), "vkAllocateMemory(world image)"); memory = handle.get(0);
-            check(vkBindImageMemory(context.device, image, memory, 0), "vkBindImageMemory(world)");
+            var dedicated = VkMemoryDedicatedRequirements.calloc(stack).sType$Default();
+            var requirements = VkMemoryRequirements2.calloc(stack).sType$Default().pNext(dedicated.address());
+            org.lwjgl.vulkan.VK11.vkGetImageMemoryRequirements2(context.device, VkImageMemoryRequirementsInfo2.calloc(stack).sType$Default().image(image), requirements);
+            allocation = context.memory.allocate(requirements.memoryRequirements(), VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true,
+                    dedicated.requiresDedicatedAllocation() ? image : 0, 0);
+            memory = allocation.memory();
+            check(vkBindImageMemory(context.device, image, memory, allocation.offset), "bind pooled GPU image");
             if ((usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
                     | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) != 0) {
                 var viewInfo = VkImageViewCreateInfo.calloc(stack).sType$Default().image(image).viewType(VK_IMAGE_VIEW_TYPE_2D).format(format)
@@ -39,6 +41,6 @@ final class GpuImage implements AutoCloseable {
     @Override public void close() {
         if (view != 0) { vkDestroyImageView(context.device, view, null); view = 0; }
         if (image != 0) { vkDestroyImage(context.device, image, null); image = 0; }
-        if (memory != 0) { vkFreeMemory(context.device, memory, null); memory = 0; }
+        if (allocation != null) { allocation.close(); allocation = null; memory = 0; }
     }
 }

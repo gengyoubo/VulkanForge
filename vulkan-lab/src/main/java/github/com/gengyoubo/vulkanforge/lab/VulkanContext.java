@@ -24,6 +24,8 @@ final class VulkanContext implements AutoCloseable {
     VkQueue queue;
     DeviceCapabilities capabilities;
     AsyncUploads uploads;
+    GpuMemory memory;
+    boolean pushDescriptors;
     int queueFamily = -1;
     long surface;
     private long messenger;
@@ -106,6 +108,8 @@ final class VulkanContext implements AutoCloseable {
             VkPhysicalDeviceVulkan13Features enabled = VkPhysicalDeviceVulkan13Features.calloc(stack).sType$Default()
                     .dynamicRendering(true).synchronization2(true);
             capabilities = DeviceCapabilities.query(physical, stack);
+            pushDescriptors = capabilities.pushDescriptor() && capabilities.maxPushDescriptors() >= 3 && !Boolean.getBoolean("vulkanforge.disablePushDescriptors");
+            enabled.pNext(VkPhysicalDeviceVulkan14Features.calloc(stack).sType$Default().pushDescriptor(pushDescriptors).address());
             boolean driven = capabilities.gpuDriven() && !Boolean.getBoolean("vulkanforge.disableGpuDriven");
             var enabled12 = VkPhysicalDeviceVulkan12Features.calloc(stack).sType$Default().pNext(enabled.address())
                     .timelineSemaphore(capabilities.timeline()).drawIndirectCount(driven);
@@ -123,6 +127,8 @@ final class VulkanContext implements AutoCloseable {
             queue = new VkQueue(pointer.get(0), device);
             System.out.println("DEVICE_CAPABILITIES=" + capabilities);
             System.out.println("GPU_DRIVEN_ENABLED=" + driven);
+            System.out.println("PUSH_DESCRIPTORS_ENABLED=" + pushDescriptors);
+            memory = new GpuMemory(this);
             uploads = new AsyncUploads(this, capabilities.timeline() && !Boolean.getBoolean("vulkanforge.disableUploadTimeline"));
             System.out.println("DEVICE_CREATED=true");
         }
@@ -236,6 +242,7 @@ final class VulkanContext implements AutoCloseable {
         if (device != null) {
             vkDeviceWaitIdle(device);
             if (uploads != null) { uploads.close(); uploads = null; }
+            if (memory != null) { memory.close(); memory = null; }
             vkDestroyDevice(device, null);
             device = null;
         }

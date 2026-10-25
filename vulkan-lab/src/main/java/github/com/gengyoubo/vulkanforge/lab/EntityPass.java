@@ -36,7 +36,7 @@ final class EntityPass implements AutoCloseable {
     private record Texture(GpuImage image, int flags) implements AutoCloseable { @Override public void close() { image.close(); } }
     private static final class SlotResources {
         GpuBuffer vertices, indices, uniforms;
-        long pool;
+        long pool, uniformSet, uniformBuffer;
         int poolSets;
     }
     private final VulkanContext context;
@@ -49,7 +49,7 @@ final class EntityPass implements AutoCloseable {
     private final long[] samplers = new long[4];
     private long textureLayout, uniformLayout, layout;
     private GpuBuffer quadIndices;
-    private long draws, vertices, textureUploads, missingTextures;
+    private long draws, vertices, textureUploads, missingTextures, descriptorAllocations, descriptorPushes, uniformWrites, bindingHits, mergedDraws;
 
     EntityPass(VulkanContext context, int slotCount, Consumer<Runnable> retire) {
         this(context, slotCount, retire, VK_FORMAT_R8G8B8A8_UNORM, false);
@@ -64,7 +64,7 @@ final class EntityPass implements AutoCloseable {
             var bindings = VkDescriptorSetLayoutBinding.calloc(3, stack);
             for (int i = 0; i < 3; i++) bindings.get(i).binding(i).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1)
                     .stageFlags(VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
-            check(vkCreateDescriptorSetLayout(context.device, VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(bindings), null, handle), "entity texture layout");
+            check(vkCreateDescriptorSetLayout(context.device, VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().flags(context.pushDescriptors ? org.lwjgl.vulkan.VK14.VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT : 0).pBindings(bindings), null, handle), "entity texture layout");
             textureLayout = handle.get(0);
             var uniform = VkDescriptorSetLayoutBinding.calloc(1, stack).binding(0).descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC).descriptorCount(1)
                     .stageFlags(VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
@@ -85,6 +85,7 @@ final class EntityPass implements AutoCloseable {
     }
 
     boolean hasTexture(int id) { return textures.containsKey(id); }
+    long[] bindingStats() { return new long[]{descriptorAllocations, descriptorPushes, uniformWrites, bindingHits, mergedDraws}; }
     long[] stats() { return new long[]{draws, vertices, textures.size(), textureUploads, missingTextures}; }
 
     /** Synchronous upload into a fresh image; never touches an image an in-flight frame may sample. */
@@ -149,6 +150,7 @@ final class EntityPass implements AutoCloseable {
     /** Records all draws inside an active dynamic-rendering pass. The slot's previous use must have completed. */
     void record(VkCommandBuffer command, MemoryStack stack, int slot, List<Object[]> packets, long lightView, long lightSampler) {
         if (packets.isEmpty()) return;
+        packets = batch(packets);
         SlotResources resources = slots[slot];
         int vertexBytes = 0, indexBytes = 0, maxQuadIndices = 0;
         for (Object[] packet : packets) {
@@ -162,21 +164,29 @@ final class EntityPass implements AutoCloseable {
         resources.indices = ensure(resources.indices, indexBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
         resources.uniforms = ensure(resources.uniforms, packets.size() * UNIFORM_STRIDE, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
         ensureQuadIndices(maxQuadIndices);
-        ensurePool(resources, packets.size() + 1);
-        check(vkResetDescriptorPool(context.device, resources.pool, 0), "reset entity descriptors");
+        ensurePool(resources, context.pushDescriptors ? 1 : packets.size() + 1);
+        if (!context.pushDescriptors) {
+            check(vkResetDescriptorPool(context.device, resources.pool, 0), "reset entity descriptors"); resources.uniformSet = resources.uniformBuffer = 0;
+        }
         var handle = stack.mallocLong(1);
-        check(vkAllocateDescriptorSets(context.device, VkDescriptorSetAllocateInfo.calloc(stack).sType$Default().descriptorPool(resources.pool)
-                .pSetLayouts(stack.longs(uniformLayout)), handle), "entity uniform set");
-        long uniformSet = handle.get(0);
-        vkUpdateDescriptorSets(context.device, VkWriteDescriptorSet.calloc(1, stack).sType$Default().dstSet(uniformSet).dstBinding(0).descriptorCount(1)
-                .descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
-                .pBufferInfo(VkDescriptorBufferInfo.calloc(1, stack).buffer(resources.uniforms.buffer).offset(0).range(UNIFORM_STRIDE)), null);
+        if (resources.uniformSet == 0) {
+            check(vkAllocateDescriptorSets(context.device, VkDescriptorSetAllocateInfo.calloc(stack).sType$Default().descriptorPool(resources.pool)
+                    .pSetLayouts(stack.longs(uniformLayout)), handle), "entity uniform set");
+            resources.uniformSet = handle.get(0); descriptorAllocations++;
+        }
+        long uniformSet = resources.uniformSet;
+        if (resources.uniformBuffer != resources.uniforms.buffer) {
+            vkUpdateDescriptorSets(context.device, VkWriteDescriptorSet.calloc(1, stack).sType$Default().dstSet(uniformSet).dstBinding(0).descriptorCount(1)
+                    .descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
+                    .pBufferInfo(VkDescriptorBufferInfo.calloc(1, stack).buffer(resources.uniforms.buffer).offset(0).range(UNIFORM_STRIDE)), null);
+            resources.uniformBuffer = resources.uniforms.buffer; uniformWrites++;
+        }
         Map<Long, Long> textureSets = new HashMap<>();
         var vertexData = resources.vertices.mapped.duplicate().clear();
         var indexData = resources.indices.mapped.duplicate().clear();
         var uniformData = resources.uniforms.mapped.duplicate().order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer();
         var buffers = stack.mallocLong(1); var offsets = stack.mallocLong(1); var dynamic = stack.mallocInt(1);
-        long bound = 0;
+        long bound = 0, boundTexture = Long.MIN_VALUE;
         for (int i = 0; i < packets.size(); i++) {
             Object[] packet = packets.get(i);
             if (packet[0] == null) {
@@ -201,11 +211,13 @@ final class EntityPass implements AutoCloseable {
             long pipeline = pipeline(header[H_FORMAT], header[H_FLAGS]);
             if (pipeline != bound) { vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline); bound = pipeline; }
             long key = (long) header[H_TEXTURE] << 32 | (header[H_OVERLAY] & 0xffffffffL);
-            Long set = textureSets.get(key);
-            if (set == null) {
+            Long set = context.pushDescriptors ? 0L : textureSets.get(key);
+            if (context.pushDescriptors ? boundTexture != key : set == null) {
+                if (!context.pushDescriptors) {
                 check(vkAllocateDescriptorSets(context.device, VkDescriptorSetAllocateInfo.calloc(stack).sType$Default().descriptorPool(resources.pool)
                         .pSetLayouts(stack.longs(textureLayout)), handle), "entity texture set");
-                set = handle.get(0);
+                set = handle.get(0); descriptorAllocations++;
+                }
                 var images = VkDescriptorImageInfo.calloc(3, stack);
                 images.get(0).sampler(samplers[texture.flags()]).imageView(texture.image().view).imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                 images.get(1).sampler(samplers[0]).imageView(overlay.image().view).imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -213,13 +225,14 @@ final class EntityPass implements AutoCloseable {
                 var writes = VkWriteDescriptorSet.calloc(3, stack);
                 for (int b = 0; b < 3; b++) writes.get(b).sType$Default().dstSet(set).dstBinding(b).descriptorCount(1)
                         .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(VkDescriptorImageInfo.create(images.address(b), 1));
-                vkUpdateDescriptorSets(context.device, writes, null);
-                textureSets.put(key, set);
-            }
+                if (context.pushDescriptors) { org.lwjgl.vulkan.VK14.vkCmdPushDescriptorSet(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, writes); descriptorPushes++; boundTexture = key; }
+                else { vkUpdateDescriptorSets(context.device, writes, null); textureSets.put(key, set); }
+            } else bindingHits++;
             uniformData.position(i * UNIFORM_STRIDE / 4); uniformData.put((float[]) packet[1], 0, UNIFORM_FLOATS);
             if (direct) uniformData.put(i * UNIFORM_STRIDE / 4 + 55, 3);
             dynamic.put(0, i * UNIFORM_STRIDE);
-            vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, stack.longs(set, uniformSet), dynamic);
+            if (context.pushDescriptors) vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, stack.longs(uniformSet), dynamic);
+            else vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, stack.longs(set, uniformSet), dynamic);
             byte[] vertexBytesOfDraw = (byte[]) packet[2];
             offsets.put(0, vertexData.position()); vertexData.put(vertexBytesOfDraw);
             buffers.put(0, resources.vertices.buffer);
@@ -236,6 +249,35 @@ final class EntityPass implements AutoCloseable {
             } else vkCmdDraw(command, header[H_VERTICES], 1, 0, 0);
             draws++; vertices += header[H_VERTICES];
         }
+    }
+
+    /** Merge only adjacent draws with identical uniforms/state; painter order and depth-clear boundaries remain intact. */
+    private List<Object[]> batch(List<Object[]> source) {
+        List<Object[]> result = new ArrayList<>(source.size());
+        for (int i = 0; i < source.size();) {
+            Object[] first = source.get(i); int end = i + 1;
+            int bytes = first[0] == null ? 0 : ((byte[]) first[2]).length;
+            while (end < source.size() && compatible(first, source.get(end)) && bytes + ((byte[]) source.get(end)[2]).length <= 1 << 20) {
+                bytes += ((byte[]) source.get(end)[2]).length; end++;
+            }
+            if (end == i + 1) result.add(first);
+            else {
+                Object[] combined = first.clone(); int[] header = ((int[]) first[0]).clone(); byte[] geometry = new byte[bytes]; int at = 0;
+                header[H_VERTICES] = 0;
+                for (int k = i; k < end; k++) { Object[] packet = source.get(k); byte[] data = (byte[]) packet[2]; System.arraycopy(data, 0, geometry, at, data.length); at += data.length; header[H_VERTICES] += ((int[]) packet[0])[H_VERTICES]; }
+                combined[0] = header; combined[2] = geometry; result.add(combined); mergedDraws += end - i - 1;
+            }
+            i = end;
+        }
+        return result;
+    }
+    private static boolean compatible(Object[] a, Object[] b) {
+        if (a[0] == null || b[0] == null || a[3] != null || b[3] != null || a.length != b.length) return false;
+        int[] x = (int[]) a[0], y = (int[]) b[0];
+        for (int i = 0; i <= H_MODE; i++) if (i != H_VERTICES && x[i] != y[i]) return false;
+        int unit = x[H_MODE] == MODE_QUADS ? 4 : 3;
+        return x[H_VERTICES] % unit == 0 && y[H_VERTICES] % unit == 0 && Arrays.equals((float[]) a[1], (float[]) b[1])
+                && (a.length <= 4 || Arrays.equals((int[]) a[4], (int[]) b[4]));
     }
 
     private GpuBuffer ensure(GpuBuffer current, int needed, int usage) {
@@ -267,7 +309,7 @@ final class EntityPass implements AutoCloseable {
             sizes.get(1).type(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC).descriptorCount(1);
             var handle = stack.mallocLong(1);
             check(vkCreateDescriptorPool(context.device, VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(capacity + 1).pPoolSizes(sizes), null, handle), "entity descriptor pool");
-            resources.pool = handle.get(0); resources.poolSets = capacity;
+            resources.pool = handle.get(0); resources.poolSets = capacity; resources.uniformSet = resources.uniformBuffer = 0;
         }
     }
 
