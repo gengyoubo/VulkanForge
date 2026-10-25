@@ -47,6 +47,7 @@ final class VulkanPreview {
     static void terrain(net.minecraftforge.client.event.RenderLevelStageEvent event) {
         if (!enabled || sink == null) return;
         translucentPending = false;
+        EntityDraws.cancel();
         if (direct && !NativeMainWindow.worldVisible()) { uploadedEpoch = 0; return; }
         try {
             WORLD.update(event, sink);
@@ -56,6 +57,8 @@ final class VulkanPreview {
                     PRESENTER.draw(sharedTexture.getId(), sharedDepth);
                     translucentPending = sharedTranslucent > 0 && sharedTranslucentDepth > 0 && TerrainPresenter.translucentReady()
                             && !Minecraft.useShaderTransparency();
+                    // P7/P8: entity and block-entity draws until AFTER_BLOCK_ENTITIES go to the Vulkan entity pass when supported.
+                    if (translucentPending) { EntityTextures.poll(); EntityDraws.open(RenderSystem.getShaderTexture(2)); }
                 }
                 else if (texture != null && bridge.status() == OffscreenBridge.Status.RUNNING) PRESENTER.draw(texture);
             }
@@ -63,6 +66,16 @@ final class VulkanPreview {
         catch (Exception error) {
             VulkanForge.LOGGER.error("Could not capture solid terrain for Vulkan", error);
             close();
+        }
+    }
+
+    /** AFTER_BLOCK_ENTITIES: replay captured entity/block-entity draws in Vulkan and composite them with depth. */
+    static void entities() {
+        try { EntityDraws.flush(PRESENTER); }
+        catch (Exception error) {
+            // Entities fall back to OpenGL; terrain stays on Vulkan.
+            VulkanForge.LOGGER.error("Vulkan entity pass failed; entities return to OpenGL until the preview restarts", error);
+            EntityDraws.disable();
         }
     }
 
@@ -92,7 +105,7 @@ final class VulkanPreview {
                 && uploadedEpoch != 0 && uploadedEpoch == WORLD.epoch() && WORLD.covers(origin);
     }
     static boolean directWorld() { return enabled && direct; }
-    static long[] directWorldStats() { return directWorld() ? NativeMainWindow.worldStats() : new long[18]; }
+    static long[] directWorldStats() { return directWorld() ? NativeMainWindow.worldStats() : new long[24]; }
     static int saveWorldFrame(java.nio.file.Path path) throws java.io.IOException {
         RenderSystem.assertOnRenderThread();
         // A diagnostic read acquires a fresh GL lease; normal terrain rendering never downloads pixels.
@@ -187,7 +200,9 @@ final class VulkanPreview {
         if (bridge != null) { bridge.close(); bridge = null; }
         if (texture != null) { Minecraft.getInstance().getTextureManager().release(TEXTURE); texture.close(); texture = null; }
         if (sharedTexture != null) { Minecraft.getInstance().getTextureManager().release(TEXTURE); sharedTexture.close(); sharedTexture = null; }
+        EntityDraws.reset();
         if (direct) NativeMainWindow.closeWorld();
+        EntityTextures.reset();
         PRESENTER.close();
         uploaded = 0;
         uploadedEpoch = 0;

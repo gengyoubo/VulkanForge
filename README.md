@@ -9,7 +9,7 @@ Minecraft **1.20.1 / Forge 47.4.28 / Java 17** 客户端 Vulkan 渲染实验。
 - 游戏主窗口预览：同进程 Vulkan 绘制旋转三角形 → 导出共享 GPU 图像 → 原有 GL 上下文采样 → 主菜单 / HUD 显示。
 - 世界不透明和镂空方块：采集原版烘焙模型、贴图 UV、染色、环境遮蔽与光照坐标 → 分区顶点缓冲 → Vulkan 图集/光照图采样、相机变换、alpha 丢弃、D32 深度测试 → 在原版 cutout 阶段之后合成。
 
-**这是混合渲染原型。主窗口的最终呈现已交给 Vulkan；Windows 主窗口路径中的 WorldScene 已接入同一个 Vulkan 后端，solid、cutout、cutoutMipped 地形通过共享 GPU 纹理合成，正常地形帧不经过 CPU 像素读回或 FrameProtocol。** 原版区块绘制保留以提供深度；天空、范围外地形、透明层、实体、粒子、手持物和 HUD 在隐藏的 OpenGL 上下文中绘制，然后统一由主窗口 Swapchain 呈现。关闭主窗口 Vulkan 路径时保留旧的子进程读回预览作为兼容路径。
+**这是混合渲染原型。主窗口的最终呈现已交给 Vulkan；Windows 主窗口路径中的 WorldScene 已接入同一个 Vulkan 后端，solid、cutout、cutoutMipped 地形通过共享 GPU 纹理合成，正常地形帧不经过 CPU 像素读回或 FrameProtocol。** Vulkan 覆盖范围内的半透明方块与水也由 Vulkan 绘制（P6 第一步），常见实体、方块实体和告示牌文字由 Vulkan 实体通道回放（P7/P8）；天空、范围外地形、Fabulous 模式下的半透明层、不支持的实体着色器、粒子、天气、手持物和 HUD 仍在隐藏的 OpenGL 上下文中绘制，然后统一由主窗口 Swapchain 呈现。关闭主窗口 Vulkan 路径时保留旧的子进程读回预览作为兼容路径。
 
 ## 构建和启动
 
@@ -92,7 +92,7 @@ IntelliJ IDEA：导入根目录的 `build.gradle`，将 **Gradle JVM** 和 **Pro
 # Windows 主窗口：呈现/故障恢复，以及同进程 45 个非空 Section 的像素、双缓冲、相机、缩放、删除、重置与关闭后重开
 .\gradlew.bat :vulkan-lab:smokePresent
 
-# 完整 Forge 检查：ASM 钩子、Vulkan 主窗口、世界、重载、昼夜光照、缩放、最小化恢复、全屏往返、切换世界，然后退出
+# 完整 Forge 检查：ASM 钩子、Vulkan 主窗口、世界、水池与染色玻璃（P6 半透明）、箱子/告示牌/牛（P7/P8 实体通道）、重载、昼夜光照、缩放、最小化恢复、全屏往返、切换世界，然后退出
 # 退出超过 30 秒或主窗口报告缺少 FINAL_PRESENTED_FRAMES / VALIDATION_ERRORS=0 时判定失败；检查期间会短暂全屏，请保持游戏窗口在前台
 # 测试源集不会被打入模组 JAR；会在 run/saves 留下测试世界和日志中的 PNG
 .\gradlew.bat -PworldSmoke runClient
@@ -114,6 +114,45 @@ java -jar vulkan-lab/build/libs/vulkan-lab.jar --probe --require-validation
 
 `-PvalidationSmoke` 要求主窗口校验层实际启用，并在客户端退出后检查 `VALIDATION=ENABLED`、`VALIDATION_ERRORS=0`、共享地形计时与完整关闭标记；兼容路径额外检查地形桥。检查缺少校验层或退出超时会失败。同进程检查核对后端 PID 等于游戏 PID、45 个分区和无地形子进程启动。`smokePresent` 额外检查 acquire 后取消帧、GL 交接前/后故障恢复，以及仍持有已 acquire 图像时的关闭。同步验证通过 `VK_VALIDATION_VALIDATE_SYNC=1` 开启，正式性能测量时应关闭校验层。
 
+## 半透明地形（P6 第一步）
+
+`WorldCapture` 现在同时采集流体：水方块的 `RenderShape` 不是 `MODEL`，此前完全没有被采集，而 P4 跳过原版 solid 层后，覆盖范围内的岩浆会缺失。流体按 `ItemBlockRenderTypes.getRenderLayer(FluidState)` 分层：岩浆进入不透明网格，水与 `translucent` 层方块（染色玻璃、冰、史莱姆块、蜂蜜块等）进入 `Mesh.translucent`。
+
+`WorldScene` 为每个含半透明几何的分区保存四边形中心，并为两个帧槽位各准备一份索引缓冲。槽位只在自身 fence 完成后重写索引，因此排序不会改动 GPU 正在读取的数据。与原版一致，相机移动超过 1 格后重新排序：每帧最多重排 16 个分区（最近的优先），尚未排序的槽位总是先排序再使用。绘制顺序为分区由远到近、分区内四边形由远到近，开启背面剔除（与原版 translucent 层相同，避免水面正反两面重复混合）。
+
+`SharedWorldRenderer` 每个槽位共有四张共享图像：不透明颜色/深度，以及半透明颜色和独立深度。半透明深度先复制不透明深度，再记录最近的半透明表面；半透明颜色清为 (0,0,0,0)，以预乘 alpha `(ONE, ONE_MINUS_SRC_ALPHA)` 累积。四张图像每帧都经过同一套所有权转换和信号量往返，并在交换前结束 GL 租用。
+
+GL 侧在 `AFTER_TRANSLUCENT_BLOCKS` 阶段合成，即原版实体和方块实体之后：使用预乘混合，并写入 `gl_FragDepth`，与 GL 深度做 LEQUAL 测试。实体位于水面前方时，会遮住该像素的半透明层；位于水下时，水面会混合在实体之上。原版 translucent 层只在同一帧确实会合成 Vulkan 结果的覆盖分区中跳过。
+
+Fabulous 图形模式会把半透明层画进独立目标供透明后处理链使用，这种情况仍交给原版绘制。雾和水下视角的雾色尚未接入 Vulkan 地形；实体见 P7/P8，GUI 仍使用 OpenGL。
+
+## 方块实体与实体（P7 / P8）
+
+`coremods/entities.js` 只改写 `RenderType.end(BufferBuilder, VertexSorting)` 中唯一一次 `BufferUploader` 上传（按 owner/描述符匹配，不依赖映射名），并把 `this` 一并传给 `EntityDraws.draw`。从 Vulkan 地形合成后（`AFTER_CUTOUT_BLOCKS`）到 `AFTER_BLOCK_ENTITIES` 之间，满足以下全部条件的绘制会被复制下来交给 Vulkan，GL 不再绘制：
+
+- 着色器属于 `rendertype_entity_{solid,cutout,cutout_no_cull,cutout_no_cull_z_offset,translucent,translucent_cull,smooth_cutout,no_outline}`、`rendertype_armor_cutout_no_cull` 或 `rendertype_text`；
+- 顶点格式为 `NEW_ENTITY`（文字为 `POSITION_COLOR_TEX_LIGHTMAP`），模式为 QUADS/TRIANGLES，排序后的自定义索引也支持；
+- GL 状态 Vulkan 可以复现：无混合或 translucent/默认混合，深度 LEQUAL/LESS，背面剔除，无多边形偏移、剪裁、逻辑运算或颜色写掩码；
+- 采样器 0 和 1（贴图、受伤覆盖层）已经镜像到 Vulkan，采样器 2 是地形同步的同一张光照图。
+
+其余绘制（发光附魔、阴影、轮廓、末影眼等）仍走 OpenGL，不会消失；世界检查报告会列出这些回退着色器的名称和次数。
+
+`EntityTextures` 按 GL 纹理 id 镜像贴图：首次使用时异步 PBO 读回，期间该绘制留在 GL；最近 1 秒用过的贴图每 2 秒重新读回一次，像素变化才重新上传（如延迟下载的皮肤、地图、动画图集）。Vulkan 端每次上传都创建新图像，旧图像等使用它的帧完成后再销毁。
+
+`EntityPass` 的 Vulkan 着色器移植自原版 `rendertype_entity_*` / `rendertype_text`：双光源漫反射、覆盖层与光照图 texelFetch、四种片元分支和线性/柱形雾。每次绘制的矩阵、颜色调制、光照方向和雾参数放在 256 字节的动态 uniform 中。顶点、索引和 uniform 使用每槽位环形缓冲，四边形使用与原版相同顺序的共享索引缓冲；管线按格式与混合/深度/剔除状态缓存。
+
+地形提交时把不透明深度复制到每槽位私有的 Vulkan 深度图。`AFTER_BLOCK_ENTITIES` 时第二次提交：把它复制进共享实体深度，在其上回放实体，然后以预乘 alpha 清屏后的颜色和深度交给 GL。GL 侧用与半透明相同的合成着色器，写入 `gl_FragDepth` 并与 GL 深度测试，因此 GL 回退的实体和范围外地形仍能正确遮挡。实体图像有独立的 fence 和信号量往返；没有实体的帧不提交。与半透明一样，Fabulous 模式不启用。
+
+尚未完成：附魔光效（`glint`）、实体阴影、发光轮廓、末影/蜘蛛眼（加法混合）、`translucentCullBlockSheet` 中的物品实体（这些在 `AFTER_BLOCK_ENTITIES` 之后才刷新）、破坏裂纹以及模组自定义着色器。
+
+## 后续阶段（P9–P11）
+
+三个阶段都复用 P7/P8 的“捕获 → 镜像贴图 → Vulkan 回放 → 带深度合成”框架，主要工作是增加捕获点和着色器移植：
+
+- **P9 粒子与天气**：`ParticleEngine.render` 与 `renderSnowAndRain` 不经过 `RenderType.end`，而是 `Tesselator` + `BufferUploader.drawWithShader`。需要在这两处安装捕获，移植 `particle` 与 `rendertype_weather`/`position_tex_color` 着色器，并在 `AFTER_PARTICLES` / `AFTER_WEATHER` 合成。
+- **P10 天空与云**：天空使用 `VertexBuffer.drawWithShader`（`position`、`position_tex`、`position_color` 着色器），云使用 `rendertype_clouds`。需要镜像静态 `VertexBuffer` 网格（天空、星星、云在重建时上传一次），在地形之前绘制到同一个 Vulkan 场景目标中；这样地形清屏不再需要原版天空。
+- **P11 手持物与 GUI**：手持物经 `RenderType.end`（可直接扩展 P8 捕获窗口）。GUI 由 `GuiGraphics` 产生，包括 `position_color`、`position_tex`、文字和物品图标。由于最终呈现已在 Vulkan 交换链，GUI 适合在 blit 之后直接画进交换链图像，不再经过 GL 合成。字体字形页需要随动态上传增量镜像。
+
 ## 接入结构
 
 - `src/main/java/github/com/gengyoubo/vulkanforge/client/ClientEvents.java`：Forge 生命周期、世界/屏幕/HUD 事件、按键。
@@ -133,7 +172,7 @@ java -jar vulkan-lab/build/libs/vulkan-lab.jar --probe --require-validation
 
 主窗口共享地形按游戏实际 framebuffer 尺寸、在当帧 cutout 阶段绘制，相机直接传递；旧兼容桥仍固定 **640×360、最高 60 FPS**，每帧读回并上传约 0.88 MiB。最终呈现采用两帧轮转，每帧独立的共享图像、命令缓冲、acquire semaphore 和 fence，仅复用该槽位时等待；呈现 semaphore 按 Swapchain 图像保存。两个等待信号量都在 BLIT 阶段等待，布局转换和队列所有权获取的第一同步范围同为 BLIT，保证排在 acquire / GL 完成之后。Surface 在全屏或最小化过渡中报告 0×0 时跳过该帧并保留旧 Swapchain；尺寸比较基于请求尺寸，避免被 Surface 钳制的尺寸导致每帧重建。若某帧在 acquire 后、提交前出错，会用空提交消耗 acquire 信号量、重建 fence/semaphore 并标记 Swapchain 重建，避免退出时卡在 fence 或残留未等待的信号量。报告记录 CPU fence 等待和 present 调用耗时。
 
-世界图像清屏 alpha 为零，只有 Vulkan 方块像素覆盖原版颜色。图集动画与原版光照图增量同步，不保证呈现原版每一个动画帧；动画区域较多时按轮询预算分批更新。镂空阈值采用原版 0.1，图集目前只采样 mip level 0；光照采样坐标和线性过滤与 1.20.1 原版一致。雾、后处理和半透明排序尚未接入 Vulkan。后续需要接管原版 Solid/Cutout pass 及深度交接、扩大可见范围、复用网格重建调度并实现 GPU culling。纹理更新仍采用同步 Vulkan 上传，更新前等待旧地形绘制完成；P5 尚未实现异步增量上传与资源延迟回收。当前仍是功能原型，未承诺帧率提升。
+世界图像清屏 alpha 为零，只有 Vulkan 方块像素覆盖原版颜色。图集动画与原版光照图增量同步，不保证呈现原版每一个动画帧；动画区域较多时按轮询预算分批更新。镂空阈值采用原版 0.1，图集目前只采样 mip level 0；光照采样坐标和线性过滤与 1.20.1 原版一致。雾和后处理尚未接入 Vulkan。后续需要接管原版 Solid/Cutout pass 及深度交接、扩大可见范围、复用网格重建调度并实现 GPU culling。纹理更新仍采用同步 Vulkan 上传，更新前等待旧地形绘制完成；P5 尚未实现异步增量上传与资源延迟回收。当前仍是功能原型，未承诺帧率提升。
 
 2026-10-26 本机 Windows / RTX 3050 Laptop 验证：GPU 世界管线检查通过；Forge 客户端成功采集 45 个分区、树叶/花等镂空模型、1024×512 图集和原版光照图。相机、方块更新、资源重载与动画贴图更新检查通过；测试场景切换夜晚后，地形平均亮度约从 137 降至 24，切回白天恢复。检查图片与报告位于 `run/logs/vulkanforge/world-client-smoke/`。
 

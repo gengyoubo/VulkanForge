@@ -15,12 +15,30 @@ import static org.lwjgl.vulkan.VK10.vkCreateShaderModule;
 final class ShaderCompiler {
     private ShaderCompiler() { }
 
+    /** Textual {@code #include "file"} from the same resource folder; shaderc's include callbacks are not wired. */
+    private static String expandIncludes(String source, String resource) {
+        String folder = resource.substring(0, resource.lastIndexOf('/') + 1);
+        StringBuilder out = new StringBuilder();
+        for (String line : source.split("\\R", -1)) {
+            String trimmed = line.trim();
+            if (trimmed.startsWith("#extension GL_GOOGLE_include_directive")) continue;
+            if (!trimmed.startsWith("#include \"")) { out.append(line).append('\n'); continue; }
+            String name = folder + trimmed.substring(10, trimmed.lastIndexOf('"'));
+            try (InputStream in = ShaderCompiler.class.getResourceAsStream(name)) {
+                if (in == null) throw new IOException("Missing shader include: " + name);
+                out.append(new String(in.readAllBytes(), StandardCharsets.UTF_8)).append('\n');
+            } catch (IOException e) { throw new IllegalStateException(e); }
+        }
+        return out.toString();
+    }
+
     static long module(VulkanContext context, String resource, int kind) {
         String source;
         try (InputStream in = ShaderCompiler.class.getResourceAsStream(resource)) {
             if (in == null) throw new IOException("Missing shader: " + resource);
             source = new String(in.readAllBytes(), StandardCharsets.UTF_8);
         } catch (IOException e) { throw new IllegalStateException(e); }
+        source = expandIncludes(source, resource);
         long compiler = shaderc_compiler_initialize();
         if (compiler == 0) throw new IllegalStateException("shaderc compiler initialization failed");
         long options = 0, result = 0;

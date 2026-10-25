@@ -75,6 +75,15 @@ public final class WorldClientSmoke {
                     for (int x = -4; x <= -3; x++) for (int y = 65; y <= 68; y++) level.setBlock(new BlockPos(x, y, 2), Blocks.MAGMA_BLOCK.defaultBlockState(), 3);
                     level.setBlock(new BlockPos(3, 65, 3), Blocks.OAK_FENCE.defaultBlockState(), 3);
                     level.setBlock(new BlockPos(3, 65, 5), Blocks.DANDELION.defaultBlockState(), 3);
+                    // P6: a walled water pool (fluid, translucent layer) and a stained-glass panel in front of the camera.
+                    for (int x = -8; x <= -4; x++) for (int z = 4; z <= 8; z++) level.setBlock(new BlockPos(x, 65, z),
+                            x == -8 || x == -4 || z == 4 || z == 8 ? Blocks.STONE_BRICKS.defaultBlockState() : Blocks.WATER.defaultBlockState(), 3);
+                    for (int x = -1; x <= 1; x++) for (int y = 65; y <= 66; y++) level.setBlock(new BlockPos(x, y, 7), Blocks.LIGHT_BLUE_STAINED_GLASS.defaultBlockState(), 3);
+                    // P7/P8: block entities (chest, sign) and a mob without AI in front of the camera.
+                    level.setBlock(new BlockPos(3, 65, 6), Blocks.CHEST.defaultBlockState(), 3);
+                    level.setBlock(new BlockPos(2, 65, 7), Blocks.OAK_SIGN.defaultBlockState(), 3);
+                    var cow = net.minecraft.world.entity.EntityType.COW.spawn(level, new BlockPos(-3, 65, 6), net.minecraft.world.entity.MobSpawnType.COMMAND);
+                    if (cow != null) { cow.setNoAi(true); cow.setYRot(30); }
                     var player = server.getPlayerList().getPlayer(uuid);
                     player.teleportTo(level, 0.5, 68.0, 9.0, 180, 18);
                     player.getAbilities().flying = true; player.onUpdateAbilities();
@@ -101,6 +110,17 @@ public final class WorldClientSmoke {
                     long[] passes = TerrainPasses.stats();
                     require(passes[0] > 0 && passes[1] > 0, "Vanilla Solid/Cutout sections were not replaced");
                     log("PASS P4 vanilla terrain skipped: solid=" + passes[0] + ", cutout=" + passes[1] + ", fallback=" + passes[2]);
+                    require(VulkanPreview.fluidBlocks() > 0 && VulkanPreview.translucentQuads() > 0 && stats[15] > 0, "Water/stained glass were not captured as Vulkan translucent geometry");
+                    require(stats[13] > 0 && stats[14] > 0 && stats[16] > 0 && stats[17] > 0, "Vulkan translucent pass did not draw sorted sections");
+                    require(passes[3] > 0 && VulkanPreview.translucentComposites() > 0, "Vanilla translucent sections were not replaced by the Vulkan composite");
+                    log("PASS P6 translucent terrain: fluids=" + VulkanPreview.fluidBlocks() + ", quads=" + VulkanPreview.translucentQuads() + ", sections=" + stats[15]
+                            + ", sorts=" + stats[17] + ", vanilla translucent skipped=" + passes[3] + ", composites=" + VulkanPreview.translucentComposites());
+                    long[] entities = EntityDraws.stats(), mirrors = EntityTextures.stats();
+                    require(entities[0] > 0 && entities[4] > 0 && mirrors[1] > 0, "No entity/block-entity draws were replayed by Vulkan: " + java.util.Arrays.toString(entities));
+                    require(stats[18] > 0 && stats[19] > 0 && stats[23] == 0, "Vulkan entity pass did not draw, or drew with missing textures: " + java.util.Arrays.toString(stats));
+                    log("PASS P7/P8 entity pass: captured=" + entities[0] + ", GL fallback unsupported=" + entities[1] + " state=" + entities[2] + " texture=" + entities[3]
+                            + ", composites=" + entities[4] + ", Vulkan draws=" + stats[19] + ", mirrored textures=" + mirrors[1] + "/" + mirrors[0]);
+                    log("INFO GL fallback shaders: " + EntityDraws.fallbackShaders());
                 }
                 firstHash = VulkanPreview.saveWorldFrame(report.resolve("before.png"));
                 if (NativeMainWindow.active()) NativeMainWindow.captureNext(report.resolve("main-swapchain.png"));

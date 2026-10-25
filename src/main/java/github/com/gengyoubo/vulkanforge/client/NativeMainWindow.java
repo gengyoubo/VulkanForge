@@ -24,7 +24,7 @@ public final class NativeMainWindow {
     private static Object backend;
     private static boolean revealed;
     private static Method present, beginFrame, setVsync, frames, generations, capture, close, earlyAcquires, lateAcquires;
-    private static Method renderWorld, worldStats, finishWorldFrame, closeWorld;
+    private static Method renderWorld, worldStats, finishWorldFrame, closeWorld, renderEntities, entityTexture;
     private static Consumer<Object[]> worldCommands;
 
     private NativeMainWindow() { }
@@ -52,6 +52,7 @@ public final class NativeMainWindow {
             capture = type.getMethod("captureNext", String.class); close = type.getMethod("close");
             renderWorld = type.getMethod("renderWorld", int.class, int.class); worldStats = type.getMethod("worldStats");
             finishWorldFrame = type.getMethod("finishWorldFrame"); closeWorld = type.getMethod("closeWorld");
+            renderEntities = type.getMethod("renderEntities", Object[].class); entityTexture = type.getMethod("entityTexture", Object[].class);
             Function<long[], Consumer<int[]>> terrainImporter = GlInterop::importTerrain;
             @SuppressWarnings("unchecked") Consumer<Object[]> commands = (Consumer<Object[]>) type.getMethod("worldCommands", Function.class).invoke(backend, terrainImporter);
             worldCommands = commands;
@@ -134,7 +135,10 @@ public final class NativeMainWindow {
     }
     static int renderWorld(int width, int height) { return active() ? ((Number)call(renderWorld, width, height)).intValue() : 0; }
     static boolean worldVisible() { return active() && GLFW.glfwGetWindowAttrib(mainWindow, GLFW.GLFW_ICONIFIED) == 0; }
-    static long[] worldStats() { return active() ? (long[])call(worldStats) : new long[18]; }
+    static long[] worldStats() { return active() ? (long[])call(worldStats) : new long[24]; }
+    /** P7/P8: {color, depth} GL textures of this frame's Vulkan entity pass, or null. */
+    static int[] renderEntities(Object[] packets) { return active() ? (int[]) call(renderEntities, (Object) packets) : null; }
+    static boolean entityTexture(Object[] texture) { return active() && (Boolean) call(entityTexture, (Object) texture); }
     static void closeWorld() { if (active()) call(closeWorld); }
     public static long acquiresBeforeInput() { return active() ? ((Number) call(earlyAcquires)).longValue() : 0; }
     public static long acquiresAfterRender() { return active() ? ((Number) call(lateAcquires)).longValue() : 0; }
@@ -160,7 +164,7 @@ public final class NativeMainWindow {
         catch (Throwable error) { LOGGER.error("Could not close Vulkan main-window resources", cause(error)); }
         finally {
             backend = null; present = beginFrame = setVsync = frames = generations = capture = close = earlyAcquires = lateAcquires = null;
-            renderWorld = worldStats = finishWorldFrame = closeWorld = null; worldCommands = null;
+            renderWorld = worldStats = finishWorldFrame = closeWorld = renderEntities = entityTexture = null; worldCommands = null;
             try { if (loader != null) loader.close(); } catch (Exception error) { LOGGER.warn("Could not close backend loader", error); }
             loader = null;
         }

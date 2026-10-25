@@ -1,4 +1,5 @@
 {
   "vulkanforge_main_window": "coremods/main_window.js",
-  "vulkanforge_terrain": "coremods/terrain.js"
+  "vulkanforge_terrain": "coremods/terrain.js",
+  "vulkanforge_entities": "coremods/entities.js"
 }

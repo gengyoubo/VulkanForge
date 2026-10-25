@@ -56,6 +56,7 @@ final class SharedWorldSmoke {
         send.accept(mesh(1, 99, 0, 0));
         require(backend.worldStats()[2] == 0 && backend.renderWorld(270, 150) == 0, "Stale mesh survived reset");
         translucent(backend, send);
+        entities(backend);
         backend.closeWorld();
         requireAlpha(backend.renderWorld(180, 100), 180, 100, 255); // Reopen as menu preview, close with a GL read lease open.
         backend.closeWorld();
@@ -100,6 +101,61 @@ final class SharedWorldSmoke {
         for (int i = 0; i < 2; i++) { require(backend.renderWorld(width, height) > 0, "Translucent re-render failed"); backend.finishWorldFrame(); }
         require(backend.worldStats()[17] >= sorts + 2, "Camera movement did not re-sort translucent quads");
         System.out.println("TRANSLUCENT_SMOKE=OK (sorted premultiplied blend, separate depth, opaque untouched, per-slot re-sort)");
+    }
+    /**
+     * P7/P8 replay over the translucent scene's opaque terrain quad ([-.5,.5]^2, depth .6): a green entity in front of it (depth .5),
+     * one behind it (depth .7, must be hidden) and one beside it (depth .7, visible over cleared depth).
+     */
+    private static void entities(MainWindowBackend backend) {
+        require(backend.entityTexture(new Object[]{1001, 2, 2, 0, new byte[]{0, (byte)255, 0, (byte)255, 0, (byte)255, 0, (byte)255, 0, (byte)255, 0, (byte)255, 0, (byte)255, 0, (byte)255}}),
+                "Entity texture upload failed");
+        byte[] white = new byte[16 * 16 * 4]; java.util.Arrays.fill(white, (byte)255);
+        backend.entityTexture(new Object[]{1002, 16, 16, 0, white});
+        ByteBuffer vertices = ByteBuffer.allocate(3 * 4 * 36).order(ByteOrder.LITTLE_ENDIAN);
+        entityQuad(vertices, -.4f, -.1f, 0); entityQuad(vertices, .1f, .4f, .4f); entityQuad(vertices, .6f, .9f, .4f);
+        float[] uniforms = new float[EntityPass.UNIFORM_FLOATS];
+        for (int i = 0; i < 4; i++) { uniforms[i * 5] = 1; uniforms[16 + i * 5] = 1; uniforms[44 + i] = 1; }
+        uniforms[32] = uniforms[37] = uniforms[42] = 1;           // inverse view rotation columns
+        uniforms[50] = uniforms[54] = 1; uniforms[55] = 1;       // light directions +z, opaque output
+        uniforms[60] = 1e9f; uniforms[61] = 2e9f; uniforms[63] = 1; // fog out of range, variant 1 (entity_solid)
+        int[] header = new int[EntityPass.HEADER];
+        header[EntityPass.H_FORMAT] = EntityPass.FORMAT_ENTITY; header[EntityPass.H_VARIANT] = 1;
+        header[EntityPass.H_FLAGS] = EntityPass.DEPTH_TEST | EntityPass.DEPTH_WRITE | EntityPass.CULL;
+        header[EntityPass.H_TEXTURE] = 1001; header[EntityPass.H_OVERLAY] = 1002; header[EntityPass.H_VERTICES] = 12; header[EntityPass.H_MODE] = EntityPass.MODE_QUADS;
+        Object[] packets = {new Object[]{header, uniforms, vertices.array(), null}};
+        int width = 64, height = 64;
+        for (int frame = 0; frame < 3; frame++) {
+            require(backend.renderWorld(width, height) > 0, "Terrain frame for entities failed");
+            int[] textures = backend.renderEntities(packets);
+            require(textures != null && textures[0] > 0 && textures[1] > 0, "Entity pass did not produce shared textures");
+            ByteBuffer pixels = read(textures[0], width, height);
+            try {
+                int row = height / 2 * width;
+                int front = (row + (int)(.35f * width)) * 4, behind = (row + (int)(.625f * width)) * 4, beside = (row + (int)(.875f * width)) * 4;
+                require(Byte.toUnsignedInt(pixels.get(front + 1)) == 255 && Byte.toUnsignedInt(pixels.get(front + 3)) == 255 && pixels.get(front) == 0,
+                        "Entity in front of terrain missing: frame=" + frame);
+                require(Byte.toUnsignedInt(pixels.get(behind + 3)) == 0, "Entity behind Vulkan terrain depth was drawn: frame=" + frame);
+                require(Byte.toUnsignedInt(pixels.get(beside + 1)) == 255 && Byte.toUnsignedInt(pixels.get(beside + 3)) == 255, "Entity beside terrain missing: frame=" + frame);
+            } finally { MemoryUtil.memFree(pixels); }
+            java.nio.FloatBuffer depths = MemoryUtil.memAllocFloat(width * height);
+            int bound = glGetInteger(GL_TEXTURE_BINDING_2D);
+            try {
+                glBindTexture(GL_TEXTURE_2D, textures[1]); glGetTexImage(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, GL_FLOAT, depths);
+                int row = height / 2 * width;
+                require(Math.abs(depths.get(row + (int)(.35f * width)) - .5f) < 1e-5f && Math.abs(depths.get(row + (int)(.625f * width)) - .6f) < 1e-5f
+                        && Math.abs(depths.get(row + (int)(.875f * width)) - .7f) < 1e-5f, "Entity depth is not terrain depth plus entity writes");
+            } finally { glBindTexture(GL_TEXTURE_2D, bound); MemoryUtil.memFree(depths); }
+            backend.finishWorldFrame();
+        }
+        long[] stats = backend.worldStats();
+        require(stats[18] >= 3 && stats[19] >= 3 && stats[21] >= 2 && stats[23] == 0, "Entity statistics wrong: " + java.util.Arrays.toString(stats));
+        System.out.println("ENTITY_SMOKE=OK (entity texture mirror, terrain depth test, entity depth export, both slots)");
+    }
+    /** NEW_ENTITY layout: position, color, uv0, overlay uv1, light uv2, normal + padding (36 bytes). */
+    private static void entityQuad(ByteBuffer vertices, float x0, float x1, float z) {
+        float[][] corners = {{x0, -.3f}, {x1, -.3f}, {x1, .3f}, {x0, .3f}};
+        for (float[] c : corners) vertices.putFloat(c[0]).putFloat(c[1]).putFloat(z).putInt(-1).putFloat(.25f).putFloat(.25f)
+                .putShort((short)0).putShort((short)10).putShort((short)240).putShort((short)240).put((byte)0).put((byte)0).put((byte)127).put((byte)0);
     }
     private static ByteBuffer quad(ByteBuffer vertices, float z, int abgr) {
         float[][] corners = {{-.5f,-.5f},{.5f,-.5f},{.5f,.5f},{.5f,.5f},{-.5f,.5f},{-.5f,-.5f}};
