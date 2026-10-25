@@ -27,6 +27,8 @@ public final class WorldClientSmoke {
     private static long firstEpoch;
     private static double dayBrightness, nightBrightness;
     private static long lightBaseline;
+    private static int originalWidth, originalHeight, swapchainBaseline;
+    private static long minimizedFrames;
     private static final long START = System.nanoTime();
     private static Path report;
 
@@ -39,6 +41,17 @@ public final class WorldClientSmoke {
                 report = mc.gameDirectory.toPath().resolve("logs/vulkanforge/world-client-smoke");
                 Files.createDirectories(report);
                 Files.writeString(report.resolve("report.txt"), "");
+                Files.deleteIfExists(report.resolve("main-swapchain.png"));
+                Files.deleteIfExists(report.resolve("resized-swapchain.png"));
+                Files.deleteIfExists(report.resolve("restored-swapchain.png"));
+                if (System.getProperty("vulkanforge.directPresent", "true").equalsIgnoreCase("true") && System.getProperty("os.name").startsWith("Windows")) {
+                    require(NativeMainWindow.active(), "Vulkan main-window initialization fell back to OpenGL");
+                    require(org.lwjgl.glfw.GLFW.glfwGetWindowAttrib(mc.getWindow().getWindow(), org.lwjgl.glfw.GLFW.GLFW_CLIENT_API) == org.lwjgl.glfw.GLFW.GLFW_NO_API,
+                            "Main window still has an OpenGL context");
+                    require(org.lwjgl.glfw.GLFW.glfwGetCurrentContext() != mc.getWindow().getWindow(), "Legacy GL context must belong to the hidden window");
+                    require(NativeMainWindow.presentedFrames() > 0, "No frames presented to main swapchain");
+                    log("PASS ASM hooks, GLFW_NO_API main window, hidden GL context and Vulkan presentation");
+                }
                 stage = 1;
                 mc.options.pauseOnLostFocus = false;
                 mc.options.renderDistance().set(3);
@@ -73,6 +86,7 @@ public final class WorldClientSmoke {
                 VulkanPreview.toggle(); stage = 3; ticks = 0;
             } else if (stage == 3 && ++ticks > 100 && VulkanPreview.worldEpoch() > 0 && VulkanPreview.capturedSections() >= 10) {
                 firstHash = VulkanPreview.saveWorldFrame(report.resolve("before.png"));
+                if (NativeMainWindow.active()) NativeMainWindow.captureNext(report.resolve("main-swapchain.png"));
                 net.minecraft.client.Screenshot.grab(mc.gameDirectory, "world-smoke-main.png", mc.getMainRenderTarget(), message -> { });
                 firstEpoch = VulkanPreview.worldEpoch();
                 log("PASS real block atlas and section capture, epoch=" + firstEpoch + ", sections=" + VulkanPreview.capturedSections());
@@ -114,8 +128,36 @@ public final class WorldClientSmoke {
                 VulkanPreview.saveWorldFrame(report.resolve("day-restored.png"));
                 require(brightness(report.resolve("day-restored.png")) > nightBrightness * 1.15, "Day lightmap did not restore brightness");
                 log("PASS daylight restoration; animated atlas patches=" + VulkanPreview.atlasPatches());
-                log("STATUS=OK");
-                stage = 99; mc.stop();
+                if (NativeMainWindow.active()) {
+                    originalWidth = mc.getWindow().getScreenWidth(); originalHeight = mc.getWindow().getScreenHeight();
+                    swapchainBaseline = NativeMainWindow.swapchainGenerations();
+                    org.lwjgl.glfw.GLFW.glfwSetWindowSize(mc.getWindow().getWindow(), originalWidth == 1000 ? 900 : 1000, 650);
+                    stage = 9; ticks = 0;
+                } else { log("STATUS=OK"); stage = 99; mc.stop(); }
+            } else if (stage == 9 && ++ticks > 40) {
+                require(NativeMainWindow.swapchainGenerations() > swapchainBaseline, "Main swapchain did not rebuild after resize");
+                verifyCapture(report.resolve("main-swapchain.png"), originalWidth, originalHeight);
+                log("PASS main-window resize and swapchain capture, frames=" + NativeMainWindow.presentedFrames());
+                NativeMainWindow.captureNext(report.resolve("resized-swapchain.png"));
+                stage = 12; ticks = 0;
+            } else if (stage == 12 && ++ticks > 10) {
+                verifyCapture(report.resolve("resized-swapchain.png"), originalWidth == 1000 ? 900 : 1000, 650);
+                org.lwjgl.glfw.GLFW.glfwIconifyWindow(mc.getWindow().getWindow());
+                stage = 10; ticks = 0; minimizedFrames = NativeMainWindow.presentedFrames();
+            } else if (stage == 10 && ++ticks > 20) {
+                require(NativeMainWindow.presentedFrames() == minimizedFrames, "Vulkan should skip minimized-window presentation");
+                org.lwjgl.glfw.GLFW.glfwRestoreWindow(mc.getWindow().getWindow());
+                org.lwjgl.glfw.GLFW.glfwSetWindowSize(mc.getWindow().getWindow(), originalWidth, originalHeight);
+                stage = 11; ticks = 0;
+            } else if (stage == 11 && ++ticks > 40) {
+                require(NativeMainWindow.presentedFrames() > minimizedFrames, "Presentation did not resume after restoring window");
+                log("PASS minimize/restore; Vulkan presented frames=" + NativeMainWindow.presentedFrames());
+                NativeMainWindow.captureNext(report.resolve("restored-swapchain.png"));
+                stage = 13; ticks = 0;
+            } else if (stage == 13 && ++ticks > 10) {
+                verifyCapture(report.resolve("restored-swapchain.png"), originalWidth, originalHeight);
+                log("PASS non-black swapchain pixels before resize, after resize and after restore");
+                log("STATUS=OK"); stage = 99; mc.stop();
             }
         } catch (Throwable error) {
             VulkanForge.LOGGER.error("World client smoke failed at stage " + stage, error);
@@ -129,6 +171,16 @@ public final class WorldClientSmoke {
         Files.writeString(report.resolve("report.txt"), message + System.lineSeparator(), StandardOpenOption.CREATE, StandardOpenOption.APPEND);
     }
     private static void require(boolean condition, String message) { if (!condition) throw new AssertionError(message); }
+    private static void verifyCapture(Path path, int width, int height) throws java.io.IOException {
+        var image = javax.imageio.ImageIO.read(path.toFile());
+        require(image != null && image.getWidth() == width && image.getHeight() == height, "Wrong swapchain screenshot extent: " + path);
+        int visible = 0; var colors = new java.util.HashSet<Integer>();
+        for (int y = 0; y < height; y++) for (int x = 0; x < width; x++) {
+            int color = image.getRGB(x, y) & 0xffffff; colors.add(color);
+            if (((color >> 16) & 255) + ((color >> 8) & 255) + (color & 255) > 24) visible++;
+        }
+        require(visible > width * height / 10 && colors.size() > 64, "Swapchain screenshot is blank or lacks game content: " + path);
+    }
     private static double brightness(Path path) throws java.io.IOException {
         var image = javax.imageio.ImageIO.read(path.toFile());
         double sum = 0; int count = 0;

@@ -1,4 +1,4 @@
-package dev.vulkanforge.lab;
+package github.com.gengyoubo.vulkanforge.lab;
 
 import dev.vulkanforge.bridge.FrameProtocol;
 import dev.vulkanforge.bridge.WorldProtocol;

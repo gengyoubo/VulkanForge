@@ -1,10 +1,10 @@
-package dev.vulkanforge.lab;
+package github.com.gengyoubo.vulkanforge.lab;
 
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.*;
-import java.nio.ByteBuffer;
+
 import static org.lwjgl.vulkan.VK10.*;
-import static dev.vulkanforge.lab.VulkanContext.check;
+import static github.com.gengyoubo.vulkanforge.lab.VulkanContext.check;
 
 final class GpuBuffer implements AutoCloseable {
     final VulkanContext context;

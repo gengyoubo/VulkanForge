@@ -1,9 +1,9 @@
-package dev.vulkanforge.lab;
+package github.com.gengyoubo.vulkanforge.lab;
 
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.*;
 import java.nio.LongBuffer;
-import static dev.vulkanforge.lab.VulkanContext.check;
+import static github.com.gengyoubo.vulkanforge.lab.VulkanContext.check;
 import static org.lwjgl.system.MemoryUtil.NULL;
 import static org.lwjgl.util.shaderc.Shaderc.*;
 import static org.lwjgl.vulkan.VK10.*;

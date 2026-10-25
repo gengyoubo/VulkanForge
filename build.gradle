@@ -9,6 +9,7 @@ group = mod_group_id
 base { archivesName = mod_id }
 java.toolchain.languageVersion = JavaLanguageVersion.of(17)
 sourceSets.main.java.srcDir 'bridge-protocol/src/main/java'
+sourceSets.main.java.srcDir 'gl-interop/src/main/java'
 sourceSets {
     smoke {
         compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
@@ -26,6 +27,7 @@ minecraft {
             mods { vulkanforge { source sourceSets.main } }
         }
         client {
+            property 'vulkanforge.directPresent', System.getProperty('vulkanforge.directPresent', 'true')
             if (project.hasProperty('worldSmoke')) {
                 property 'vulkanforge.worldSmoke', 'true'
                 mods { vulkanforge { source sourceSets.smoke } }
@@ -48,8 +50,26 @@ tasks.named('processResources', ProcessResources) {
     filesMatching('META-INF/mods.toml') { expand version: project.version }
     from(labJar) { into 'vulkanforge'; rename { 'vulkan-lab.jar' } }
 }
-tasks.named('jar', Jar) { finalizedBy 'reobfJar' }
+tasks.named('jar', Jar) {
+    finalizedBy 'reobfJar'
+}
 tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
 
 tasks.register('runProbe') { dependsOn ':vulkan-lab:runProbe' }
 tasks.register('runTriangle') { dependsOn ':vulkan-lab:runTriangle' }
+
+if (project.hasProperty('worldSmoke')) {
+    tasks.matching { it.name == 'runClient' }.configureEach {
+        doFirst {
+            def report = file('run/logs/vulkanforge/world-client-smoke/report.txt')
+            report.parentFile.mkdirs()
+            report.text = 'STATUS=RUNNING\n'
+        }
+        doLast {
+            def report = file('run/logs/vulkanforge/world-client-smoke/report.txt')
+            if (!report.exists() || !report.text.contains('STATUS=OK')) {
+                throw new GradleException('World client smoke did not finish successfully; see run/logs/vulkanforge/world-client-smoke/report.txt')
+            }
+        }
+    }
+}

@@ -10,6 +10,6 @@ public final class VulkanForge {
     public static final Logger LOGGER = LogUtils.getLogger();
 
     public VulkanForge() {
-        LOGGER.info("VulkanForge loaded: in-window offscreen preview, Vulkan lab and capability detection");
+        LOGGER.info("VulkanForge loaded: ASM main-window Vulkan presentation, terrain bridge and capability detection");
     }
 }

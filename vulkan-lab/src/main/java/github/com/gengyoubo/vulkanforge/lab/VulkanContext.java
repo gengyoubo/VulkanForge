@@ -1,4 +1,4 @@
-package dev.vulkanforge.lab;
+package github.com.gengyoubo.vulkanforge.lab;
 
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
@@ -27,6 +27,26 @@ final class VulkanContext implements AutoCloseable {
     private long messenger;
     private VkDebugUtilsMessengerCallbackEXT debugCallback;
     private final AtomicInteger validationErrors = new AtomicInteger();
+    private boolean interop;
+    private byte[] deviceUUID;
+
+    void initializeInterop(byte[] uuid, boolean requireValidation) {
+        interop = true; deviceUUID = uuid;
+        initialize(0, VK.getInstanceVersionSupported(), requireValidation);
+    }
+
+    void attachWin32(long hwnd, long hinstance) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            var info = VkWin32SurfaceCreateInfoKHR.calloc(stack).sType$Default().hwnd(hwnd)
+                    .hinstance(hinstance);
+            var handle = stack.mallocLong(1);
+            check(org.lwjgl.vulkan.KHRWin32Surface.vkCreateWin32SurfaceKHR(instance, info, null, handle), "vkCreateWin32SurfaceKHR(main window)");
+            surface = handle.get(0);
+            var supported = stack.ints(0);
+            check(vkGetPhysicalDeviceSurfaceSupportKHR(physical, queueFamily, surface, supported), "main window present support");
+            if (supported.get(0) == 0) throw new IllegalStateException("Selected GPU cannot present to the Minecraft window");
+        }
+    }
 
     void initialize(long window, int loaderVersion, boolean requireValidation) {
         boolean offscreen = window == NULL;
@@ -37,10 +57,11 @@ final class VulkanContext implements AutoCloseable {
             if (requireValidation && !debug) throw new IllegalStateException("VK_EXT_debug_utils is unavailable");
             System.out.println("VALIDATION=" + (debug ? "ENABLED" : "UNAVAILABLE"));
 
-            PointerBuffer glfwExtensions = offscreen ? null : glfwGetRequiredInstanceExtensions();
+            PointerBuffer glfwExtensions = interop ? stack.pointers(stack.UTF8(VK_KHR_SURFACE_EXTENSION_NAME), stack.UTF8(org.lwjgl.vulkan.KHRWin32Surface.VK_KHR_WIN32_SURFACE_EXTENSION_NAME))
+                    : offscreen ? null : glfwGetRequiredInstanceExtensions();
             if (!offscreen && glfwExtensions == null) throw new IllegalStateException("GLFW Vulkan surface extensions are unavailable");
-            PointerBuffer extensions = stack.mallocPointer((offscreen ? 0 : glfwExtensions.remaining()) + (debug ? 1 : 0));
-            if (!offscreen) extensions.put(glfwExtensions);
+            PointerBuffer extensions = stack.mallocPointer((glfwExtensions == null ? 0 : glfwExtensions.remaining()) + (debug ? 1 : 0));
+            if (glfwExtensions != null) extensions.put(glfwExtensions);
             if (debug) extensions.put(stack.UTF8(VK_EXT_DEBUG_UTILS_EXTENSION_NAME));
             extensions.flip();
 
@@ -85,6 +106,9 @@ final class VulkanContext implements AutoCloseable {
             VkDeviceCreateInfo deviceInfo = VkDeviceCreateInfo.calloc(stack).sType$Default().pQueueCreateInfos(queueInfo)
                     .pNext(enabled.address());
             if (!offscreen) deviceInfo.ppEnabledExtensionNames(stack.pointers(stack.UTF8(VK_KHR_SWAPCHAIN_EXTENSION_NAME)));
+            if (interop) deviceInfo.ppEnabledExtensionNames(stack.pointers(stack.UTF8(VK_KHR_SWAPCHAIN_EXTENSION_NAME),
+                    stack.UTF8(org.lwjgl.vulkan.KHRExternalMemoryWin32.VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME),
+                    stack.UTF8(org.lwjgl.vulkan.KHRExternalSemaphoreWin32.VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME)));
             check(vkCreateDevice(physical, deviceInfo, null, pointer), "vkCreateDevice");
             device = new VkDevice(pointer.get(0), physical, deviceInfo);
             vkGetDeviceQueue(device, queueFamily, 0, pointer);
@@ -125,6 +149,16 @@ final class VulkanContext implements AutoCloseable {
                 presentation = formats && count.get(0) > 0;
             }
             boolean suitable = api && family >= 0 && dynamicRendering && synchronization2 && (offscreen || (swapchain && presentation));
+            if (interop) {
+                var id = VkPhysicalDeviceIDProperties.calloc(stack).sType$Default();
+                var properties2 = VkPhysicalDeviceProperties2.calloc(stack).sType$Default().pNext(id.address());
+                vkGetPhysicalDeviceProperties2(candidate, properties2);
+                byte[] uuid = new byte[16]; id.deviceUUID().get(uuid);
+                suitable &= java.util.Arrays.equals(uuid, deviceUUID)
+                        && hasDeviceExtension(candidate, stack, VK_KHR_SWAPCHAIN_EXTENSION_NAME)
+                        && hasDeviceExtension(candidate, stack, org.lwjgl.vulkan.KHRExternalMemoryWin32.VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME)
+                        && hasDeviceExtension(candidate, stack, org.lwjgl.vulkan.KHRExternalSemaphoreWin32.VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
+            }
             System.out.printf("GPU[%d]=%s | API=%s | driverRaw=%s | vendor=0x%04x | device=0x%04x%n",
                     i, props.deviceNameString(), version(props.apiVersion()), Integer.toUnsignedString(props.driverVersion()), props.vendorID(), props.deviceID());
             System.out.printf("  api14=%s swapchain=%s graphicsQueue=%d dynamicRendering=%s synchronization2=%s presentation=%s eligible=%s%n",
@@ -185,6 +219,7 @@ final class VulkanContext implements AutoCloseable {
         if (result != VK_SUCCESS) throw new IllegalStateException(operation + " failed: VkResult=" + result);
     }
     int validationErrors() { return validationErrors.get(); }
+    boolean validationEnabled() { return messenger != 0; }
 
     @Override public void close() {
         if (device != null) {

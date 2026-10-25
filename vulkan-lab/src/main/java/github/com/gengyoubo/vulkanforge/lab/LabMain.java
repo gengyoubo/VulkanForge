@@ -1,4 +1,4 @@
-package dev.vulkanforge.lab;
+package github.com.gengyoubo.vulkanforge.lab;
 
 import org.lwjgl.glfw.GLFWErrorCallback;
 import org.lwjgl.system.MemoryStack;
