@@ -1,0 +1,2 @@
+// Allows fast standalone development: gradlew -p vulkan-lab runProbe
+rootProject.name = 'vulkan-lab'

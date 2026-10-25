@@ -1,0 +1,44 @@
+plugins {
+    id 'java'
+    id 'idea'
+    id 'net.minecraftforge.gradle' version '6.0.54'
+}
+
+version = mod_version
+group = mod_group_id
+base { archivesName = mod_id }
+java.toolchain.languageVersion = JavaLanguageVersion.of(17)
+sourceSets.main.java.srcDir 'bridge-protocol/src/main/java'
+
+minecraft {
+    mappings channel: 'official', version: minecraft_version
+    copyIdeResources = true
+    runs {
+        configureEach {
+            workingDirectory project.file('run')
+            property 'forge.logging.console.level', 'info'
+            mods { vulkanforge { source sourceSets.main } }
+        }
+        client { }
+        server { args '--nogui' }
+    }
+}
+
+dependencies {
+    minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+}
+
+// The lab's LWJGL and native libraries are deliberately outside Minecraft's classpath.
+evaluationDependsOn(':vulkan-lab')
+def labJar = project(':vulkan-lab').tasks.named('fatJar')
+tasks.named('processResources', ProcessResources) {
+    dependsOn labJar
+    inputs.property 'version', project.version
+    filesMatching('META-INF/mods.toml') { expand version: project.version }
+    from(labJar) { into 'vulkanforge'; rename { 'vulkan-lab.jar' } }
+}
+tasks.named('jar', Jar) { finalizedBy 'reobfJar' }
+tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
+
+tasks.register('runProbe') { dependsOn ':vulkan-lab:runProbe' }
+tasks.register('runTriangle') { dependsOn ':vulkan-lab:runTriangle' }

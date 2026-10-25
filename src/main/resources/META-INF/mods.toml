@@ -1,0 +1,25 @@
+modLoader="javafml"
+loaderVersion="[47,48)"
+license="All Rights Reserved"
+
+[[mods]]
+modId="vulkanforge"
+version="${version}"
+displayName="VulkanForge"
+authors="gengy"
+displayTest="IGNORE_ALL_VERSION"
+description='''Experimental Vulkan 1.4 laboratory for Minecraft Forge 1.20.1. Runs capability detection and a separate triangle window; game rendering is still vanilla.'''
+
+[[dependencies.vulkanforge]]
+modId="forge"
+mandatory=true
+versionRange="[47.4.28,48)"
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.vulkanforge]]
+modId="minecraft"
+mandatory=true
+versionRange="[1.20.1]"
+ordering="NONE"
+side="BOTH"

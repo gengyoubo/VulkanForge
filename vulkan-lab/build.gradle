@@ -1,0 +1,40 @@
+plugins { id 'java'; id 'application' }
+group = 'dev.vulkanforge'
+version = '0.1.0'
+java.toolchain.languageVersion = JavaLanguageVersion.of(17)
+sourceSets.main.java.srcDir '../bridge-protocol/src/main/java'
+repositories { mavenCentral() }
+
+def lwjglVersion = '3.3.6'
+dependencies {
+    implementation platform("org.lwjgl:lwjgl-bom:${lwjglVersion}")
+    ['lwjgl', 'lwjgl-glfw', 'lwjgl-vulkan', 'lwjgl-shaderc'].each {
+        implementation "org.lwjgl:${it}"
+    }
+    // Stage 1 supports Windows/Linux x86_64. Vulkan loader comes from the GPU driver.
+    ['natives-windows', 'natives-linux'].each { platform ->
+        ['lwjgl', 'lwjgl-glfw', 'lwjgl-shaderc'].each {
+            runtimeOnly "org.lwjgl:${it}::${platform}"
+        }
+    }
+}
+application { mainClass = 'dev.vulkanforge.lab.LabMain' }
+tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
+tasks.register('fatJar', Jar) {
+    archiveFileName = 'vulkan-lab.jar'
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest { attributes 'Main-Class': application.mainClass.get() }
+    from sourceSets.main.output
+    from { configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) } }
+    exclude 'META-INF/*.SF', 'META-INF/*.RSA', 'META-INF/*.DSA', 'module-info.class', 'META-INF/versions/**/module-info.class'
+}
+tasks.register('runProbe', JavaExec) {
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = application.mainClass
+    args '--probe'
+}
+tasks.register('runTriangle', JavaExec) {
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = application.mainClass
+    args '--triangle'
+}
