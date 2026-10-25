@@ -30,6 +30,7 @@ public final class MainWindowBackend implements AutoCloseable {
     private final java.util.Map<Integer, Object[]> mirroredTextures = new java.util.HashMap<>();
     private java.util.List<Object[]> guiPackets = java.util.List.of();
     private int width, height, format, generations, requestedWidth, requestedHeight;
+    private long graphPasses, graphBarriers;
     private long frames, skippedExtents, abandonedFrames;
     private long earlyAcquires, lateAcquires, cancelledAcquires, acquireNanos, maxAcquireNanos;
     private long fenceWaitNanos, maxFenceWaitNanos, presentNanos, maxPresentNanos;
@@ -94,6 +95,9 @@ public final class MainWindowBackend implements AutoCloseable {
     public int generations() { return generations; }
     public long earlyAcquires() { return earlyAcquires; }
     public long lateAcquires() { return lateAcquires; }
+    public boolean gpuDrivenEnabled() { return context.capabilities.gpuDriven() && !Boolean.getBoolean("vulkanforge.disableGpuDriven"); }
+    public long[] optimizationStats() { return world == null ? new long[4] : world.optimizationStats(); }
+    public long[] uploadStats() { return context.uploads.stats(); }
     public int validationErrors() { return context.validationErrors(); }
     public boolean gpuTimingsEnabled() { return timers != null && timers.enabled(); }
     public long gpuTimingSamples(int metric) { return timers == null ? 0 : timers.samples(metric); }
@@ -209,48 +213,36 @@ public final class MainWindowBackend implements AutoCloseable {
                 check(vkResetCommandBuffer(command, 0), "reset presentation command");
                 check(vkBeginCommandBuffer(command, VkCommandBufferBeginInfo.calloc(stack).sType$Default().flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)), "begin presentation command");
                 timers.begin(command, timerSlot);
-                // Both semaphores are waited at BLIT; the barriers' first scope must include BLIT to chain after those waits.
-                var barriers = VkImageMemoryBarrier2.calloc(2, stack);
-                barriers.get(0).sType$Default().srcStageMask(VK_PIPELINE_STAGE_2_BLIT_BIT).dstStageMask(VK_PIPELINE_STAGE_2_BLIT_BIT)
-                        .dstAccessMask(VK_ACCESS_2_TRANSFER_READ_BIT).oldLayout(VK_IMAGE_LAYOUT_GENERAL).newLayout(VK_IMAGE_LAYOUT_GENERAL)
-                        .srcQueueFamilyIndex(VK_QUEUE_FAMILY_EXTERNAL).dstQueueFamilyIndex(context.queueFamily).image(shared.image)
-                        .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
-                barriers.get(1).sType$Default().srcStageMask(VK_PIPELINE_STAGE_2_BLIT_BIT).dstStageMask(VK_PIPELINE_STAGE_2_BLIT_BIT)
-                        .dstAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT).oldLayout(VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
-                        .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).image(images[image])
-                        .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
-                vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barriers));
-                var blit = VkImageBlit.calloc(1, stack).srcSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1))
-                        .dstSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1));
-                blit.srcOffsets(0).set(0, height, 0); blit.srcOffsets(1).set(width, 0, 1);
-                blit.dstOffsets(0).set(0, 0, 0); blit.dstOffsets(1).set(width, height, 1);
-                timers.start(command, timerSlot, 0, VK_PIPELINE_STAGE_2_BLIT_BIT);
-                vkCmdBlitImage(command, shared.image, VK_IMAGE_LAYOUT_GENERAL, images[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, blit, VK_FILTER_NEAREST);
-                timers.end(command, timerSlot, 0, VK_PIPELINE_STAGE_2_BLIT_BIT);
-                boolean hasGui = !packets.isEmpty();
-                if (hasGui) {
-                    var toGui = VkImageMemoryBarrier2.calloc(1, stack).sType$Default()
-                            .srcStageMask(VK_PIPELINE_STAGE_2_BLIT_BIT).srcAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
-                            .dstStageMask(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT)
-                            .dstAccessMask(VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT)
-                            .oldLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
-                            .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).image(images[image])
-                            .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
-                    vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(toGui));
-                    gui.record(command, stack, timerSlot, views[image], width, height, packets);
+                // Imported ownership and per-pass usages generate the synchronization2 barriers.
+                var graph = new FrameGraph();
+                var source = new FrameGraph.Image("GL framebuffer", shared.image, VK_IMAGE_ASPECT_COLOR_BIT,
+                        new FrameGraph.State(VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_BLIT_BIT, 0, VK_QUEUE_FAMILY_EXTERNAL));
+                var target = new FrameGraph.Image("Swapchain", images[image], VK_IMAGE_ASPECT_COLOR_BIT,
+                        FrameGraph.state(VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_BLIT_BIT, 0));
+                graph.pass("GL blit", () -> {
+                    var blit = VkImageBlit.calloc(1, stack).srcSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1))
+                            .dstSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1));
+                    blit.srcOffsets(0).set(0, height, 0); blit.srcOffsets(1).set(width, 0, 1);
+                    blit.dstOffsets(0).set(0, 0, 0); blit.dstOffsets(1).set(width, height, 1);
+                    timers.start(command, timerSlot, 0, VK_PIPELINE_STAGE_2_BLIT_BIT);
+                    vkCmdBlitImage(command, shared.image, VK_IMAGE_LAYOUT_GENERAL, images[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, blit, VK_FILTER_NEAREST);
+                    timers.end(command, timerSlot, 0, VK_PIPELINE_STAGE_2_BLIT_BIT);
+                }, FrameGraph.use(source, new FrameGraph.State(VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, context.queueFamily)),
+                        FrameGraph.use(target, FrameGraph.state(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT)));
+                if (!packets.isEmpty()) graph.pass("GUI", () -> gui.record(command, stack, timerSlot, views[image], width, height, packets),
+                        FrameGraph.use(target, FrameGraph.state(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT)));
+                if (capture != null) {
+                    proof = new CaptureBuffer(context, width * height * 4); final CaptureBuffer screenshot = proof;
+                    graph.pass("Capture", () -> screenshot.recordCopy(command, images[image], width, height, stack),
+                            FrameGraph.use(target, FrameGraph.state(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT)));
                 }
-                // Optional diagnostic readback, never used by the normal presentation path.
-                if (capture != null) { proof = new CaptureBuffer(context, width * height * 4); proof.record(command, images[image], width, height, stack, hasGui); }
-                // The presentation engine/scanout is outside command-buffer timestamp scope.
-                timers.start(command, timerSlot, 1, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
-                barriers.get(0).srcStageMask(VK_PIPELINE_STAGE_2_BLIT_BIT).srcAccessMask(VK_ACCESS_2_TRANSFER_READ_BIT)
-                        .dstStageMask(VK_PIPELINE_STAGE_2_NONE).dstAccessMask(0).srcQueueFamilyIndex(context.queueFamily).dstQueueFamilyIndex(VK_QUEUE_FAMILY_EXTERNAL);
-                barriers.get(1).srcStageMask(proof != null ? VK_PIPELINE_STAGE_2_COPY_BIT : hasGui ? VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_2_BLIT_BIT)
-                        .srcAccessMask(proof != null ? VK_ACCESS_2_TRANSFER_READ_BIT : hasGui ? VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT : VK_ACCESS_2_TRANSFER_WRITE_BIT)
-                        .dstStageMask(VK_PIPELINE_STAGE_2_NONE).dstAccessMask(0).oldLayout(proof != null ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : hasGui ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
-                        .newLayout(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-                vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barriers));
-                timers.end(command, timerSlot, 1, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+                // Start before the terminal graph node so PRESENT_PREPARE includes the generated release barriers.
+                graph.pass("Present timer", () -> timers.start(command, timerSlot, 1, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT));
+                graph.pass("Present", java.util.List.of("Present timer"), () -> timers.end(command, timerSlot, 1, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT),
+                        FrameGraph.use(source, new FrameGraph.State(VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_QUEUE_FAMILY_EXTERNAL)),
+                        FrameGraph.use(target, FrameGraph.state(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_NONE, 0)));
+                graphBarriers += graph.execute(command, stack); graphPasses += graph.schedule().size();
                 check(vkEndCommandBuffer(command), "end presentation command");
                 var waits = VkSemaphoreSubmitInfo.calloc(2, stack);
                 waits.get(0).sType$Default().semaphore(acquired).stageMask(VK_PIPELINE_STAGE_2_BLIT_BIT);
@@ -418,6 +410,8 @@ public final class MainWindowBackend implements AutoCloseable {
         }
         log("ACQUIRES_BEFORE_INPUT=" + earlyAcquires); log("ACQUIRES_AFTER_RENDER=" + lateAcquires); log("CANCELLED_ACQUIRES=" + cancelledAcquires);
         if (skippedExtents > 0 || abandonedFrames > 0) log("ZERO_EXTENT_FRAMES=" + skippedExtents + " ABANDONED_FRAMES=" + abandonedFrames);
+        log("PRESENT_GRAPH passes=" + graphPasses + " imageBarriers=" + graphBarriers);
+        if (context.uploads != null) log("ASYNC_UPLOADS=" + java.util.Arrays.toString(context.uploads.stats()));
         context.close(); log("FINAL_PRESENTED_FRAMES=" + frames); log("VALIDATION_ERRORS=" + context.validationErrors());
         if (report != null) { report.close(); report = null; }
     }

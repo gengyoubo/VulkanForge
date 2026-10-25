@@ -26,7 +26,7 @@ final class GuiPassSmoke {
         byte[] vertices = (byte[]) patch[2]; var data = ByteBuffer.wrap(vertices).order(ByteOrder.LITTLE_ENDIAN);
         for (int i = 0; i < 4; i++) { data.putFloat(i * 20 + 12, .25f); data.putFloat(i * 20 + 16, .25f); }
         patch[4] = new int[]{0, 0, 320, 480};
-        Object[] untouched = quad(FORMAT_POSITION_TEX, 4, 0, 9001, -1, 0);
+        Object[] untouched = quad(FORMAT_TEXT, 2, 0, 9001, -1, 0); // texelFetch lightmap at (15,15), not a 1x1 fallback
         backend.gui(new Object[]{red, new Object[]{null, new int[]{0,0,640,480}}, behind, untouched, patch});
         Path second = output.resolve("gui-patch-clear.png"); backend.captureNext(second.toString()); backend.present(source, 320, 240, 640, 480);
         image = ImageIO.read(second.toFile());
@@ -41,11 +41,12 @@ final class GuiPassSmoke {
         System.out.println("GUI_SWAPCHAIN_SMOKE=OK (alpha, scissor, depth, depth clear, incremental texture patch, no world renderer)");
     }
     private static Object[] quad(int format, int variant, int flags, int texture, int color, float z) {
-        int stride = format == FORMAT_POSITION_TEX ? 20 : 16;
+        int stride = format == FORMAT_TEXT ? 28 : format == FORMAT_POSITION_TEX ? 20 : 16;
         var bytes = ByteBuffer.allocate(stride * 4).order(ByteOrder.LITTLE_ENDIAN);
         for (float[] xy : new float[][]{{-.9f,-.9f},{.9f,-.9f},{.9f,.9f},{-.9f,.9f}}) {
             bytes.putFloat(xy[0]).putFloat(xy[1]).putFloat(z);
-            if (format == FORMAT_POSITION_TEX) bytes.putFloat(.75f).putFloat(.75f); else bytes.putInt(color);
+            if (format == FORMAT_POSITION_TEX) bytes.putFloat(.75f).putFloat(.75f);
+            else { bytes.putInt(color); if (format == FORMAT_TEXT) bytes.putFloat(.75f).putFloat(.75f).putShort((short)240).putShort((short)240); }
         }
         int[] header = {format, variant, flags, texture, texture, 4, MODE_QUADS, 0, 0};
         float[] uniforms = new float[64];

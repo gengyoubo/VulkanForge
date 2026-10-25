@@ -22,6 +22,8 @@ final class VulkanContext implements AutoCloseable {
     VkPhysicalDevice physical;
     VkDevice device;
     VkQueue queue;
+    DeviceCapabilities capabilities;
+    AsyncUploads uploads;
     int queueFamily = -1;
     long surface;
     private long messenger;
@@ -103,8 +105,14 @@ final class VulkanContext implements AutoCloseable {
             // Features must be queried AND explicitly enabled even with a Vulkan 1.4 baseline.
             VkPhysicalDeviceVulkan13Features enabled = VkPhysicalDeviceVulkan13Features.calloc(stack).sType$Default()
                     .dynamicRendering(true).synchronization2(true);
+            capabilities = DeviceCapabilities.query(physical, stack);
+            boolean driven = capabilities.gpuDriven() && !Boolean.getBoolean("vulkanforge.disableGpuDriven");
+            var enabled12 = VkPhysicalDeviceVulkan12Features.calloc(stack).sType$Default().pNext(enabled.address())
+                    .timelineSemaphore(capabilities.timeline()).drawIndirectCount(driven);
+            var enabled11 = VkPhysicalDeviceVulkan11Features.calloc(stack).sType$Default().pNext(enabled12.address()).shaderDrawParameters(driven);
+            var core = VkPhysicalDeviceFeatures.calloc(stack).multiDrawIndirect(driven).drawIndirectFirstInstance(driven);
             VkDeviceCreateInfo deviceInfo = VkDeviceCreateInfo.calloc(stack).sType$Default().pQueueCreateInfos(queueInfo)
-                    .pNext(enabled.address());
+                    .pNext(enabled11.address()).pEnabledFeatures(core);
             if (!offscreen) deviceInfo.ppEnabledExtensionNames(stack.pointers(stack.UTF8(VK_KHR_SWAPCHAIN_EXTENSION_NAME)));
             if (interop) deviceInfo.ppEnabledExtensionNames(stack.pointers(stack.UTF8(VK_KHR_SWAPCHAIN_EXTENSION_NAME),
                     stack.UTF8(org.lwjgl.vulkan.KHRExternalMemoryWin32.VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME),
@@ -113,6 +121,9 @@ final class VulkanContext implements AutoCloseable {
             device = new VkDevice(pointer.get(0), physical, deviceInfo);
             vkGetDeviceQueue(device, queueFamily, 0, pointer);
             queue = new VkQueue(pointer.get(0), device);
+            System.out.println("DEVICE_CAPABILITIES=" + capabilities);
+            System.out.println("GPU_DRIVEN_ENABLED=" + driven);
+            uploads = new AsyncUploads(this, capabilities.timeline());
             System.out.println("DEVICE_CREATED=true");
         }
     }
@@ -224,6 +235,7 @@ final class VulkanContext implements AutoCloseable {
     @Override public void close() {
         if (device != null) {
             vkDeviceWaitIdle(device);
+            if (uploads != null) { uploads.close(); uploads = null; }
             vkDestroyDevice(device, null);
             device = null;
         }

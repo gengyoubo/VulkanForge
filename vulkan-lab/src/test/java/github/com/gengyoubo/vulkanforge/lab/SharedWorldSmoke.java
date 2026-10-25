@@ -44,6 +44,11 @@ final class SharedWorldSmoke {
         }
         long[] stats = backend.worldStats();
         require(stats[2] == 45 && stats[3] == 45 && stats[7] == 45 * 12, "Not all 45 sections were drawn");
+        if (backend.gpuDrivenEnabled()) {
+            long[] optimized = backend.optimizationStats();
+            require(optimized[0] == 12 && optimized[2] == 45, "GPU driven batches/arena uploads not exercised: " + java.util.Arrays.toString(optimized));
+            System.out.println("GPU_DRIVEN_SMOKE=OK sections=45 indirectBatches=" + optimized[0] + " arenaUploads=" + optimized[2]);
+        }
         send.accept(camera(1, 3));
         requireAlpha(backend.renderWorld(270, 150), 270, 150, 0);
         backend.finishWorldFrame();

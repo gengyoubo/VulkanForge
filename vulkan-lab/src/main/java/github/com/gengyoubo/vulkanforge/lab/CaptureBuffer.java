@@ -31,6 +31,10 @@ final class CaptureBuffer implements AutoCloseable {
                 .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
                 .image(image).subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
         vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barrier));
+        recordCopy(command, image, width, height, stack);
+    }
+    /** Graph path: the caller declares the image in TRANSFER_SRC_OPTIMAL. */
+    void recordCopy(VkCommandBuffer command, long image, int width, int height, MemoryStack stack) {
         var copy = VkBufferImageCopy.calloc(1, stack).imageSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1))
                 .imageExtent(e -> e.set(width, height, 1));
         vkCmdCopyImageToBuffer(command, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, storage.buffer, copy);

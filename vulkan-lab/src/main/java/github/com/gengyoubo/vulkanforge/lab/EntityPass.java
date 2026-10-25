@@ -21,7 +21,7 @@ final class EntityPass implements AutoCloseable {
     static final int FORMAT_POSITION = 3, FORMAT_POSITION_COLOR = 4, FORMAT_POSITION_TEX = 5, FORMAT_POSITION_TEX_COLOR = 6, FORMAT_CLOUDS = 7;
     /** P11: POSITION_COLOR_TEX (GuiGraphics colored blits, screen-effect overlays). */
     static final int FORMAT_POSITION_COLOR_TEX = 8;
-    /** Texture id of the built-in 1x1 white image used by untextured shaders. */
+    /** Texture id of the built-in 16x16 white image (also the fullbright GUI lightmap) used by untextured shaders. */
     static final int WHITE_TEXTURE = 0;
     static final int MODE_QUADS = 0, MODE_TRIANGLES = 1;
     /** BLEND: premultiplied "over"; BLEND_ADD: GL (SRC_ALPHA, ONE) additive; NO_COLOR: color writes off (cloud depth prepass). */
@@ -47,8 +47,7 @@ final class EntityPass implements AutoCloseable {
     private final Map<Integer, Long> pipelines = new HashMap<>();
     private final SlotResources[] slots;
     private final long[] samplers = new long[4];
-    private long textureLayout, uniformLayout, layout, uploadPool, uploadFence;
-    private VkCommandBuffer upload;
+    private long textureLayout, uniformLayout, layout;
     private GpuBuffer quadIndices;
     private long draws, vertices, textureUploads, missingTextures;
 
@@ -80,15 +79,8 @@ final class EntityPass implements AutoCloseable {
                         .mipmapMode(VK_SAMPLER_MIPMAP_MODE_NEAREST).addressModeU(address).addressModeV(address).addressModeW(address).maxLod(0), null, handle), "entity sampler");
                 samplers[i] = handle.get(0);
             }
-            check(vkCreateCommandPool(context.device, VkCommandPoolCreateInfo.calloc(stack).sType$Default().queueFamilyIndex(context.queueFamily)
-                    .flags(VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT), null, handle), "entity upload pool"); uploadPool = handle.get(0);
-            var pointer = stack.mallocPointer(1);
-            check(vkAllocateCommandBuffers(context.device, VkCommandBufferAllocateInfo.calloc(stack).sType$Default().commandPool(uploadPool)
-                    .level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1), pointer), "entity upload command");
-            upload = new VkCommandBuffer(pointer.get(0), context.device);
-            check(vkCreateFence(context.device, VkFenceCreateInfo.calloc(stack).sType$Default(), null, handle), "entity upload fence"); uploadFence = handle.get(0);
         } catch (Throwable error) { close(); throw error; }
-        try { texture(WHITE_TEXTURE, 1, 1, 0, new byte[]{-1, -1, -1, -1}); textureUploads = 0; }
+        try { byte[] white = new byte[16 * 16 * 4]; Arrays.fill(white, (byte) 255); texture(WHITE_TEXTURE, 16, 16, 0, white); textureUploads = 0; }
         catch (Throwable error) { close(); throw error; }
     }
 
@@ -112,9 +104,9 @@ final class EntityPass implements AutoCloseable {
 
     private void uploadTexture(int id, int width, int height, int flags, byte[] rgba, Texture source, int x, int y, int patchWidth, int patchHeight) {
         GpuImage image = new GpuImage(context, width, height, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
-        try (GpuBuffer staging = new GpuBuffer(context, rgba, VK_BUFFER_USAGE_TRANSFER_SRC_BIT); MemoryStack stack = MemoryStack.stackPush()) {
-            check(vkResetCommandBuffer(upload, 0), "reset entity texture upload");
-            check(vkBeginCommandBuffer(upload, VkCommandBufferBeginInfo.calloc(stack).sType$Default().flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)), "begin entity texture upload");
+        long ticket;
+        try {
+            ticket = context.uploads.submit(rgba, (upload, staging, stack) -> {
             var barrier = VkImageMemoryBarrier2.calloc(1, stack).sType$Default().srcStageMask(VK_PIPELINE_STAGE_2_NONE)
                     .dstStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).dstAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
                     .oldLayout(VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
@@ -147,14 +139,11 @@ final class EntityPass implements AutoCloseable {
                     .dstStageMask(VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT).dstAccessMask(VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)
                     .oldLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             vkCmdPipelineBarrier2(upload, dependency);
-            check(vkEndCommandBuffer(upload), "end entity texture upload");
-            check(vkResetFences(context.device, uploadFence), "reset entity texture fence");
-            check(vkQueueSubmit(context.queue, VkSubmitInfo.calloc(stack).sType$Default().pCommandBuffers(stack.pointers(upload.address())), uploadFence), "submit entity texture");
-            check(vkWaitForFences(context.device, uploadFence, true, 5_000_000_000L), "wait entity texture");
+            });
         } catch (Throwable error) { image.close(); throw error; }
         Texture old = textures.put(id, new Texture(image, flags & 3));
         textureUploads++;
-        if (old != null) retire.accept(old::close);
+        if (old != null) context.uploads.retire(ticket, () -> retire.accept(old::close));
     }
 
     /** Records all draws inside an active dynamic-rendering pass. The slot's previous use must have completed. */
@@ -368,6 +357,7 @@ final class EntityPass implements AutoCloseable {
     }
 
     @Override public void close() {
+        context.uploads.drain();
         textures.values().forEach(Texture::close); textures.clear();
         for (long pipeline : pipelines.values()) vkDestroyPipeline(context.device, pipeline, null);
         pipelines.clear();
@@ -383,7 +373,5 @@ final class EntityPass implements AutoCloseable {
         if (layout != 0) { vkDestroyPipelineLayout(context.device, layout, null); layout = 0; }
         if (textureLayout != 0) { vkDestroyDescriptorSetLayout(context.device, textureLayout, null); textureLayout = 0; }
         if (uniformLayout != 0) { vkDestroyDescriptorSetLayout(context.device, uniformLayout, null); uniformLayout = 0; }
-        if (uploadPool != 0) { vkDestroyCommandPool(context.device, uploadPool, null); uploadPool = 0; }
-        if (uploadFence != 0) { vkDestroyFence(context.device, uploadFence, null); uploadFence = 0; }
     }
 }

@@ -1,9 +1,10 @@
 #version 450
 layout(local_size_x=64) in;
-struct Bounds { vec4 minimum; vec4 maximum; uvec4 draw; };
+struct Bounds { vec4 minimum; vec4 maximum; uvec4 draw; vec4 origin; };
 layout(std430, binding=0) readonly buffer Input { Bounds sections[]; };
 layout(std430, binding=1) writeonly buffer Output { uvec4 commands[]; };
-layout(push_constant) uniform View { mat4 viewProjection; uint count; } view;
+layout(std430, binding=2) buffer Count { uint visibleCount; };
+layout(push_constant) uniform View { mat4 viewProjection; uint count; uint compact; } view;
 void main() {
     uint index = gl_GlobalInvocationID.x;
     if (index >= view.count) return;
@@ -19,5 +20,8 @@ void main() {
                   | (clip.z < -clip.w ? 16u : 0u) | (clip.z > clip.w ? 32u : 0u);
         outside &= mask;
     }
-    commands[index] = uvec4(outside == 0u ? bounds.draw.x : 0u, 1u, 0u, 0u);
+    bool visible = outside == 0u && bounds.draw.x != 0u;
+    if (view.compact != 0u) {
+        if (visible) { uint outputIndex = atomicAdd(visibleCount, 1u); commands[outputIndex] = uvec4(bounds.draw.x, 1u, bounds.draw.y, index); }
+    } else commands[index] = uvec4(visible ? bounds.draw.x : 0u, 1u, 0u, 0u);
 }

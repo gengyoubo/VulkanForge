@@ -12,10 +12,11 @@ import static org.lwjgl.opengl.GL11.*;
 import static org.lwjgl.opengl.GL14.*;
 import static org.lwjgl.opengl.GL30.GL_DRAW_FRAMEBUFFER_BINDING;
 
-/** Holds the GUI until present. Original buffers survive until commit so unsupported draws can replay the complete GUI on GL. */
+/** Holds immutable GUI packets until present; unsupported draws replay the complete GUI on GL in the original order. */
 public final class GuiDraws {
-    private record Draw(BufferBuilder.RenderedBuffer original, Object[] packet, State state) { }
+    private record Draw(VertexFormat format, Object[] packet, State state) { }
     private static final List<Draw> pending = new ArrayList<>();
+    private static final Map<VertexFormat, BufferBuilder> replayBuilders = new IdentityHashMap<>();
     private static boolean active, fallback;
     private static long draws, frames, fallbacks;
     private static final Map<String, Long> reasons = new TreeMap<>();
@@ -51,7 +52,8 @@ public final class GuiDraws {
             reasons.merge(shader + (glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING) != target.frameBufferId ? ":framebuffer" : ":shader/state/texture"), 1L, Long::sum);
             fail(); BufferUploader.drawWithShader(original); return; }
         packet = Arrays.copyOf(packet, 5); packet[4] = rect(glIsEnabled(GL_SCISSOR_TEST));
-        pending.add(new Draw(original, packet, new State()));
+        pending.add(new Draw(original.drawState().format(), packet, new State()));
+        original.release(); // BufferSource may clear/reuse its builder at the very next GuiGraphics.flush.
     }
 
     private static int[] rect(boolean clipped) {
@@ -71,10 +73,13 @@ public final class GuiDraws {
         Map<VertexFormat, VertexBuffer> buffers = new IdentityHashMap<>();
         try {
             for (Draw draw : pending) {
-                if (draw.original == null) { GlStateManager._disableScissorTest(); RenderSystem.depthMask(true); RenderSystem.clear(GL_DEPTH_BUFFER_BIT, Minecraft.ON_OSX); continue; }
+                if (draw.format == null) { GlStateManager._disableScissorTest(); RenderSystem.depthMask(true); RenderSystem.clear(GL_DEPTH_BUFFER_BIT, Minecraft.ON_OSX); continue; }
                 draw.state.restore();
-                VertexBuffer buffer = buffers.computeIfAbsent(draw.original.drawState().format(), key -> new VertexBuffer(VertexBuffer.Usage.DYNAMIC));
-                buffer.bind(); buffer.upload(draw.original);
+                VertexBuffer buffer = buffers.computeIfAbsent(draw.format, key -> new VertexBuffer(VertexBuffer.Usage.DYNAMIC));
+                BufferBuilder builder = replayBuilders.computeIfAbsent(draw.format, key -> new BufferBuilder(4096));
+                builder.begin(VertexFormat.Mode.TRIANGLES, draw.format);
+                builder.putBulkData(triangles(draw.packet, draw.format.getVertexSize()));
+                buffer.bind(); buffer.upload(builder.end());
                 float[] uniforms = (float[]) draw.packet[1];
                 buffer.drawWithShader(new Matrix4f().set(uniforms, 16), new Matrix4f().set(uniforms, 0), draw.state.shader);
             }
@@ -85,17 +90,30 @@ public final class GuiDraws {
         }
     }
 
+    /** Expand sorted/custom indices too; replay must retain the exact painter order saved in the packet. */
+    private static java.nio.ByteBuffer triangles(Object[] packet, int stride) {
+        int[] header = (int[]) packet[0]; byte[] vertices = (byte[]) packet[2], indices = (byte[]) packet[3];
+        int count = indices != null ? header[7] : header[6] == 0 ? header[5] / 4 * 6 : header[5];
+        var result = java.nio.ByteBuffer.allocate(count * stride);
+        var indexData = indices == null ? null : java.nio.ByteBuffer.wrap(indices).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        int[] quad = {0, 1, 2, 2, 3, 0};
+        for (int i = 0; i < count; i++) {
+            int vertex = indexData != null ? header[8] == 2 ? Short.toUnsignedInt(indexData.getShort()) : indexData.getInt()
+                    : header[6] == 0 ? i / 6 * 4 + quad[i % 6] : i;
+            result.put(vertices, vertex * stride, stride);
+        }
+        return result.flip();
+    }
+
     /** Called before the GL framebuffer is copied. Successful GUI frames never draw into a GL target. */
     static Object[] take() {
         Object[] packets = pending.stream().map(Draw::packet).toArray();
-        if (packets.length > 0) { draws += pending.stream().filter(draw -> draw.original != null).count(); frames++; }
-        for (Draw draw : pending) if (draw.original != null) draw.original.release();
+        if (packets.length > 0) { draws += pending.stream().filter(draw -> draw.format != null).count(); frames++; }
         pending.clear(); active = fallback = false;
         return packets;
     }
 
     static void reset() {
-        for (Draw draw : pending) if (draw.original != null) draw.original.release();
         pending.clear(); active = fallback = false;
     }
 

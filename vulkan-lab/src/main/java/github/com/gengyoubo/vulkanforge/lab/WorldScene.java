@@ -11,8 +11,8 @@ import static org.lwjgl.vulkan.VK13.*;
 /** GPU section cache. Commands are applied on the Vulkan thread after the previous frame fence. */
 final class WorldScene implements AutoCloseable {
     /** buffer is null when the section only has translucent geometry; translucent is null when it has none. */
-    private record Section(int x, int y, int z, int vertices, GpuBuffer buffer, float[] bounds, Translucent translucent) implements AutoCloseable {
-        @Override public void close() { if (buffer != null) buffer.close(); if (translucent != null) translucent.close(); }
+    private record Section(int x, int y, int z, int vertices, GpuBuffer buffer, MeshArena.Allocation allocation, float[] bounds, Translucent translucent) implements AutoCloseable {
+        @Override public void close() { if (buffer != null) buffer.close(); if (allocation != null) allocation.close(); if (translucent != null) translucent.close(); }
     }
     /** Frame slots that may record translucent draws concurrently; matches SharedWorldRenderer. */
     static final int TRANSLUCENT_SLOTS = 2;
@@ -63,11 +63,12 @@ final class WorldScene implements AutoCloseable {
     private final Set<Long> tracked = new HashSet<>();
     private final java.util.function.Consumer<String> log;
     private int peakSections;
-    private long epoch, descriptorLayout, descriptorPool, descriptorSet, layout, pipeline, translucentPipeline, sampler, lightSampler, pool, fence;
+    private long epoch, descriptorLayout, descriptorPool, descriptorSet, layout, pipeline, translucentPipeline, sampler, lightSampler;
     private long translucentSorts, translucentDraws;
     private GpuImage atlas, lightMap;
+    private MeshArena arena;
+    private long drivenLayout, drivenPipeline, indirectBatches;
     private long atlasPatches, lightUpdates;
-    private VkCommandBuffer upload;
     private WorldProtocol.Camera camera;
     private boolean receivedMesh;
     private java.util.function.Consumer<Runnable> retirement = Runnable::run;
@@ -100,15 +101,23 @@ final class WorldScene implements AutoCloseable {
             check(vkCreateSampler(context.device, samplerInfo, null, handle), "world atlas sampler"); sampler = handle.get(0);
             samplerInfo.magFilter(VK_FILTER_LINEAR).minFilter(VK_FILTER_LINEAR);
             check(vkCreateSampler(context.device, samplerInfo, null, handle), "world lightmap sampler"); lightSampler = handle.get(0);
-            check(vkCreateCommandPool(context.device, VkCommandPoolCreateInfo.calloc(stack).sType$Default().queueFamilyIndex(context.queueFamily)
-                    .flags(VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT), null, handle), "world upload pool"); pool = handle.get(0);
-            var pointer = stack.mallocPointer(1);
-            check(vkAllocateCommandBuffers(context.device, VkCommandBufferAllocateInfo.calloc(stack).sType$Default().commandPool(pool)
-                    .level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1), pointer), "world upload command");
-            upload = new VkCommandBuffer(pointer.get(0), context.device);
-            check(vkCreateFence(context.device, VkFenceCreateInfo.calloc(stack).sType$Default(), null, handle), "world upload fence"); fence = handle.get(0);
         }
     }
+
+    void enableGpuDriven(GpuCuller culler) {
+        if (!culler.compact()) return;
+        arena = new MeshArena(context, action -> retirement.accept(action));
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            var handle = stack.mallocLong(1);
+            check(vkCreatePipelineLayout(context.device, VkPipelineLayoutCreateInfo.calloc(stack).sType$Default()
+                    .pSetLayouts(stack.longs(descriptorLayout, culler.descriptorLayout()))
+                    .pPushConstantRanges(VkPushConstantRange.calloc(1, stack).stageFlags(VK_SHADER_STAGE_VERTEX_BIT).size(80)), null, handle), "GPU driven world layout");
+            drivenLayout = handle.get(0);
+            drivenPipeline = GraphicsPipeline.create(context, drivenLayout, VK_FORMAT_R8G8B8A8_UNORM, "/shaders/world_driven.vert", true, stack);
+        }
+    }
+    long indirectBatches() { return indirectBatches; }
+    long[] arenaStats() { return arena == null ? new long[3] : arena.stats(); }
 
     void apply(WorldProtocol.Command command) {
         if (command instanceof WorldProtocol.Reset reset) {
@@ -126,11 +135,12 @@ final class WorldScene implements AutoCloseable {
             if (tracked.size() >= GpuCuller.CAPACITY && !tracked.contains(mesh.key())) throw new IllegalStateException("World section cache limit exceeded");
             Section replacement = null;
             if (mesh.vertices().length > 0 || mesh.translucent().length > 0) {
-                GpuBuffer opaque = mesh.vertices().length == 0 ? null : new GpuBuffer(context, mesh.vertices(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+                GpuBuffer opaque = mesh.vertices().length == 0 || arena != null ? null : new GpuBuffer(context, mesh.vertices(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+                MeshArena.Allocation allocation = arena != null && mesh.vertices().length > 0 ? arena.upload(mesh.vertices()) : null;
                 try {
-                    replacement = new Section(mesh.x(), mesh.y(), mesh.z(), mesh.vertices().length / WorldProtocol.STRIDE, opaque,
+                    replacement = new Section(mesh.x(), mesh.y(), mesh.z(), mesh.vertices().length / WorldProtocol.STRIDE, opaque, allocation,
                             bounds(mesh.vertices().length > 0 ? mesh.vertices() : mesh.translucent()), mesh.translucent().length == 0 ? null : new Translucent(mesh.translucent()));
-                } catch (Throwable error) { if (opaque != null) opaque.close(); throw error; }
+                } catch (Throwable error) { if (opaque != null) opaque.close(); if (allocation != null) allocation.close(); throw error; }
             }
             Section old = sections.remove(mesh.key());
             if (old != null) retirement.accept(old::close);
@@ -188,10 +198,7 @@ final class WorldScene implements AutoCloseable {
     }
 
     private void uploadPixels(GpuImage image, int x, int y, int width, int height, byte[] rgba, boolean fresh) {
-        try (GpuBuffer staging = new GpuBuffer(context, rgba, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-             MemoryStack stack = MemoryStack.stackPush()) {
-            check(vkResetCommandBuffer(upload, 0), "reset atlas upload");
-            check(vkBeginCommandBuffer(upload, VkCommandBufferBeginInfo.calloc(stack).sType$Default().flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)), "begin atlas upload");
+        context.uploads.submit(rgba, (upload, staging, stack) -> {
             var barrier = VkImageMemoryBarrier2.calloc(1, stack).sType$Default()
                     .srcStageMask(fresh ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT)
                     .srcAccessMask(fresh ? 0 : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)
@@ -208,11 +215,7 @@ final class WorldScene implements AutoCloseable {
                     .dstStageMask(VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT).dstAccessMask(VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)
                     .oldLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             vkCmdPipelineBarrier2(upload, dependency);
-            check(vkEndCommandBuffer(upload), "end atlas upload");
-            check(vkResetFences(context.device, fence), "reset atlas fence");
-            check(vkQueueSubmit(context.queue, VkSubmitInfo.calloc(stack).sType$Default().pCommandBuffers(stack.pointers(upload.address())), fence), "submit atlas upload");
-            check(vkWaitForFences(context.device, fence, true, 5_000_000_000L), "wait atlas upload");
-        }
+        });
     }
 
     private void updateDescriptor(int binding, GpuImage image, long imageSampler) {
@@ -242,12 +245,23 @@ final class WorldScene implements AutoCloseable {
                 for (int axis = 0; axis < 3; axis++) input.putFloat((float)(offset[axis] + section.bounds()[bound * 3 + axis]) + (bound == 0 ? -.001f : .001f));
                 input.putFloat(0);
             }
-            input.putInt(section.vertices()).putInt(0).putInt(0).putInt(0);
+            input.putInt(section.vertices()).putInt(section.allocation() == null ? 0 : section.allocation().firstVertex).putInt(0).putInt(0);
+            for (int axis = 0; axis < 3; axis++) input.putFloat((float) offset[axis]); input.putFloat(0);
         }
         culler.record(command, slot, camera.matrix(), sections.size(), stack);
     }
     void draw(VkCommandBuffer command, MemoryStack stack) { draw(command, stack, null, 0); }
     void draw(VkCommandBuffer command, MemoryStack stack, GpuCuller culler, int slot) {
+        if (arena != null && culler != null && culler.compact()) {
+            if (arena.buffer() == 0) return;
+            vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, drivenPipeline);
+            vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, drivenLayout, 0, stack.longs(descriptorSet, culler.descriptorSet(slot)), null);
+            var push = stack.callocFloat(20); push.put(camera.matrix()).position(0);
+            vkCmdPushConstants(command, drivenLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, push);
+            vkCmdBindVertexBuffers(command, 0, stack.longs(arena.buffer()), stack.longs(0));
+            culler.drawAll(command, slot); indirectBatches++;
+            return;
+        }
         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, stack.longs(descriptorSet), null);
         var push = stack.mallocFloat(20);
@@ -310,6 +324,7 @@ final class WorldScene implements AutoCloseable {
     }
 
     private void clear() {
+        context.uploads.drain();
         sections.values().forEach(Section::close); sections.clear(); tracked.clear(); camera = null; receivedMesh = false;
         if (atlas != null) { atlas.close(); atlas = null; }
         if (lightMap != null) { lightMap.close(); lightMap = null; }
@@ -317,6 +332,9 @@ final class WorldScene implements AutoCloseable {
 
     @Override public void close() {
         vkDeviceWaitIdle(context.device); clear();
+        if (arena != null) { log.accept("MESH_ARENA=" + java.util.Arrays.toString(arena.stats()) + " indirectBatches=" + indirectBatches); arena.close(); arena = null; }
+        if (drivenPipeline != 0) { vkDestroyPipeline(context.device, drivenPipeline, null); drivenPipeline = 0; }
+        if (drivenLayout != 0) { vkDestroyPipelineLayout(context.device, drivenLayout, null); drivenLayout = 0; }
         if (pipeline != 0) { vkDestroyPipeline(context.device, pipeline, null); pipeline = 0; }
         if (translucentPipeline != 0) { vkDestroyPipeline(context.device, translucentPipeline, null); translucentPipeline = 0; }
         if (layout != 0) { vkDestroyPipelineLayout(context.device, layout, null); layout = 0; }
@@ -324,7 +342,5 @@ final class WorldScene implements AutoCloseable {
         if (descriptorLayout != 0) { vkDestroyDescriptorSetLayout(context.device, descriptorLayout, null); descriptorLayout = 0; }
         if (sampler != 0) { vkDestroySampler(context.device, sampler, null); sampler = 0; }
         if (lightSampler != 0) { vkDestroySampler(context.device, lightSampler, null); lightSampler = 0; }
-        if (pool != 0) { vkDestroyCommandPool(context.device, pool, null); pool = 0; }
-        if (fence != 0) { vkDestroyFence(context.device, fence, null); fence = 0; }
     }
 }

@@ -74,6 +74,8 @@ final class SharedWorldRenderer implements AutoCloseable {
             vkGetPhysicalDeviceQueueFamilyProperties(context.physical, familyCount, families);
             if ((families.get(context.queueFamily).queueFlags() & VK_QUEUE_COMPUTE_BIT) != 0 && !Boolean.getBoolean("vulkanforge.disableGpuCulling"))
                 culler = new GpuCuller(context, SLOT_COUNT);
+            if (culler != null) world.enableGpuDriven(culler);
+            log.accept("GPU_DRIVEN=" + (culler != null && culler.compact() ? "COMPACT_INDIRECT_COUNT" : "FALLBACK"));
             log.accept("GPU_CULLING=" + (culler == null ? "DISABLED" : "COMPUTE_INDIRECT"));
             var handle = stack.mallocLong(1);
             check(vkCreateCommandPool(context.device, VkCommandPoolCreateInfo.calloc(stack).sType$Default().queueFamilyIndex(context.queueFamily)
@@ -102,7 +104,7 @@ final class SharedWorldRenderer implements AutoCloseable {
 
     void apply(WorldProtocol.Command command) {
         // Camera pushes are copied while recording; they do not mutate resources used by older submissions.
-        if (!(command instanceof WorldProtocol.Camera || command instanceof WorldProtocol.Mesh || command instanceof WorldProtocol.Remove)) { endRead(); waitAll(); }
+        if (command instanceof WorldProtocol.Reset || command instanceof WorldProtocol.Atlas) { endRead(); waitAll(); }
         world.apply(command);
     }
     void prepareFrame() { waitSlot((int)(frames % SLOT_COUNT)); }
@@ -394,6 +396,7 @@ final class SharedWorldRenderer implements AutoCloseable {
                 culling[0], culling[1], culling[2], translucentTexture, translucentDepthTexture, world.translucentSections(), translucentSectionDraws, world.translucentSorts(),
                 overlayPasses, entity[0], entity[1], entity[2], entity[3], entity[4], skyDraws};
     }
+    long[] optimizationStats() { long[] a = world.arenaStats(); return new long[]{world.indirectBatches(), a[0], a[1], a[2]}; }
     private void destroyTargets() {
         for (Slot slot : slots) {
             if (slot.color != null) { slot.color.close(); slot.color = null; }

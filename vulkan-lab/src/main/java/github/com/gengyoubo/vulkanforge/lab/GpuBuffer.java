@@ -16,6 +16,9 @@ final class GpuBuffer implements AutoCloseable {
         vkUnmapMemory(context.device, memory); mapped = null;
     }
     GpuBuffer(VulkanContext context, int capacity, int usage) {
+        this(context, capacity, usage, true);
+    }
+    GpuBuffer(VulkanContext context, int capacity, int usage, boolean hostVisible) {
         this.context = context;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             var handle = stack.mallocLong(1);
@@ -24,12 +27,15 @@ final class GpuBuffer implements AutoCloseable {
             var requirements = VkMemoryRequirements.calloc(stack);
             vkGetBufferMemoryRequirements(context.device, buffer, requirements);
             var allocation = VkMemoryAllocateInfo.calloc(stack).sType$Default().allocationSize(requirements.size())
-                    .memoryTypeIndex(memoryType(context, stack, requirements.memoryTypeBits(), VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
+                    .memoryTypeIndex(memoryType(context, stack, requirements.memoryTypeBits(), hostVisible
+                            ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
             check(vkAllocateMemory(context.device, allocation, null, handle), "vkAllocateMemory(world buffer)"); memory = handle.get(0);
             check(vkBindBufferMemory(context.device, buffer, memory, 0), "vkBindBufferMemory(world)");
-            var pointer = stack.mallocPointer(1);
-            check(vkMapMemory(context.device, memory, 0, capacity, 0, pointer), "vkMapMemory(world)");
-            mapped = org.lwjgl.system.MemoryUtil.memByteBuffer(pointer.get(0), capacity).order(java.nio.ByteOrder.nativeOrder());
+            if (hostVisible) {
+                var pointer = stack.mallocPointer(1);
+                check(vkMapMemory(context.device, memory, 0, capacity, 0, pointer), "vkMapMemory(world)");
+                mapped = org.lwjgl.system.MemoryUtil.memByteBuffer(pointer.get(0), capacity).order(java.nio.ByteOrder.nativeOrder());
+            }
         } catch (Throwable error) { close(); throw error; }
     }
 
