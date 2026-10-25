@@ -28,6 +28,7 @@ final class GuiPass implements AutoCloseable {
         this.frame = frame;
         while (!retired.isEmpty() && retired.peek().getKey() <= frame) retired.remove().getValue().run();
     }
+    boolean usesPushDescriptors() { return draws.usesPushDescriptors(); }
     long[] bindingStats() { return draws.bindingStats(); }
     long passes() { return passes; }
 

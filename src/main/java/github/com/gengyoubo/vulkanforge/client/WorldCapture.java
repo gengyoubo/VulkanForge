@@ -44,7 +44,7 @@ final class WorldCapture {
     private int wantedX = Integer.MIN_VALUE, wantedY, wantedZ, wantedRadius;
     private long cancelledBuilds, deferredPublishes, completedThisFrame, maxFrameBuildNanos, maxCompletedPerFrame;
     private final long[] frameSamples = new long[1024];
-    private int frameSampleCount;
+    private int frameSampleCount, frameSampleCursor;
     private SectionPos pendingSection;
     private byte[][] pendingVertices;
     private boolean atlasSent;
@@ -206,7 +206,8 @@ final class WorldCapture {
         }
         long frameElapsed = System.nanoTime() - frameStart;
         maxFrameBuildNanos = Math.max(maxFrameBuildNanos, frameElapsed); maxCompletedPerFrame = Math.max(maxCompletedPerFrame, completedThisFrame);
-        frameSamples[frameSampleCount++ % frameSamples.length] = frameElapsed;
+        frameSamples[frameSampleCursor++ & (frameSamples.length - 1)] = frameElapsed;
+        frameSampleCount = Math.min(frameSampleCount + 1, frameSamples.length);
     }
 
     /** Edits first, then visible nearby sections; age prevents offscreen work from starving. Missing chunks are never force-loaded. */

@@ -50,7 +50,7 @@ final class SharedWorldRenderer implements AutoCloseable {
     static final int MAX_OVERLAYS = 16; // world windows plus order-preserving hand/HUD/screen splits (P11)
     private int width, height, generations, reading = -1, overlayReading = -1;
     private EntityPass entities;
-    private long overlayPasses, skyDraws;
+    private long overlayPasses, skyDraws, handoffGroups, handoffImages;
     private int depthTexture, translucentTexture, translucentDepthTexture;
     private long translucentSectionDraws;
     private static final long DEPTH_STAGES = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
@@ -105,6 +105,7 @@ final class SharedWorldRenderer implements AutoCloseable {
     void apply(WorldProtocol.Command command) {
         // Camera pushes are copied while recording; they do not mutate resources used by older submissions.
         if (command instanceof WorldProtocol.Reset || command instanceof WorldProtocol.Atlas) { endRead(); waitAll(); }
+        if (command instanceof WorldProtocol.Reset || command instanceof WorldProtocol.Atlas) entities.invalidateDescriptors();
         world.apply(command);
     }
     void prepareFrame() { waitSlot((int)(frames % SLOT_COUNT)); }
@@ -215,15 +216,12 @@ final class SharedWorldRenderer implements AutoCloseable {
             timers.end(command, index, 1, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             check(vkEndCommandBuffer(command), "end shared world command");
             SharedPresentImage[] images = slot.images();
-            var signals = VkSemaphoreSubmitInfo.calloc(images.length, stack);
-            for (int i = 0; i < images.length; i++) signals.get(i).sType$Default().semaphore(images[i].ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+            var signals = VkSemaphoreSubmitInfo.calloc(1, stack).sType$Default().semaphore(slot.color.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             var submit = VkSubmitInfo2.calloc(1, stack).sType$Default()
                     .pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1, stack).sType$Default().commandBuffer(command)).pSignalSemaphoreInfos(signals);
             if (slot.used) {
-                // Each wait stage matches the first use in this command buffer, which the acquire barriers chain from.
-                long[] stages = {VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, DEPTH_STAGES, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_2_COPY_BIT};
-                var waits = VkSemaphoreSubmitInfo.calloc(images.length, stack);
-                for (int i = 0; i < images.length; i++) waits.get(i).sType$Default().semaphore(images[i].complete).stageMask(stages[i]);
+                var waits = VkSemaphoreSubmitInfo.calloc(1, stack).sType$Default().semaphore(slot.color.complete)
+                        .stageMask(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | DEPTH_STAGES | VK_PIPELINE_STAGE_2_COPY_BIT);
                 submit.pWaitSemaphoreInfos(waits);
             }
             check(vkResetFences(context.device, slot.fence), "reset shared world fence");
@@ -233,10 +231,8 @@ final class SharedWorldRenderer implements AutoCloseable {
             if (terrain) { terrainFrames++; sectionDraws += world.drawableSections(); translucentSectionDraws += world.translucentSections(); }
             // Keep the GL read lease open through terrain + HUD/inset sampling, and close it before final presentation.
             reading = index;
-            int texture = slot.color.beginReadGL();
-            depthTexture = slot.depth.beginReadGL();
-            translucentTexture = slot.translucentColor.beginReadGL();
-            translucentDepthTexture = slot.translucentDepth.beginReadGL();
+            int[] textures = SharedPresentImage.beginGroupGL(images); handoffGroups++; handoffImages += images.length;
+            int texture = textures[0]; depthTexture = textures[1]; translucentTexture = textures[2]; translucentDepthTexture = textures[3];
             if (frames % 300 == 0) { log.accept("WORLD_RENDERED_FRAMES=" + frames + " sections=" + world.trackedSections()); timers.report(log); }
             return texture;
         }
@@ -305,28 +301,25 @@ final class SharedWorldRenderer implements AutoCloseable {
             releaseBarrier(release.get(1), slot.overlayDepth, DEPTH_STAGES, DEPTH_ACCESS, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, true);
             vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(release));
             check(vkEndCommandBuffer(command), "end overlay command");
-            var signals = VkSemaphoreSubmitInfo.calloc(2, stack);
-            signals.get(0).sType$Default().semaphore(slot.overlayColor.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
-            signals.get(1).sType$Default().semaphore(slot.overlayDepth.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+            var signals = VkSemaphoreSubmitInfo.calloc(1, stack).sType$Default().semaphore(slot.overlayColor.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             var submit = VkSubmitInfo2.calloc(1, stack).sType$Default()
                     .pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1, stack).sType$Default().commandBuffer(command)).pSignalSemaphoreInfos(signals);
             if (slot.overlayUsed) {
-                var waits = VkSemaphoreSubmitInfo.calloc(2, stack);
-                waits.get(0).sType$Default().semaphore(slot.overlayColor.complete).stageMask(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
-                // First depth use is the copy, or the clear/depth tests for a clearDepth pass.
-                waits.get(1).sType$Default().semaphore(slot.overlayDepth.complete).stageMask(VK_PIPELINE_STAGE_2_COPY_BIT | DEPTH_STAGES);
+                var waits = VkSemaphoreSubmitInfo.calloc(1, stack).sType$Default().semaphore(slot.overlayColor.complete)
+                        .stageMask(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_COPY_BIT | DEPTH_STAGES);
                 submit.pWaitSemaphoreInfos(waits);
             }
             check(vkResetFences(context.device, slot.overlayFences[pass]), "reset overlay fence");
             check(vkQueueSubmit2(context.queue, submit, slot.overlayFences[pass]), "submit overlay");
             slot.overlayUsed = slot.overlayPending[pass] = true; overlayPasses++;
             overlayReading = index;
-            return new int[]{slot.overlayColor.beginReadGL(), slot.overlayDepth.beginReadGL()};
+            handoffGroups++; handoffImages += 2;
+            return SharedPresentImage.beginGroupGL(slot.overlayColor, slot.overlayDepth);
         }
     }
     /** GL has issued its composite of the current overlay: release it so the next pass of this frame can reuse the images. */
     void finishOverlay() {
-        if (overlayReading >= 0) { int index = overlayReading; overlayReading = -1; slots[index].overlayColor.endReadGL(); slots[index].overlayDepth.endReadGL(); }
+        if (overlayReading >= 0) { int index = overlayReading; overlayReading = -1; SharedPresentImage.endGroupGL(slots[index].overlayColor, slots[index].overlayDepth); }
     }
     void entityTexture(int id, int width, int height, int flags, byte[] rgba) { entities.texture(id, width, height, flags, rgba); }
     void entityTexturePatch(int id, int x, int y, int width, int height, byte[] rgba) { entities.texturePatch(id, x, y, width, height, rgba); }
@@ -358,7 +351,7 @@ final class SharedWorldRenderer implements AutoCloseable {
     }
 
     void endRead() {
-        if (reading >= 0) { int index = reading; reading = -1; slots[index].sceneFresh = false; for (SharedPresentImage image : slots[index].images()) image.endReadGL(); }
+        if (reading >= 0) { int index = reading; reading = -1; slots[index].sceneFresh = false; SharedPresentImage.endGroupGL(slots[index].images()); }
         finishOverlay();
     }
     private void waitSlot(int index) {
@@ -415,6 +408,7 @@ final class SharedWorldRenderer implements AutoCloseable {
         log.accept("WORLD_FINAL_FRAMES=" + frames + " terrain=" + terrainFrames + " sectionDraws=" + sectionDraws + " peakSections=" + world.peakSections());
         log.accept("WORLD_TRANSLUCENT sectionDraws=" + translucentSectionDraws + " sorts=" + world.translucentSorts());
         log.accept("WORLD_RGBA_READBACK_BYTES=0");
+        log.accept("GL_VULKAN_READ_LEASES groups=" + handoffGroups + " images=" + handoffImages);
         if (entities != null) {
             long[] entity = entities.stats();
             log.accept("WORLD_BINDINGS=" + java.util.Arrays.toString(entities.bindingStats()));

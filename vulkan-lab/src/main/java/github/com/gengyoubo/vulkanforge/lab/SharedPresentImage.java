@@ -69,6 +69,16 @@ final class SharedPresentImage implements AutoCloseable {
     }
     int beginReadGL() { int[] result = {0, 0}; glImage.accept(result); return result[1]; }
     void endReadGL() { glImage.accept(new int[]{1}); }
+    private int glTexture;
+    private int textureGL() { if (glTexture == 0) { int[] result = {2, 0}; glImage.accept(result); glTexture = result[1]; } return glTexture; }
+    /** All images share the leader's one semaphore pair; the Vulkan submit releases/acquires every group member together. */
+    static int[] beginGroupGL(SharedPresentImage... images) { return groupGL(true, images); }
+    static void endGroupGL(SharedPresentImage... images) { groupGL(false, images); }
+    private static int[] groupGL(boolean begin, SharedPresentImage[] images) {
+        int[] command = new int[images.length + 2], textures = new int[images.length]; command[0] = begin ? 3 : 4; command[1] = images.length;
+        for (int i = 0; i < images.length; i++) command[i + 2] = textures[i] = images[i].textureGL();
+        images[0].glImage.accept(command); return textures;
+    }
     private static void closeHandle(long handle) {
         long function = org.lwjgl.system.windows.Kernel32.getLibrary().getFunctionAddress("CloseHandle");
         if (org.lwjgl.system.JNI.callPI(handle, function) == 0) throw new IllegalStateException("CloseHandle failed");

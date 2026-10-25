@@ -51,6 +51,8 @@ public final class MainWindowBackend implements AutoCloseable {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 context.initializeInterop(uuid, Boolean.getBoolean("vulkanforge.requireValidation"));
                 log("DEVICE_CAPABILITIES=" + context.capabilities);
+                log("PUSH_DESCRIPTOR_AVAILABLE=" + (context.pushDescriptors ? context.pushDescriptorCore ? "VULKAN14_CORE" : "KHR_ALIAS" : "NONE"));
+                log("ENTITY_DESCRIPTOR_MODE=" + (Boolean.getBoolean("vulkanforge.preferPushDescriptors") && context.pushDescriptors ? "PUSH" : "CACHED_SET"));
                 timers = new GpuTimers(context, FRAMES_IN_FLIGHT, this::log, "COPY", "PRESENT_PREPARE");
                 log("VALIDATION=" + (context.validationEnabled() ? "ENABLED" : "UNAVAILABLE"));
                 log("SYNC_VALIDATION_REQUESTED=" + "1".equals(System.getenv("VK_VALIDATION_VALIDATE_SYNC")));
@@ -140,7 +142,7 @@ public final class MainWindowBackend implements AutoCloseable {
         guiPackets = list;
     }
     public long[] guiBindingStats() { return gui == null ? new long[5] : gui.bindingStats(); }
-    public boolean pushDescriptorsEnabled() { return context.pushDescriptors; }
+    public boolean pushDescriptorsEnabled() { return gui != null && gui.usesPushDescriptors(); }
     public long guiPasses() { return gui == null ? 0 : gui.passes(); }
     public long[] worldStats() { return world == null ? new long[25] : world.stats(); }
     /** P7-P9: packets are EntityPass Object[]s; returns {color, depth} GL textures leased until finishOverlay, or null. */

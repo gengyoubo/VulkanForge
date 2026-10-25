@@ -25,7 +25,7 @@ final class VulkanContext implements AutoCloseable {
     DeviceCapabilities capabilities;
     AsyncUploads uploads;
     GpuMemory memory;
-    boolean pushDescriptors;
+    boolean pushDescriptors, pushDescriptorCore;
     int queueFamily = -1;
     long surface;
     private long messenger;
@@ -55,7 +55,7 @@ final class VulkanContext implements AutoCloseable {
     void initialize(long window, int loaderVersion, boolean requireValidation) {
         boolean offscreen = window == NULL;
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            boolean validation = hasLayer(stack, "VK_LAYER_KHRONOS_validation");
+            boolean validation = !Boolean.getBoolean("vulkanforge.disableValidation") && hasLayer(stack, "VK_LAYER_KHRONOS_validation");
             if (requireValidation && !validation) throw new IllegalStateException("VK_LAYER_KHRONOS_validation is not installed (install Vulkan SDK)");
             boolean debug = validation && hasInstanceExtension(stack, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
             if (requireValidation && !debug) throw new IllegalStateException("VK_EXT_debug_utils is unavailable");
@@ -108,7 +108,8 @@ final class VulkanContext implements AutoCloseable {
             VkPhysicalDeviceVulkan13Features enabled = VkPhysicalDeviceVulkan13Features.calloc(stack).sType$Default()
                     .dynamicRendering(true).synchronization2(true);
             capabilities = DeviceCapabilities.query(physical, stack);
-            pushDescriptors = capabilities.pushDescriptor() && capabilities.maxPushDescriptors() >= 3 && !Boolean.getBoolean("vulkanforge.disablePushDescriptors");
+            boolean pushExtension = hasDeviceExtension(physical, stack, org.lwjgl.vulkan.KHRPushDescriptor.VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+            pushDescriptors = (app.apiVersion() >= VK_API_VERSION_1_4 || pushExtension) && capabilities.pushDescriptor() && capabilities.maxPushDescriptors() >= 3 && !Boolean.getBoolean("vulkanforge.disablePushDescriptors");
             enabled.pNext(VkPhysicalDeviceVulkan14Features.calloc(stack).sType$Default().pushDescriptor(pushDescriptors).address());
             boolean driven = capabilities.gpuDriven() && !Boolean.getBoolean("vulkanforge.disableGpuDriven");
             var enabled12 = VkPhysicalDeviceVulkan12Features.calloc(stack).sType$Default().pNext(enabled.address())
@@ -117,14 +118,25 @@ final class VulkanContext implements AutoCloseable {
             var core = VkPhysicalDeviceFeatures.calloc(stack).multiDrawIndirect(driven).drawIndirectFirstInstance(driven);
             VkDeviceCreateInfo deviceInfo = VkDeviceCreateInfo.calloc(stack).sType$Default().pQueueCreateInfos(queueInfo)
                     .pNext(enabled11.address()).pEnabledFeatures(core);
-            if (!offscreen) deviceInfo.ppEnabledExtensionNames(stack.pointers(stack.UTF8(VK_KHR_SWAPCHAIN_EXTENSION_NAME)));
-            if (interop) deviceInfo.ppEnabledExtensionNames(stack.pointers(stack.UTF8(VK_KHR_SWAPCHAIN_EXTENSION_NAME),
-                    stack.UTF8(org.lwjgl.vulkan.KHRExternalMemoryWin32.VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME),
-                    stack.UTF8(org.lwjgl.vulkan.KHRExternalSemaphoreWin32.VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME)));
+            java.util.List<String> deviceExtensions = new java.util.ArrayList<>();
+            if (!offscreen || interop) deviceExtensions.add(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+            if (interop) {
+                deviceExtensions.add(org.lwjgl.vulkan.KHRExternalMemoryWin32.VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
+                deviceExtensions.add(org.lwjgl.vulkan.KHRExternalSemaphoreWin32.VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
+            }
+            if (pushDescriptors && pushExtension) deviceExtensions.add(org.lwjgl.vulkan.KHRPushDescriptor.VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+            if (!deviceExtensions.isEmpty()) {
+                var names = stack.mallocPointer(deviceExtensions.size()); for (String name : deviceExtensions) names.put(stack.UTF8(name)); names.flip();
+                deviceInfo.ppEnabledExtensionNames(names);
+            }
             check(vkCreateDevice(physical, deviceInfo, null, pointer), "vkCreateDevice");
             device = new VkDevice(pointer.get(0), physical, deviceInfo);
             vkGetDeviceQueue(device, queueFamily, 0, pointer);
             queue = new VkQueue(pointer.get(0), device);
+            pushDescriptorCore = device.getCapabilities().vkCmdPushDescriptorSet != 0;
+            pushDescriptors &= pushDescriptorCore || device.getCapabilities().vkCmdPushDescriptorSetKHR != 0;
+            System.out.println("INSTANCE_API=" + version(app.apiVersion()));
+            System.out.println("PUSH_DESCRIPTOR_PATH=" + (pushDescriptors ? pushDescriptorCore ? "VULKAN14_CORE" : "KHR_ALIAS" : "LEGACY"));
             System.out.println("DEVICE_CAPABILITIES=" + capabilities);
             System.out.println("GPU_DRIVEN_ENABLED=" + driven);
             System.out.println("PUSH_DESCRIPTORS_ENABLED=" + pushDescriptors);

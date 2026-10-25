@@ -40,12 +40,13 @@ final class GuiPassSmoke {
         if (backend.guiPasses() < 3) throw new AssertionError("GUI did not draw after blit");
         long[] bindings = backend.guiBindingStats();
         if (bindings[4] == 0) throw new AssertionError("Compatible adjacent GUI draws were not batched");
+        if (bindings[2] > 2) throw new AssertionError("Uniform descriptors were rewritten every frame");
         if (backend.pushDescriptorsEnabled() && (bindings[0] > 2 || bindings[1] == 0 || bindings[2] > 2))
             throw new AssertionError("Vulkan 1.4 push descriptors / persistent uniform descriptors not exercised: " + java.util.Arrays.toString(bindings));
         System.out.println("GUI_BINDING_SMOKE=OK " + java.util.Arrays.toString(bindings));
         System.out.println("GUI_SWAPCHAIN_SMOKE=OK (alpha, scissor, depth, depth clear, incremental texture patch, no world renderer)");
     }
-    private static Object[] quad(int format, int variant, int flags, int texture, int color, float z) {
+    static Object[] quad(int format, int variant, int flags, int texture, int color, float z) {
         int stride = format == FORMAT_TEXT ? 28 : format == FORMAT_POSITION_TEX ? 20 : 16;
         var bytes = ByteBuffer.allocate(stride * 4).order(ByteOrder.LITTLE_ENDIAN);
         for (float[] xy : new float[][]{{-.9f,-.9f},{.9f,-.9f},{.9f,.9f},{-.9f,.9f}}) {

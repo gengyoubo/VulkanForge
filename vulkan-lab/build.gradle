@@ -58,6 +58,7 @@ tasks.register('smokePresent', JavaExec) {
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'github.com.gengyoubo.vulkanforge.lab.NativePresentSmoke'
     if (rootProject.hasProperty('validationSmoke')) systemProperty 'vulkanforge.requireValidation', 'true'
+    if (rootProject.hasProperty('pushDescriptorSmoke')) systemProperty 'vulkanforge.preferPushDescriptors', 'true'
     if (rootProject.hasProperty('legacyGpuSmoke')) {
         systemProperty 'vulkanforge.disableGpuDriven', 'true'
         systemProperty 'vulkanforge.disableUploadTimeline', 'true'
@@ -70,4 +71,11 @@ tasks.register('smokeResources', JavaExec) {
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'github.com.gengyoubo.vulkanforge.lab.ResourceSmoke'
     if (rootProject.hasProperty('validationSmoke')) systemProperty 'vulkanforge.requireValidation', 'true'
+}
+
+tasks.register('benchmarkBindings', JavaExec) {
+    dependsOn 'testClasses'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.lab.BindingBenchmark'
+    systemProperty 'vulkanforge.disableValidation', 'true'
 }

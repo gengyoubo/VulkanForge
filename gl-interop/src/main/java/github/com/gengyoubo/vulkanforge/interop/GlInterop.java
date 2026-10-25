@@ -75,7 +75,15 @@ public final class GlInterop {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 var empty = stack.mallocInt(0); var textures = stack.ints(texture); var layouts = stack.ints(GL_LAYOUT_GENERAL_EXT);
                 if (terrain) {
-                    if (source[0] == 0) { glWaitSemaphoreEXT(ready, empty, textures, layouts); source[1] = texture; }
+                    if (source[0] == 2) { source[1] = texture; return; }
+                    if (source[0] == 3 || source[0] == 4) {
+                        var groupTextures = stack.mallocInt(source[1]); var groupLayouts = stack.mallocInt(source[1]);
+                        for (int i = 0; i < source[1]; i++) { groupTextures.put(source[i + 2]); groupLayouts.put(GL_LAYOUT_GENERAL_EXT); }
+                        groupTextures.flip(); groupLayouts.flip();
+                        if (source[0] == 3) glWaitSemaphoreEXT(ready, empty, groupTextures, groupLayouts);
+                        else { glSignalSemaphoreEXT(complete, empty, groupTextures, groupLayouts); glFlush(); }
+                    }
+                    else if (source[0] == 0) { glWaitSemaphoreEXT(ready, empty, textures, layouts); source[1] = texture; }
                     else if (source[0] == 1) { glSignalSemaphoreEXT(complete, empty, textures, layouts); glFlush(); }
                     else throw new IllegalArgumentException("Unknown shared terrain command");
                     check("shared terrain handoff"); return;

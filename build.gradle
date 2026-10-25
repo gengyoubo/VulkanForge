@@ -29,6 +29,7 @@ minecraft {
         client {
             property 'vulkanforge.directPresent', System.getProperty('vulkanforge.directPresent', 'true')
             if (project.hasProperty('validationSmoke')) property 'vulkanforge.requireValidation', 'true'
+            if (project.hasProperty('pushDescriptorSmoke')) property 'vulkanforge.preferPushDescriptors', 'true'
             if (project.hasProperty('configSmoke')) {
                 property 'vulkanforge.configSmoke', 'true'
                 mods { vulkanforge { source sourceSets.smoke } }
