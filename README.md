@@ -50,9 +50,22 @@ IntelliJ IDEA：导入根目录的 `build.gradle`，将 **Gradle JVM** 和 **Pro
 | 文件 | 内容 |
 | --- | --- |
 | `probe-report.txt` | 启动时的 loader / GPU / 功能检测与设备创建 |
-| `bridge-report.txt` | 游戏窗口预览的离屏渲染与退出结果 |
+| `bridge-report.txt` | 游戏窗口预览的离屏渲染、地形/读回复制 GPU 时间和退出结果 |
 | `triangle-report.txt` | 独立窗口测试 |
-| `main-window-report.txt` | GPU 共享预检、主窗口 Surface、Swapchain 尺寸/呈现模式、帧数和资源关闭 |
+| `main-window-report.txt` | GPU 共享预检、主窗口 Surface、Swapchain、复制/呈现准备 GPU 时间、CPU 等待与资源关闭 |
+
+## GPU 计时（P1）
+
+时间戳查询按现有帧槽位轮转，在原有 fence 完成后读取，未添加 CPU 等待。报告启动时记录 `GPU_TIMESTAMPS`、队列有效位数和每 tick 的纳秒数；不支持时明确记为 `UNAVAILABLE`。每 300 帧及正常关闭时输出累计样本数、平均值和最大值，单位为毫秒：
+
+| 指标 | 测量范围 | 报告 |
+| --- | --- | --- |
+| `GPU_TERRAIN_MS` | 地形动态渲染，包括颜色/深度清屏和 WorldScene 绘制 | `bridge-report.txt` |
+| `GPU_READBACK_COPY_MS` | 离屏颜色图像复制到 staging buffer 的 GPU 命令 | `bridge-report.txt` |
+| `GPU_COPY_MS` | GL 共享图像到主窗口 Swapchain 的 Vulkan blit | `main-window-report.txt` |
+| `GPU_PRESENT_PREPARE_MS` | 复制完成后的队列所有权释放和 PRESENT 布局转换 | `main-window-report.txt` |
+
+三角形使用单独的 `GPU_TRIANGLE_MS`，不混入地形样本。查询结果按设备的 `timestampPeriod` 换算，并处理有效位回绕；未提交帧不计入样本。呈现准备不包含可选诊断截图复制。`CPU_PRESENT_MS` 仍单独记录 `vkQueuePresentKHR` 的 CPU 调用耗时；GPU 时间戳不能测量显示引擎扫描输出或输入到屏幕的延迟。两个进程的时间均为各自区间耗时，不作为同一条跨进程时间线相加。性能对比时应关闭校验层，并保持分辨率、场景和 VSync 设置一致。
 
 ## 验证命令
 
@@ -67,12 +80,19 @@ IntelliJ IDEA：导入根目录的 `build.gradle`，将 **Gradle JVM** 和 **Pro
 # 真实 GPU 世界管线：镂空阈值和深度、图集区域更新、光照图更新、相机、分区删除与场景重置
 .\gradlew.bat :vulkan-lab:smokeWorld
 
-# Windows 主窗口呈现管线：GPU 共享、四象限颜色/方向、缩放、VSync 和零尺寸跳过
+# Windows 主窗口呈现管线：GPU 共享、四象限颜色/方向、逐帧像素新鲜度、缩放、全屏往返、VSync 和零尺寸跳过
 .\gradlew.bat :vulkan-lab:smokePresent
 
-# 完整 Forge 检查：ASM 钩子、Vulkan 主窗口、世界、重载、昼夜光照、缩放及最小化恢复，然后退出
+# 完整 Forge 检查：ASM 钩子、Vulkan 主窗口、世界、重载、昼夜光照、缩放、最小化恢复、全屏往返、切换世界，然后退出
+# 退出超过 30 秒或主窗口报告缺少 FINAL_PRESENTED_FRAMES / VALIDATION_ERRORS=0 时判定失败；检查期间会短暂全屏，请保持游戏窗口在前台
 # 测试源集不会被打入模组 JAR；会在 run/saves 留下测试世界和日志中的 PNG
 .\gradlew.bat -PworldSmoke runClient
+
+# P0 严格检查：先准备 Vulkan SDK 的 Bin 目录，或 Khronos 官方 Windows validation layer 的 DLL/JSON 目录
+# 环境变量只影响当前 PowerShell 会话及其子进程，无需修改注册表或驱动
+$env:VK_LAYER_PATH = 'C:\path\to\validation-layers'
+$env:VK_VALIDATION_VALIDATE_SYNC = '1'
+.\gradlew.bat -PvalidationSmoke -PworldSmoke :vulkan-lab:smokePresent :vulkan-lab:smokeBridge :vulkan-lab:smokeWorld runClient
 
 # 交换链缩放检查
 java -jar vulkan-lab/build/libs/vulkan-lab.jar --triangle --frames=90 --resize-smoke
@@ -82,6 +102,8 @@ java -jar vulkan-lab/build/libs/vulkan-lab.jar --probe --require-validation
 ```
 
 普通 `build` 不要求 GPU 或 Vulkan 驱动。GPU 检查需要 Vulkan 1.4 硬件和驱动。日志中 `VALIDATION=UNAVAILABLE` 表示没有启用校验层；此时错误计数为零不代表通过了校验层检查。
+
+`-PvalidationSmoke` 要求主窗口校验层实际启用，并在客户端退出后检查主窗口及地形桥的 `VALIDATION=ENABLED`、`VALIDATION_ERRORS=0` 和完整关闭标记；缺少校验层或退出超时会失败。`smokePresent` 额外检查 acquire 后取消帧、GL 交接前/后故障恢复，以及仍持有已 acquire 图像时的关闭。同步验证通过 `VK_VALIDATION_VALIDATE_SYNC=1` 开启，正式性能测量时应关闭校验层。
 
 ## 接入结构
 
@@ -99,7 +121,7 @@ java -jar vulkan-lab/build/libs/vulkan-lab.jar --probe --require-validation
 - `vulkan-lab/`：LWJGL 3.3.6，Vulkan 实例、设备、离屏图像、同步、内存与交换链。
 - `WorldScene`：分区 GPU 缓存、图集上传、采样描述符、带相机相对坐标的世界绘制。
 
-地形桥的离屏目标固定为 **640×360、最高 60 FPS**，每帧读回并上传约 0.88 MiB；最终呈现按主窗口 framebuffer 尺寸执行。主窗口采用两帧轮转，每帧独立的共享图像、命令缓冲、acquire semaphore 和 fence，仅复用该槽位时等待；呈现 semaphore 按 Swapchain 图像保存。报告记录 CPU fence 等待和 present 调用耗时。世界图像清屏 alpha 为零，只有 Vulkan 方块像素覆盖原版颜色。图集动画与原版光照图增量同步，不保证呈现原版每一个动画帧；动画区域较多时按轮询预算分批更新。镂空阈值采用原版 0.1，图集目前只采样 mip level 0；光照采样坐标和线性过滤与 1.20.1 原版一致。雾、后处理和半透明排序尚未接入 Vulkan。后续需要把地形管线迁入同进程后端以消除地形读回和相机传输延迟、扩大可见范围、复用原版网格重建调度，并逐步替换原版 pass。当前仍是功能原型，未承诺帧率提升。
+地形桥的离屏目标固定为 **640×360、最高 60 FPS**，每帧读回并上传约 0.88 MiB；最终呈现按主窗口 framebuffer 尺寸执行。主窗口采用两帧轮转，每帧独立的共享图像、命令缓冲、acquire semaphore 和 fence，仅复用该槽位时等待；呈现 semaphore 按 Swapchain 图像保存。两个等待信号量都在 BLIT 阶段等待，布局转换和队列所有权获取的第一同步范围同为 BLIT，保证排在 acquire / GL 完成之后。Surface 在全屏或最小化过渡中报告 0×0 时跳过该帧并保留旧 Swapchain；尺寸比较基于请求尺寸，避免被 Surface 钳制的尺寸导致每帧重建。若某帧在 acquire 后、提交前出错，会用空提交消耗 acquire 信号量、重建 fence/semaphore 并标记 Swapchain 重建，避免退出时卡在 fence 或残留未等待的信号量。报告记录 CPU fence 等待和 present 调用耗时。世界图像清屏 alpha 为零，只有 Vulkan 方块像素覆盖原版颜色。图集动画与原版光照图增量同步，不保证呈现原版每一个动画帧；动画区域较多时按轮询预算分批更新。镂空阈值采用原版 0.1，图集目前只采样 mip level 0；光照采样坐标和线性过滤与 1.20.1 原版一致。雾、后处理和半透明排序尚未接入 Vulkan。后续需要把地形管线迁入同进程后端以消除地形读回和相机传输延迟、扩大可见范围、复用原版网格重建调度，并逐步替换原版 pass。当前仍是功能原型，未承诺帧率提升。
 
 2026-10-26 本机 Windows / RTX 3050 Laptop 验证：GPU 世界管线检查通过；Forge 客户端成功采集 45 个分区、树叶/花等镂空模型、1024×512 图集和原版光照图。相机、方块更新、资源重载与动画贴图更新检查通过；测试场景切换夜晚后，地形平均亮度约从 137 降至 24，切回白天恢复。检查图片与报告位于 `run/logs/vulkanforge/world-client-smoke/`。
 

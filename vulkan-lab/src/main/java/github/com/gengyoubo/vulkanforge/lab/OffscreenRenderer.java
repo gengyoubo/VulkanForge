@@ -21,6 +21,8 @@ final class OffscreenRenderer implements AutoCloseable {
     private ByteBuffer mapped;
     private boolean coherent;
     private GpuImage depth;
+    private GpuTimers timers;
+    private long frames;
 
     OffscreenRenderer(VulkanContext context, int width, int height) {
         this.context = context;
@@ -30,6 +32,7 @@ final class OffscreenRenderer implements AutoCloseable {
     }
 
     void initialize() {
+        timers = new GpuTimers(context, 1, System.out::println, "TERRAIN", "READBACK_COPY", "TRIANGLE");
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkFormatProperties props = VkFormatProperties.calloc(stack);
             vkGetPhysicalDeviceFormatProperties(context.physical, FORMAT, props);
@@ -113,6 +116,7 @@ final class OffscreenRenderer implements AutoCloseable {
             check(vkResetCommandBuffer(command, 0), "vkResetCommandBuffer(offscreen)");
             check(vkBeginCommandBuffer(command, VkCommandBufferBeginInfo.calloc(stack).sType$Default()
                     .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)), "vkBeginCommandBuffer(offscreen)");
+            timers.begin(command, 0);
             VkImageMemoryBarrier2.Buffer barrier = VkImageMemoryBarrier2.calloc(1, stack).sType$Default()
                     .srcStageMask(VK_PIPELINE_STAGE_2_NONE).srcAccessMask(VK_ACCESS_2_NONE)
                     .dstStageMask(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT).dstAccessMask(VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT)
@@ -143,6 +147,8 @@ final class OffscreenRenderer implements AutoCloseable {
                 depthAttachment.clearValue().depthStencil().depth(1.0f).stencil(0);
                 rendering.pDepthAttachment(depthAttachment);
             }
+            int drawMetric = terrain ? 0 : 2;
+            timers.start(command, 0, drawMetric, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             vkCmdBeginRendering(command, rendering);
             vkCmdSetViewport(command, 0, VkViewport.calloc(1, stack).width(width).height(height).minDepth(0).maxDepth(1));
             vkCmdSetScissor(command, 0, VkRect2D.calloc(1, stack).offset(o -> o.set(0, 0)).extent(e -> e.set(width, height)));
@@ -153,6 +159,7 @@ final class OffscreenRenderer implements AutoCloseable {
                 vkCmdDraw(command, 3, 1, 0, 0);
             }
             vkCmdEndRendering(command);
+            timers.end(command, 0, drawMetric, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             barrier.srcStageMask(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT).srcAccessMask(VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT)
                     .dstStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).dstAccessMask(VK_ACCESS_2_TRANSFER_READ_BIT)
                     .oldLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -160,7 +167,9 @@ final class OffscreenRenderer implements AutoCloseable {
             VkBufferImageCopy.Buffer copy = VkBufferImageCopy.calloc(1, stack)
                     .imageSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1))
                     .imageOffset(o -> o.set(0, 0, 0)).imageExtent(e -> e.set(width, height, 1));
+            timers.start(command, 0, 1, VK_PIPELINE_STAGE_2_COPY_BIT);
             vkCmdCopyImageToBuffer(command, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging, copy);
+            timers.end(command, 0, 1, VK_PIPELINE_STAGE_2_COPY_BIT);
             VkMemoryBarrier2.Buffer toHost = VkMemoryBarrier2.calloc(1, stack).sType$Default()
                     .srcStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).srcAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
                     .dstStageMask(VK_PIPELINE_STAGE_2_HOST_BIT).dstAccessMask(VK_ACCESS_2_HOST_READ_BIT);
@@ -169,7 +178,10 @@ final class OffscreenRenderer implements AutoCloseable {
             check(vkResetFences(context.device, fence), "vkResetFences(offscreen)");
             VkSubmitInfo submit = VkSubmitInfo.calloc(stack).sType$Default().pCommandBuffers(stack.pointers(command.address()));
             check(vkQueueSubmit(context.queue, submit, fence), "vkQueueSubmit(offscreen)");
+            timers.submitted(0);
             check(vkWaitForFences(context.device, fence, true, 5_000_000_000L), "vkWaitForFences(offscreen)");
+            timers.collect(0);
+            if (++frames % 300 == 0) timers.report(System.out::println);
             if (!coherent) {
                 VkMappedMemoryRange.Buffer range = VkMappedMemoryRange.calloc(1, stack).sType$Default().memory(stagingMemory).offset(0).size(VK_WHOLE_SIZE);
                 check(vkInvalidateMappedMemoryRanges(context.device, range), "vkInvalidateMappedMemoryRanges");
@@ -181,6 +193,7 @@ final class OffscreenRenderer implements AutoCloseable {
     @Override public void close() {
         if (context.device == null) return;
         vkDeviceWaitIdle(context.device);
+        if (timers != null) { timers.collectAll(); timers.report(System.out::println); timers.close(); timers = null; }
         if (depth != null) { depth.close(); depth = null; }
         if (mapped != null) { vkUnmapMemory(context.device, stagingMemory); mapped = null; }
         if (pipeline != NULL) { vkDestroyPipeline(context.device, pipeline, null); pipeline = NULL; }

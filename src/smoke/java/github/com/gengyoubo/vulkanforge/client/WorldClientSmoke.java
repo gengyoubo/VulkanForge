@@ -36,20 +36,21 @@ public final class WorldClientSmoke {
         if (!Boolean.getBoolean("vulkanforge.worldSmoke") || event.phase != TickEvent.Phase.END || stage == 99) return;
         Minecraft mc = Minecraft.getInstance();
         try {
-            if (TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - START) > 180) throw new IllegalStateException("World client smoke timed out, stage=" + stage);
+            if (TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - START) > 300) throw new IllegalStateException("World client smoke timed out, stage=" + stage);
             if (stage == 0 && mc.screen instanceof TitleScreen) {
                 report = mc.gameDirectory.toPath().resolve("logs/vulkanforge/world-client-smoke");
                 Files.createDirectories(report);
                 Files.writeString(report.resolve("report.txt"), "");
                 Files.deleteIfExists(report.resolve("main-swapchain.png"));
                 Files.deleteIfExists(report.resolve("resized-swapchain.png"));
-                Files.deleteIfExists(report.resolve("restored-swapchain.png"));
+                for (String png : new String[]{"restored", "fullscreen", "windowed"}) Files.deleteIfExists(report.resolve(png + "-swapchain.png"));
                 if (System.getProperty("vulkanforge.directPresent", "true").equalsIgnoreCase("true") && System.getProperty("os.name").startsWith("Windows")) {
                     require(NativeMainWindow.active(), "Vulkan main-window initialization fell back to OpenGL");
                     require(org.lwjgl.glfw.GLFW.glfwGetWindowAttrib(mc.getWindow().getWindow(), org.lwjgl.glfw.GLFW.GLFW_CLIENT_API) == org.lwjgl.glfw.GLFW.GLFW_NO_API,
                             "Main window still has an OpenGL context");
                     require(org.lwjgl.glfw.GLFW.glfwGetCurrentContext() != mc.getWindow().getWindow(), "Legacy GL context must belong to the hidden window");
                     require(NativeMainWindow.presentedFrames() > 0, "No frames presented to main swapchain");
+                    require(NativeMainWindow.acquiresBeforeInput() > 0, "No image acquisition before input sampling");
                     log("PASS ASM hooks, GLFW_NO_API main window, hidden GL context and Vulkan presentation");
                 }
                 stage = 1;
@@ -57,12 +58,7 @@ public final class WorldClientSmoke {
                 mc.options.renderDistance().set(3);
                 mc.options.graphicsMode().set(net.minecraft.client.GraphicsStatus.FANCY);
                 mc.options.gamma().set(0.0);
-                String name = "VulkanForge Smoke " + System.currentTimeMillis();
-                mc.createWorldOpenFlows().createFreshLevel(name,
-                        new LevelSettings(name, GameType.CREATIVE, false, Difficulty.PEACEFUL, true, new GameRules(), WorldDataConfiguration.DEFAULT),
-                        new WorldOptions(1234L, false, false),
-                        registries -> registries.registryOrThrow(Registries.WORLD_PRESET).getHolderOrThrow(WorldPresets.FLAT).value().createWorldDimensions());
-                log("Created isolated flat test world");
+                createWorld(mc, "VulkanForge Smoke ");
             } else if (stage == 1 && mc.player != null && mc.level != null && mc.screen == null) {
                 stage = 2; ticks = 0;
                 var server = mc.getSingleplayerServer();
@@ -83,6 +79,15 @@ public final class WorldClientSmoke {
                     player.getAbilities().flying = true; player.onUpdateAbilities();
                 });
             } else if (stage == 2 && ++ticks >= 50) {
+                if (NativeMainWindow.active() && mc.mouseHandler.isMouseGrabbed()) {
+                    long window = mc.getWindow().getWindow();
+                    require(org.lwjgl.glfw.GLFW.glfwGetInputMode(window, org.lwjgl.glfw.GLFW.GLFW_CURSOR) == org.lwjgl.glfw.GLFW.GLFW_CURSOR_DISABLED,
+                            "Cursor capture targets a different window");
+                    if (mc.options.rawMouseInput().get() && org.lwjgl.glfw.GLFW.glfwRawMouseMotionSupported()) require(
+                            org.lwjgl.glfw.GLFW.glfwGetInputMode(window, org.lwjgl.glfw.GLFW.GLFW_RAW_MOUSE_MOTION) == org.lwjgl.glfw.GLFW.GLFW_TRUE,
+                            "Raw mouse input is not bound to the visible main window");
+                    log("PASS vanilla cursor/raw mouse capture belongs to the visible main window");
+                }
                 VulkanPreview.toggle(); stage = 3; ticks = 0;
             } else if (stage == 3 && ++ticks > 100 && VulkanPreview.worldEpoch() > 0 && VulkanPreview.capturedSections() >= 10) {
                 firstHash = VulkanPreview.saveWorldFrame(report.resolve("before.png"));
@@ -133,7 +138,7 @@ public final class WorldClientSmoke {
                     swapchainBaseline = NativeMainWindow.swapchainGenerations();
                     org.lwjgl.glfw.GLFW.glfwSetWindowSize(mc.getWindow().getWindow(), originalWidth == 1000 ? 900 : 1000, 650);
                     stage = 9; ticks = 0;
-                } else { log("STATUS=OK"); stage = 99; mc.stop(); }
+                } else leaveWorld(mc);
             } else if (stage == 9 && ++ticks > 40) {
                 require(NativeMainWindow.swapchainGenerations() > swapchainBaseline, "Main swapchain did not rebuild after resize");
                 verifyCapture(report.resolve("main-swapchain.png"), originalWidth, originalHeight);
@@ -157,7 +162,40 @@ public final class WorldClientSmoke {
             } else if (stage == 13 && ++ticks > 10) {
                 verifyCapture(report.resolve("restored-swapchain.png"), originalWidth, originalHeight);
                 log("PASS non-black swapchain pixels before resize, after resize and after restore");
-                log("STATUS=OK"); stage = 99; mc.stop();
+                // Same path as F11; Window.updateDisplay applies it on the next frame.
+                swapchainBaseline = NativeMainWindow.swapchainGenerations();
+                mc.getWindow().toggleFullScreen();
+                stage = 14; ticks = 0;
+            } else if (stage == 14 && ++ticks > 40) {
+                require(mc.getWindow().isFullscreen() && NativeMainWindow.swapchainGenerations() > swapchainBaseline, "Fullscreen did not rebuild the main swapchain");
+                NativeMainWindow.captureNext(report.resolve("fullscreen-swapchain.png"));
+                stage = 15; ticks = 0;
+            } else if (stage == 15 && ++ticks > 10) {
+                verifyCapture(report.resolve("fullscreen-swapchain.png"), mc.getWindow().getWidth(), mc.getWindow().getHeight());
+                log("PASS fullscreen " + mc.getWindow().getWidth() + "x" + mc.getWindow().getHeight());
+                swapchainBaseline = NativeMainWindow.swapchainGenerations();
+                mc.getWindow().toggleFullScreen();
+                stage = 16; ticks = 0;
+            } else if (stage == 16 && ++ticks > 40) {
+                require(!mc.getWindow().isFullscreen() && NativeMainWindow.swapchainGenerations() > swapchainBaseline, "Leaving fullscreen did not rebuild the main swapchain");
+                NativeMainWindow.captureNext(report.resolve("windowed-swapchain.png"));
+                stage = 17; ticks = 0;
+            } else if (stage == 17 && ++ticks > 10) {
+                verifyCapture(report.resolve("windowed-swapchain.png"), mc.getWindow().getWidth(), mc.getWindow().getHeight());
+                log("PASS fullscreen round trip, swapchain generations=" + NativeMainWindow.swapchainGenerations());
+                leaveWorld(mc);
+            } else if (stage == 18 && mc.level == null && mc.screen instanceof TitleScreen && ++ticks > 20) {
+                require(VulkanPreview.worldEpoch() == 0, "Vulkan world state survived leaving the world");
+                long frames = NativeMainWindow.presentedFrames();
+                createWorld(mc, "VulkanForge Smoke Switch ");
+                minimizedFrames = frames;
+                stage = 19; ticks = 0;
+            } else if (stage == 19 && mc.player != null && mc.level != null && mc.screen == null && ++ticks > 100
+                    && VulkanPreview.worldEpoch() > firstEpoch && VulkanPreview.capturedSections() >= 10) {
+                VulkanPreview.saveWorldFrame(report.resolve("switched-world.png"));
+                require(!NativeMainWindow.active() || NativeMainWindow.presentedFrames() > minimizedFrames, "Main window stopped presenting across the world switch");
+                log("PASS world switch, epoch " + firstEpoch + " -> " + VulkanPreview.worldEpoch() + ", sections=" + VulkanPreview.capturedSections());
+                finish(mc);
             }
         } catch (Throwable error) {
             VulkanForge.LOGGER.error("World client smoke failed at stage " + stage, error);
@@ -166,6 +204,38 @@ public final class WorldClientSmoke {
         }
     }
 
+    private static void createWorld(Minecraft mc, String prefix) throws java.io.IOException {
+        String name = prefix + System.currentTimeMillis();
+        mc.createWorldOpenFlows().createFreshLevel(name,
+                new LevelSettings(name, GameType.CREATIVE, false, Difficulty.PEACEFUL, true, new GameRules(), WorldDataConfiguration.DEFAULT),
+                new WorldOptions(1234L, false, false),
+                registries -> registries.registryOrThrow(Registries.WORLD_PRESET).getHolderOrThrow(WorldPresets.FLAT).value().createWorldDimensions());
+        log("Created isolated flat test world: " + name);
+    }
+    private static void leaveWorld(Minecraft mc) {
+        firstEpoch = VulkanPreview.worldEpoch();
+        // Same sequence as the pause screen's "Save and Quit to Title".
+        mc.level.disconnect();
+        mc.clearLevel(new net.minecraft.client.gui.screens.GenericDirtMessageScreen(net.minecraft.network.chat.Component.translatable("menu.savingLevel")));
+        mc.setScreen(new TitleScreen());
+        stage = 18; ticks = 0;
+    }
+    private static void finish(Minecraft mc) throws java.io.IOException {
+        if (NativeMainWindow.active()) {
+            require(NativeMainWindow.acquiresBeforeInput() > NativeMainWindow.presentedFrames() * .9,
+                    "Most acquisitions still happen after camera rendering");
+            log("PASS acquire before input=" + NativeMainWindow.acquiresBeforeInput() + ", fallback acquire after render=" + NativeMainWindow.acquiresAfterRender());
+        }
+        log("STATUS=OK"); stage = 99;
+        // Teardown of the swapchain, shared GL images and bridge must not hang; build.gradle fails on this marker.
+        Thread watchdog = new Thread(() -> {
+            try { Thread.sleep(30_000); Files.writeString(report.resolve("report.txt"), "EXIT_TIMEOUT" + System.lineSeparator(), StandardOpenOption.APPEND); }
+            catch (Exception ignored) { }
+            Runtime.getRuntime().halt(3);
+        }, "VulkanForge-smoke-exit-watchdog");
+        watchdog.setDaemon(true); watchdog.start();
+        mc.stop();
+    }
     private static void log(String message) throws java.io.IOException {
         VulkanForge.LOGGER.info("World client smoke: {}", message);
         Files.writeString(report.resolve("report.txt"), message + System.lineSeparator(), StandardOpenOption.CREATE, StandardOpenOption.APPEND);

@@ -62,7 +62,10 @@ public final class WorldSmokeTest {
             require(process.waitFor(5, TimeUnit.SECONDS) && process.exitValue() == 0, "World process did not exit cleanly");
             String log = Files.readString(report);
             require(log.contains("STATUS=OK") && log.contains("VALIDATION_ERRORS=0"), log);
-            System.out.println("World GPU smoke passed: cutout threshold/depth, live atlas patches, lightmap, camera, removal, epoch reset and shutdown");
+            if (log.contains("GPU_TIMESTAMPS=ENABLED")) {
+                requireTiming(log, "TERRAIN"); requireTiming(log, "READBACK_COPY");
+            } else require(log.contains("GPU_TIMESTAMPS=UNAVAILABLE"), "Missing timestamp capability report");
+            System.out.println("World GPU smoke passed: cutout threshold/depth, live atlas patches, lightmap, camera, removal, epoch reset, GPU timestamps and shutdown");
         } finally { watchdog.shutdownNow(); if (process.isAlive()) process.destroyForcibly(); }
     }
 
@@ -97,4 +100,11 @@ public final class WorldSmokeTest {
     private static boolean darkRed(byte[] bytes) { return Math.abs(component(bytes, 0) - 32) < 3 && component(bytes, 2) < 20; }
     private static boolean background(byte[] bytes) { return Math.abs(component(bytes, 0) - 26) < 3 && Math.abs(component(bytes, 2) - 26) < 3; }
     private static void require(boolean success, String message) { if (!success) throw new AssertionError(message); }
+    private static void requireTiming(String log, String metric) {
+        var match = java.util.regex.Pattern.compile("GPU_" + metric + "_MS samples=(\\d+) mean=([0-9.]+) max=([0-9.]+)").matcher(log);
+        require(match.find(), "Missing GPU timing: " + metric);
+        double mean = Double.parseDouble(match.group(2)), max = Double.parseDouble(match.group(3));
+        require(Long.parseLong(match.group(1)) > 0 && Double.isFinite(mean) && mean >= 0 && Double.isFinite(max) && max >= mean,
+                "Invalid GPU timing: " + match.group());
+    }
 }

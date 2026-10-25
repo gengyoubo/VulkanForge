@@ -19,18 +19,21 @@ public final class MainWindowBackend implements AutoCloseable {
     private static final int FRAMES_IN_FLIGHT = 2;
     private static final class FrameSlot {
         long fence, acquired;
+        int imageIndex = -1, acquireResult;
         VkCommandBuffer command;
         SharedPresentImage shared;
     }
     private final FrameSlot[] slots = {new FrameSlot(), new FrameSlot()};
     private long swapchain, pool;
     private long[] images = new long[0], finished = new long[0];
-    private int width, height, format, generations;
-    private long frames;
+    private int width, height, format, generations, requestedWidth, requestedHeight;
+    private long frames, skippedExtents, abandonedFrames;
+    private long earlyAcquires, lateAcquires, cancelledAcquires, acquireNanos, maxAcquireNanos;
     private long fenceWaitNanos, maxFenceWaitNanos, presentNanos, maxPresentNanos;
     private boolean dirty = true, vsync = true;
     private String capture;
     private PrintWriter report;
+    private GpuTimers timers;
     private final Function<long[], Consumer<int[]>> importer;
     private final Runnable finishGL;
 
@@ -41,7 +44,9 @@ public final class MainWindowBackend implements AutoCloseable {
         try {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 context.initializeInterop(uuid, Boolean.getBoolean("vulkanforge.requireValidation"));
+                timers = new GpuTimers(context, FRAMES_IN_FLIGHT, this::log, "COPY", "PRESENT_PREPARE");
                 log("VALIDATION=" + (context.validationEnabled() ? "ENABLED" : "UNAVAILABLE"));
+                log("SYNC_VALIDATION_REQUESTED=" + "1".equals(System.getenv("VK_VALIDATION_VALIDATE_SYNC")));
                 verifyInterop(stack);
                 var handle = stack.mallocLong(1);
                 check(vkCreateCommandPool(context.device, VkCommandPoolCreateInfo.calloc(stack).sType$Default().queueFamilyIndex(context.queueFamily)
@@ -50,9 +55,8 @@ public final class MainWindowBackend implements AutoCloseable {
                 check(vkAllocateCommandBuffers(context.device, VkCommandBufferAllocateInfo.calloc(stack).sType$Default().commandPool(pool)
                         .level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(FRAMES_IN_FLIGHT), pointer), "main-window command buffers");
                 for (int i = 0; i < slots.length; i++) {
-                    FrameSlot slot = slots[i]; slot.command = new VkCommandBuffer(pointer.get(i), context.device);
-                    check(vkCreateFence(context.device, VkFenceCreateInfo.calloc(stack).sType$Default().flags(VK_FENCE_CREATE_SIGNALED_BIT), null, handle), "main-window frame fence"); slot.fence = handle.get(0);
-                    check(vkCreateSemaphore(context.device, VkSemaphoreCreateInfo.calloc(stack).sType$Default(), null, handle), "main-window acquire semaphore"); slot.acquired = handle.get(0);
+                    slots[i].command = new VkCommandBuffer(pointer.get(i), context.device);
+                    createSync(slots[i]);
                 }
             }
             // Check actual handle import and FBO creation before the caller replaces the visible window.
@@ -83,63 +87,106 @@ public final class MainWindowBackend implements AutoCloseable {
     public void prepare(int width, int height) { if (width > 0 && height > 0) recreate(width, height); }
     public long frames() { return frames; }
     public int generations() { return generations; }
+    public long earlyAcquires() { return earlyAcquires; }
+    public long lateAcquires() { return lateAcquires; }
+    public int validationErrors() { return context.validationErrors(); }
+    public boolean gpuTimingsEnabled() { return timers != null && timers.enabled(); }
+    public long gpuTimingSamples(int metric) { return timers == null ? 0 : timers.samples(metric); }
     public void captureNext(String path) { capture = path; }
     public void setVsync(boolean enabled) { if (vsync != enabled) { vsync = enabled; dirty = true; } }
 
-    public void present(int sourceFramebuffer, int sourceWidth, int sourceHeight, int framebufferWidth, int framebufferHeight) throws IOException {
-        if (framebufferWidth <= 0 || framebufferHeight <= 0) return;
-        if (dirty || framebufferWidth != width || framebufferHeight != height) recreate(framebufferWidth, framebufferHeight);
+    /** Wait for a slot/image before Minecraft polls input and advances its timer. */
+    public boolean beginFrame(int framebufferWidth, int framebufferHeight) { return acquire(framebufferWidth, framebufferHeight, true); }
+    private boolean acquire(int framebufferWidth, int framebufferHeight, boolean early) {
+        if (framebufferWidth <= 0 || framebufferHeight <= 0) return false;
+        // Compare requested sizes: the surface may clamp them.
+        if ((dirty || framebufferWidth != requestedWidth || framebufferHeight != requestedHeight) && !recreate(framebufferWidth, framebufferHeight)) return false;
         FrameSlot slot = slots[(int)(frames % slots.length)];
+        if (slot.imageIndex >= 0) return true;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            long start = System.nanoTime();
+            check(vkWaitForFences(context.device, slot.fence, true, 5_000_000_000L), "wait presentation slot before input");
+            long elapsed = System.nanoTime() - start; fenceWaitNanos += elapsed; maxFenceWaitNanos = Math.max(maxFenceWaitNanos, elapsed);
+            timers.collect((int)(frames % slots.length));
+            var index = stack.ints(0); start = System.nanoTime();
+            int result = vkAcquireNextImageKHR(context.device, swapchain, 5_000_000_000L, slot.acquired, 0, index);
+            elapsed = System.nanoTime() - start; acquireNanos += elapsed; maxAcquireNanos = Math.max(maxAcquireNanos, elapsed);
+            if (result == VK_ERROR_OUT_OF_DATE_KHR) { dirty = true; return false; }
+            if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) check(result, "acquire main-window swapchain");
+            slot.imageIndex = index.get(0); slot.acquireResult = result;
+            if (early) earlyAcquires++; else lateAcquires++;
+            return true;
+        }
+    }
+
+    public void present(int sourceFramebuffer, int sourceWidth, int sourceHeight, int framebufferWidth, int framebufferHeight) throws IOException {
+        if (!acquire(framebufferWidth, framebufferHeight, false)) return;
+        FrameSlot slot = slots[(int)(frames % slots.length)];
+        int timerSlot = (int)(frames % slots.length);
         long fence = slot.fence, acquired = slot.acquired;
         VkCommandBuffer command = slot.command;
         SharedPresentImage shared = slot.shared;
         try (MemoryStack stack = MemoryStack.stackPush()) {
+            var index = stack.ints(slot.imageIndex);
+            int acquiredResult = slot.acquireResult, image = slot.imageIndex;
+            CaptureBuffer proof = null;
+            boolean submitted = false;
+            try {
+                shared.copyFromGL(sourceFramebuffer, sourceWidth, sourceHeight);
+                check(vkResetCommandBuffer(command, 0), "reset presentation command");
+                check(vkBeginCommandBuffer(command, VkCommandBufferBeginInfo.calloc(stack).sType$Default().flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)), "begin presentation command");
+                timers.begin(command, timerSlot);
+                // Both semaphores are waited at BLIT; the barriers' first scope must include BLIT to chain after those waits.
+                var barriers = VkImageMemoryBarrier2.calloc(2, stack);
+                barriers.get(0).sType$Default().srcStageMask(VK_PIPELINE_STAGE_2_BLIT_BIT).dstStageMask(VK_PIPELINE_STAGE_2_BLIT_BIT)
+                        .dstAccessMask(VK_ACCESS_2_TRANSFER_READ_BIT).oldLayout(VK_IMAGE_LAYOUT_GENERAL).newLayout(VK_IMAGE_LAYOUT_GENERAL)
+                        .srcQueueFamilyIndex(VK_QUEUE_FAMILY_EXTERNAL).dstQueueFamilyIndex(context.queueFamily).image(shared.image)
+                        .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
+                barriers.get(1).sType$Default().srcStageMask(VK_PIPELINE_STAGE_2_BLIT_BIT).dstStageMask(VK_PIPELINE_STAGE_2_BLIT_BIT)
+                        .dstAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT).oldLayout(VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                        .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).image(images[image])
+                        .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
+                vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barriers));
+                var blit = VkImageBlit.calloc(1, stack).srcSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1))
+                        .dstSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1));
+                blit.srcOffsets(0).set(0, height, 0); blit.srcOffsets(1).set(width, 0, 1);
+                blit.dstOffsets(0).set(0, 0, 0); blit.dstOffsets(1).set(width, height, 1);
+                timers.start(command, timerSlot, 0, VK_PIPELINE_STAGE_2_BLIT_BIT);
+                vkCmdBlitImage(command, shared.image, VK_IMAGE_LAYOUT_GENERAL, images[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, blit, VK_FILTER_NEAREST);
+                timers.end(command, timerSlot, 0, VK_PIPELINE_STAGE_2_BLIT_BIT);
+                // Optional diagnostic readback, never used by the normal presentation path.
+                if (capture != null) { proof = new CaptureBuffer(context, width * height * 4); proof.record(command, images[image], width, height, stack); }
+                // The presentation engine/scanout is outside command-buffer timestamp scope.
+                timers.start(command, timerSlot, 1, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+                barriers.get(0).srcStageMask(VK_PIPELINE_STAGE_2_BLIT_BIT).srcAccessMask(VK_ACCESS_2_TRANSFER_READ_BIT)
+                        .dstStageMask(VK_PIPELINE_STAGE_2_NONE).dstAccessMask(0).srcQueueFamilyIndex(context.queueFamily).dstQueueFamilyIndex(VK_QUEUE_FAMILY_EXTERNAL);
+                barriers.get(1).srcStageMask(proof == null ? VK_PIPELINE_STAGE_2_BLIT_BIT : VK_PIPELINE_STAGE_2_COPY_BIT)
+                        .srcAccessMask(proof == null ? VK_ACCESS_2_TRANSFER_WRITE_BIT : VK_ACCESS_2_TRANSFER_READ_BIT)
+                        .dstStageMask(VK_PIPELINE_STAGE_2_NONE).dstAccessMask(0).oldLayout(proof == null ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+                        .newLayout(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+                vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barriers));
+                timers.end(command, timerSlot, 1, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+                check(vkEndCommandBuffer(command), "end presentation command");
+                var waits = VkSemaphoreSubmitInfo.calloc(2, stack);
+                waits.get(0).sType$Default().semaphore(acquired).stageMask(VK_PIPELINE_STAGE_2_BLIT_BIT);
+                waits.get(1).sType$Default().semaphore(shared.complete).stageMask(VK_PIPELINE_STAGE_2_BLIT_BIT);
+                var signals = VkSemaphoreSubmitInfo.calloc(2, stack);
+                signals.get(0).sType$Default().semaphore(finished[image]).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+                signals.get(1).sType$Default().semaphore(shared.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+                var submit = VkSubmitInfo2.calloc(1, stack).sType$Default().pWaitSemaphoreInfos(waits).pSignalSemaphoreInfos(signals)
+                        .pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1, stack).sType$Default().commandBuffer(command));
+                check(vkResetFences(context.device, fence), "reset presentation fence");
+                check(vkQueueSubmit2(context.queue, submit, fence), "submit main-window presentation");
+                timers.submitted(timerSlot);
+                slot.imageIndex = -1;
+                submitted = true;
+            } finally {
+                if (!submitted) { if (proof != null) proof.close(); abandon(slot); }
+            }
             long start = System.nanoTime();
-            check(vkWaitForFences(context.device, fence, true, 5_000_000_000L), "wait presentation frame");
-            long elapsed = System.nanoTime() - start; fenceWaitNanos += elapsed; maxFenceWaitNanos = Math.max(maxFenceWaitNanos, elapsed);
-            var index = stack.ints(0);
-            int result = vkAcquireNextImageKHR(context.device, swapchain, 5_000_000_000L, acquired, 0, index);
-            if (result == VK_ERROR_OUT_OF_DATE_KHR) { dirty = true; return; }
-            if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) check(result, "acquire main-window swapchain");
-            int acquiredResult = result, image = index.get(0);
-            shared.copyFromGL(sourceFramebuffer, sourceWidth, sourceHeight);
-            check(vkResetCommandBuffer(command, 0), "reset presentation command");
-            check(vkBeginCommandBuffer(command, VkCommandBufferBeginInfo.calloc(stack).sType$Default().flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)), "begin presentation command");
-            var barriers = VkImageMemoryBarrier2.calloc(2, stack);
-            barriers.get(0).sType$Default().srcStageMask(VK_PIPELINE_STAGE_2_NONE).dstStageMask(VK_PIPELINE_STAGE_2_BLIT_BIT)
-                    .dstAccessMask(VK_ACCESS_2_TRANSFER_READ_BIT).oldLayout(VK_IMAGE_LAYOUT_GENERAL).newLayout(VK_IMAGE_LAYOUT_GENERAL)
-                    .srcQueueFamilyIndex(VK_QUEUE_FAMILY_EXTERNAL).dstQueueFamilyIndex(context.queueFamily).image(shared.image)
-                    .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
-            barriers.get(1).sType$Default().srcStageMask(VK_PIPELINE_STAGE_2_NONE).dstStageMask(VK_PIPELINE_STAGE_2_BLIT_BIT)
-                    .dstAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT).oldLayout(VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
-                    .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).image(images[image])
-                    .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
-            vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barriers));
-            var blit = VkImageBlit.calloc(1, stack).srcSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1))
-                    .dstSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1));
-            blit.srcOffsets(0).set(0, height, 0); blit.srcOffsets(1).set(width, 0, 1);
-            blit.dstOffsets(0).set(0, 0, 0); blit.dstOffsets(1).set(width, height, 1);
-            vkCmdBlitImage(command, shared.image, VK_IMAGE_LAYOUT_GENERAL, images[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, blit, VK_FILTER_NEAREST);
-            // Optional diagnostic readback, never used by the normal presentation path.
-            CaptureBuffer proof = capture == null ? null : new CaptureBuffer(context, width * height * 4);
-            if (proof != null) proof.record(command, images[image], width, height, stack);
-            barriers.get(0).srcStageMask(VK_PIPELINE_STAGE_2_BLIT_BIT).srcAccessMask(VK_ACCESS_2_TRANSFER_READ_BIT)
-                    .dstStageMask(VK_PIPELINE_STAGE_2_NONE).dstAccessMask(0).srcQueueFamilyIndex(context.queueFamily).dstQueueFamilyIndex(VK_QUEUE_FAMILY_EXTERNAL);
-            barriers.get(1).srcStageMask(proof == null ? VK_PIPELINE_STAGE_2_BLIT_BIT : VK_PIPELINE_STAGE_2_COPY_BIT)
-                    .srcAccessMask(proof == null ? VK_ACCESS_2_TRANSFER_WRITE_BIT : VK_ACCESS_2_TRANSFER_READ_BIT)
-                    .dstStageMask(VK_PIPELINE_STAGE_2_NONE).dstAccessMask(0).oldLayout(proof == null ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
-                    .newLayout(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-            vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barriers));
-            check(vkEndCommandBuffer(command), "end presentation command");
-            check(vkResetFences(context.device, fence), "reset presentation fence");
-            var submit = VkSubmitInfo.calloc(stack).sType$Default().pWaitSemaphores(stack.longs(acquired, shared.complete))
-                    .pWaitDstStageMask(stack.ints(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT))
-                    .pCommandBuffers(stack.pointers(command.address())).pSignalSemaphores(stack.longs(finished[image], shared.ready));
-            check(vkQueueSubmit(context.queue, submit, fence), "submit main-window presentation");
-            start = System.nanoTime();
-            result = vkQueuePresentKHR(context.queue, VkPresentInfoKHR.calloc(stack).sType$Default().pWaitSemaphores(stack.longs(finished[image]))
+            int result = vkQueuePresentKHR(context.queue, VkPresentInfoKHR.calloc(stack).sType$Default().pWaitSemaphores(stack.longs(finished[image]))
                     .swapchainCount(1).pSwapchains(stack.longs(swapchain)).pImageIndices(index));
-            elapsed = System.nanoTime() - start; presentNanos += elapsed; maxPresentNanos = Math.max(maxPresentNanos, elapsed);
+            long elapsed = System.nanoTime() - start; presentNanos += elapsed; maxPresentNanos = Math.max(maxPresentNanos, elapsed);
             if (result != VK_SUCCESS && result != VK_ERROR_OUT_OF_DATE_KHR && result != VK_SUBOPTIMAL_KHR) check(result, "vkQueuePresentKHR(main window)");
             if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR || acquiredResult == VK_SUBOPTIMAL_KHR) dirty = true;
             frames++;
@@ -148,19 +195,23 @@ public final class MainWindowBackend implements AutoCloseable {
                 try { check(vkWaitForFences(context.device, fence, true, 5_000_000_000L), "wait swapchain capture"); proof.save(capture, width, height, format); }
                 finally { proof.close(); capture = null; }
             }
-            if (frames == 1 || frames % 300 == 0) log("PRESENTED_FRAMES=" + frames);
+            if (frames == 1 || frames % 300 == 0) { log("PRESENTED_FRAMES=" + frames); timers.report(this::log); }
         }
     }
 
-    private void recreate(int requestedWidth, int requestedHeight) {
-        finishGL.run(); check(vkDeviceWaitIdle(context.device), "wait resize"); destroySwapchain();
+    private boolean recreate(int requestedWidth, int requestedHeight) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             var caps = VkSurfaceCapabilitiesKHR.calloc(stack);
             check(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(context.physical, context.surface, caps), "main-window surface capabilities");
             int required = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
             if ((caps.supportedUsageFlags() & required) != required) throw new IllegalStateException("Swapchain transfer usage unavailable");
-            width = caps.currentExtent().width() == -1 ? Math.max(caps.minImageExtent().width(), Math.min(requestedWidth, caps.maxImageExtent().width())) : caps.currentExtent().width();
-            height = caps.currentExtent().height() == -1 ? Math.max(caps.minImageExtent().height(), Math.min(requestedHeight, caps.maxImageExtent().height())) : caps.currentExtent().height();
+            int extentWidth = caps.currentExtent().width() == -1 ? Math.max(caps.minImageExtent().width(), Math.min(requestedWidth, caps.maxImageExtent().width())) : caps.currentExtent().width();
+            int extentHeight = caps.currentExtent().height() == -1 ? Math.max(caps.minImageExtent().height(), Math.min(requestedHeight, caps.maxImageExtent().height())) : caps.currentExtent().height();
+            // Fullscreen/minimize transitions can briefly report 0x0 while GLFW still has a size; retry next frame.
+            if (extentWidth <= 0 || extentHeight <= 0) { dirty = true; if (skippedExtents++ == 0) log("ZERO_SURFACE_EXTENT_SKIPPED"); return false; }
+            finishGL.run(); drainAcquired(); check(vkDeviceWaitIdle(context.device), "wait resize"); timers.collectAll(); destroySwapchain();
+            width = extentWidth; height = extentHeight;
+            this.requestedWidth = requestedWidth; this.requestedHeight = requestedHeight;
             var count = stack.ints(0);
             check(vkGetPhysicalDeviceSurfaceFormatsKHR(context.physical, context.surface, count, null), "surface formats");
             var formats = VkSurfaceFormatKHR.calloc(count.get(0), stack);
@@ -173,12 +224,14 @@ public final class MainWindowBackend implements AutoCloseable {
             int imageCount = caps.minImageCount() + 1;
             if (caps.maxImageCount() > 0) imageCount = Math.min(imageCount, caps.maxImageCount());
             int mode = VK_PRESENT_MODE_FIFO_KHR;
-            if (!vsync) {
-                check(vkGetPhysicalDeviceSurfacePresentModesKHR(context.physical, context.surface, count, null), "present modes");
-                var modes = stack.mallocInt(count.get(0));
-                check(vkGetPhysicalDeviceSurfacePresentModesKHR(context.physical, context.surface, count, modes), "present modes");
-                for (int i = 0; i < modes.remaining(); i++) { int candidate = modes.get(i); if (candidate == VK_PRESENT_MODE_MAILBOX_KHR) { mode = candidate; break; } if (candidate == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = candidate; }
-            }
+            check(vkGetPhysicalDeviceSurfacePresentModesKHR(context.physical, context.surface, count, null), "present modes");
+            var modes = stack.mallocInt(count.get(0));
+            check(vkGetPhysicalDeviceSurfacePresentModesKHR(context.physical, context.surface, count, modes), "present modes");
+            boolean mailbox = false, immediate = false;
+            for (int i = 0; i < modes.remaining(); i++) { mailbox |= modes.get(i) == VK_PRESENT_MODE_MAILBOX_KHR; immediate |= modes.get(i) == VK_PRESENT_MODE_IMMEDIATE_KHR; }
+            // Mailbox keeps VSync and replaces older pending frames; FIFO remains the portable fallback.
+            if (vsync && mailbox) mode = VK_PRESENT_MODE_MAILBOX_KHR;
+            else if (!vsync) mode = immediate ? VK_PRESENT_MODE_IMMEDIATE_KHR : mailbox ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_FIFO_KHR;
             var info = VkSwapchainCreateInfoKHR.calloc(stack).sType$Default().surface(context.surface).minImageCount(imageCount).imageFormat(format).imageColorSpace(colorSpace)
                     .imageExtent(e -> e.set(width, height)).imageArrayLayers(1).imageUsage(required).imageSharingMode(VK_SHARING_MODE_EXCLUSIVE)
                     .preTransform(caps.currentTransform()).compositeAlpha(Integer.lowestOneBit(caps.supportedCompositeAlpha())).presentMode(mode).clipped(true);
@@ -205,11 +258,47 @@ public final class MainWindowBackend implements AutoCloseable {
             check(vkQueueSubmit(context.queue, VkSubmitInfo.calloc(stack).sType$Default().pCommandBuffers(stack.pointers(command.address())).pSignalSemaphores(signals), 0), "initialize GL ownership");
             check(vkQueueWaitIdle(context.queue), "wait GL ownership initializer");
             generations++; dirty = false;
-            log("SWAPCHAIN[" + generations + "]=" + width + "x" + height + " format=" + format + " mode=" + mode);
+            log("SWAPCHAIN[" + generations + "]=" + width + "x" + height + " format=" + format + " mode=" + mode
+                    + " (" + (mode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "IMMEDIATE" : "FIFO") + ") images=" + images.length);
+            return true;
         }
     }
 
+    private void createSync(FrameSlot slot) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            var handle = stack.mallocLong(1);
+            check(vkCreateFence(context.device, VkFenceCreateInfo.calloc(stack).sType$Default().flags(VK_FENCE_CREATE_SIGNALED_BIT), null, handle), "main-window frame fence"); slot.fence = handle.get(0);
+            check(vkCreateSemaphore(context.device, VkSemaphoreCreateInfo.calloc(stack).sType$Default(), null, handle), "main-window acquire semaphore"); slot.acquired = handle.get(0);
+        }
+    }
+
+    /** A frame that acquired an image but never reached the queue leaves its acquire semaphore pending and its GL handoff half done. */
+    private void abandon(FrameSlot slot) {
+        abandonedFrames++; dirty = true;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            // Consume the pending acquire signal on the queue so the semaphore and fence can be destroyed legally.
+            check(vkResetFences(context.device, slot.fence), "reset abandoned frame fence");
+            check(vkQueueSubmit(context.queue, VkSubmitInfo.calloc(stack).sType$Default().pWaitSemaphores(stack.longs(slot.acquired))
+                    .pWaitDstStageMask(stack.ints(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)), slot.fence), "consume failed frame acquisition");
+            slot.imageIndex = -1;
+            finishGL.run(); check(vkDeviceWaitIdle(context.device), "wait abandoned frame");
+            vkDestroyFence(context.device, slot.fence, null); vkDestroySemaphore(context.device, slot.acquired, null);
+            slot.fence = slot.acquired = 0;
+            createSync(slot);
+            log("ABANDONED_FRAME=" + abandonedFrames);
+        } catch (Throwable error) { log("ABANDON_FAILED=" + error); }
+    }
+
     private void log(String message) { if (report != null) { report.println(message); report.flush(); } }
+    private void drainAcquired() {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            for (FrameSlot slot : slots) if (slot.imageIndex >= 0) {
+                var wait = VkSemaphoreSubmitInfo.calloc(1, stack).sType$Default().semaphore(slot.acquired).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+                check(vkQueueSubmit2(context.queue, VkSubmitInfo2.calloc(1, stack).sType$Default().pWaitSemaphoreInfos(wait), 0), "consume cancelled frame acquisition");
+                slot.imageIndex = -1; cancelledAcquires++;
+            }
+        }
+    }
     private void destroySwapchain() {
         for (FrameSlot slot : slots) if (slot.shared != null) { slot.shared.close(); slot.shared = null; }
         for (long semaphore : finished) if (semaphore != 0) vkDestroySemaphore(context.device, semaphore, null);
@@ -218,7 +307,9 @@ public final class MainWindowBackend implements AutoCloseable {
     }
     @Override public void close() {
         if (context.device != null) {
-            finishGL.run(); vkDeviceWaitIdle(context.device); destroySwapchain();
+            finishGL.run(); drainAcquired(); check(vkDeviceWaitIdle(context.device), "wait presentation shutdown");
+            if (timers != null) { timers.collectAll(); timers.report(this::log); timers.close(); }
+            destroySwapchain();
             if (pool != 0) { vkDestroyCommandPool(context.device, pool, null); pool = 0; }
             for (FrameSlot slot : slots) {
                 if (slot.fence != 0) { vkDestroyFence(context.device, slot.fence, null); slot.fence = 0; }
@@ -228,7 +319,10 @@ public final class MainWindowBackend implements AutoCloseable {
         if (frames > 0) {
             log("CPU_FENCE_WAIT_MS mean=" + fenceWaitNanos / (frames * 1_000_000.0) + " max=" + maxFenceWaitNanos / 1_000_000.0);
             log("CPU_PRESENT_MS mean=" + presentNanos / (frames * 1_000_000.0) + " max=" + maxPresentNanos / 1_000_000.0);
+            log("CPU_ACQUIRE_MS mean=" + acquireNanos / (Math.max(1, earlyAcquires + lateAcquires) * 1_000_000.0) + " max=" + maxAcquireNanos / 1_000_000.0);
         }
+        log("ACQUIRES_BEFORE_INPUT=" + earlyAcquires); log("ACQUIRES_AFTER_RENDER=" + lateAcquires); log("CANCELLED_ACQUIRES=" + cancelledAcquires);
+        if (skippedExtents > 0 || abandonedFrames > 0) log("ZERO_EXTENT_FRAMES=" + skippedExtents + " ABANDONED_FRAMES=" + abandonedFrames);
         context.close(); log("FINAL_PRESENTED_FRAMES=" + frames); log("VALIDATION_ERRORS=" + context.validationErrors());
         if (report != null) { report.close(); report = null; }
     }

@@ -28,6 +28,7 @@ minecraft {
         }
         client {
             property 'vulkanforge.directPresent', System.getProperty('vulkanforge.directPresent', 'true')
+            if (project.hasProperty('validationSmoke')) property 'vulkanforge.requireValidation', 'true'
             if (project.hasProperty('worldSmoke')) {
                 property 'vulkanforge.worldSmoke', 'true'
                 mods { vulkanforge { source sourceSets.smoke } }
@@ -67,8 +68,20 @@ if (project.hasProperty('worldSmoke')) {
         }
         doLast {
             def report = file('run/logs/vulkanforge/world-client-smoke/report.txt')
-            if (!report.exists() || !report.text.contains('STATUS=OK')) {
+            if (!report.exists() || !report.text.contains('STATUS=OK') || report.text.contains('EXIT_TIMEOUT')) {
                 throw new GradleException('World client smoke did not finish successfully; see run/logs/vulkanforge/world-client-smoke/report.txt')
+            }
+            // The backend writes these only after swapchain, shared images, device and instance are destroyed.
+            def window = file('run/logs/vulkanforge/main-window-report.txt')
+            if (report.text.contains('PASS ASM hooks') && (!window.exists() || !window.text.contains('FINAL_PRESENTED_FRAMES=') || !window.text.contains('VALIDATION_ERRORS=0'))) {
+                throw new GradleException('Vulkan main window did not shut down cleanly; see run/logs/vulkanforge/main-window-report.txt')
+            }
+            if (project.hasProperty('validationSmoke')) {
+                if (!window.text.contains('VALIDATION=ENABLED')) throw new GradleException('Vulkan validation layer was not enabled')
+                def bridge = file('run/logs/vulkanforge/bridge-report.txt')
+                if (!bridge.exists() || !bridge.text.contains('VALIDATION=ENABLED') || !bridge.text.contains('VALIDATION_ERRORS=0')) {
+                    throw new GradleException('Terrain bridge did not pass validation')
+                }
             }
         }
     }

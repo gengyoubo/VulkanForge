@@ -42,7 +42,8 @@ function initializeCoreMod() {
                     {owner: forge, name: 'setupMinecraftWindow', desc: '(Ljava/util/function/IntSupplier;Ljava/util/function/IntSupplier;Ljava/util/function/Supplier;Ljava/util/function/LongSupplier;)J', to: 'createWindow', ctor: true},
                     {owner: forge, name: 'positionWindow', desc: '(Ljava/util/Optional;Ljava/util/function/IntConsumer;Ljava/util/function/IntConsumer;Ljava/util/function/IntConsumer;Ljava/util/function/IntConsumer;)Z', to: 'positionWindow', ctor: true},
                     {owner: glfw, name: 'glfwMakeContextCurrent', desc: '(J)V', to: 'makeContextCurrent', ctor: true},
-                    {owner: glfw, name: 'glfwDestroyWindow', desc: '(J)V', to: 'destroyWindow'}
+                    {owner: glfw, name: 'glfwDestroyWindow', desc: '(J)V', to: 'destroyWindow'},
+                    {owner: 'com/mojang/blaze3d/platform/GLX', name: '_shouldClose', desc: '(Lcom/mojang/blaze3d/platform/Window;)Z', to: 'shouldClose'}
                 ]);
             }
         },

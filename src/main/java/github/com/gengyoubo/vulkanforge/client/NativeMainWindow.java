@@ -1,6 +1,8 @@
 package github.com.gengyoubo.vulkanforge.client;
 
 import com.mojang.logging.LogUtils;
+import com.mojang.blaze3d.platform.GLX;
+import com.mojang.blaze3d.platform.Window;
 import net.minecraft.client.Minecraft;
 import net.minecraftforge.fml.loading.ImmediateWindowHandler;
 import net.minecraftforge.fml.loading.FMLPaths;
@@ -21,7 +23,7 @@ public final class NativeMainWindow {
     private static URLClassLoader loader;
     private static Object backend;
     private static boolean revealed;
-    private static Method present, setVsync, frames, generations, capture, close;
+    private static Method present, beginFrame, setVsync, frames, generations, capture, close, earlyAcquires, lateAcquires;
 
     private NativeMainWindow() { }
 
@@ -41,6 +43,8 @@ public final class NativeMainWindow {
             backend = type.getConstructor(String.class, byte[].class, Function.class, Runnable.class)
                     .newInstance(logs.resolve("main-window-report.txt").toString(), uuid, importer, finishGL);
             present = type.getMethod("present", int.class, int.class, int.class, int.class, int.class);
+            beginFrame = type.getMethod("beginFrame", int.class, int.class);
+            earlyAcquires = type.getMethod("earlyAcquires"); lateAcquires = type.getMethod("lateAcquires");
             setVsync = type.getMethod("setVsync", boolean.class);
             frames = type.getMethod("frames"); generations = type.getMethod("generations");
             capture = type.getMethod("captureNext", String.class); close = type.getMethod("close");
@@ -83,6 +87,22 @@ public final class NativeMainWindow {
         return !active() && ImmediateWindowHandler.positionWindow(monitor, width, height, x, y);
     }
     public static void makeContextCurrent(long window) { GLFW.glfwMakeContextCurrent(active() && window == mainWindow ? hiddenContext : window); }
+    /** Window.shouldClose is called at the start of Minecraft.runTick, before timer/ticks/mouse.turnPlayer. */
+    public static boolean shouldClose(Window window) {
+        if (GLX._shouldClose(window)) return true;
+        if (active() && window.getWindow() == mainWindow) {
+            // Process close/minimize/resize before a WSI wait; then sample again after the wait.
+            GLFW.glfwPollEvents();
+            if (GLX._shouldClose(window)) return true;
+            Minecraft mc = Minecraft.getInstance();
+            call(setVsync, mc.options.enableVsync().get());
+            int[] width = {0}, height = {0}; GLFW.glfwGetFramebufferSize(mainWindow, width, height);
+            if (GLFW.glfwGetWindowAttrib(mainWindow, GLFW.GLFW_ICONIFIED) == 0) call(beginFrame, width[0], height[0]);
+            // Acquire/fence waits are over: deliver fresh mouse/key events before simulation and camera sampling.
+            GLFW.glfwPollEvents();
+        }
+        return GLX._shouldClose(window);
+    }
     public static void swapBuffers(long window) {
         if (!active() || window != mainWindow) { GLFW.glfwSwapBuffers(window); return; }
         Minecraft mc = Minecraft.getInstance();
@@ -100,6 +120,8 @@ public final class NativeMainWindow {
     }
 
     public static long presentedFrames() { return active() ? ((Number) call(frames)).longValue() : 0; }
+    public static long acquiresBeforeInput() { return active() ? ((Number) call(earlyAcquires)).longValue() : 0; }
+    public static long acquiresAfterRender() { return active() ? ((Number) call(lateAcquires)).longValue() : 0; }
     public static int swapchainGenerations() { return active() ? ((Number) call(generations)).intValue() : 0; }
     public static void captureNext(Path path) {
         if (!active()) throw new IllegalStateException("Vulkan main-window backend is inactive");
@@ -121,7 +143,7 @@ public final class NativeMainWindow {
         try { if (backend != null) { if (close != null) close.invoke(backend); else ((AutoCloseable) backend).close(); } }
         catch (Throwable error) { LOGGER.error("Could not close Vulkan main-window resources", cause(error)); }
         finally {
-            backend = null; present = setVsync = frames = generations = capture = close = null;
+            backend = null; present = beginFrame = setVsync = frames = generations = capture = close = earlyAcquires = lateAcquires = null;
             try { if (loader != null) loader.close(); } catch (Exception error) { LOGGER.warn("Could not close backend loader", error); }
             loader = null;
         }

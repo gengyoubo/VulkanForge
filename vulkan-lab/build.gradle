@@ -57,4 +57,5 @@ tasks.register('smokePresent', JavaExec) {
     dependsOn 'testClasses'
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'github.com.gengyoubo.vulkanforge.lab.NativePresentSmoke'
+    if (rootProject.hasProperty('validationSmoke')) systemProperty 'vulkanforge.requireValidation', 'true'
 }
