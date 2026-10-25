@@ -48,6 +48,7 @@ final class SharedWorldSmoke {
             long[] optimized = backend.optimizationStats();
             require(optimized[0] == 12 && optimized[2] == 45, "GPU driven batches/arena uploads not exercised: " + java.util.Arrays.toString(optimized));
             System.out.println("GPU_DRIVEN_SMOKE=OK sections=45 indirectBatches=" + optimized[0] + " arenaUploads=" + optimized[2]);
+            arenaGrowth(backend, send);
         }
         send.accept(camera(1, 3));
         requireAlpha(backend.renderWorld(270, 150), 270, 150, 0);
@@ -69,6 +70,26 @@ final class SharedWorldSmoke {
         backend.closeWorld();
         require(glGetError() == GL_NO_ERROR, "GL error in shared world path");
         System.out.println("SHARED_WORLD_SMOKE=OK sections=45 draws=" + stats[7] + " (shared color/depth, compute culling, both slots, fresh pixels, resize, camera, removal, reset and reopen)");
+    }
+
+    private static void arenaGrowth(MainWindowBackend backend, Consumer<WorldProtocol.Command> send) {
+        // Force two arena resizes while both rendering slots and prior uploads can still refer to the old buffers.
+        var mesh = ByteBuffer.allocate(60_000 * WorldProtocol.STRIDE).order(ByteOrder.LITTLE_ENDIAN);
+        for (int i = 0; i < 60_000; i++) mesh.putFloat(4 + (i % 3) * .1f).putFloat(0).putFloat(0).putInt(-1)
+                .putFloat(.5f).putFloat(.5f).putShort((short)240).putShort((short)240);
+        for (int i = 0; i < 3; i++) {
+            send.accept(new WorldProtocol.Mesh(1, 100 + i, 0, 0, 0, mesh.array()));
+            backend.renderWorld(270, 150); backend.finishWorldFrame();
+        }
+        send.accept(new WorldProtocol.Mesh(1, 100, 0, 0, 0, mesh.array()));
+        for (int i = 0; i < 3; i++) send.accept(new WorldProtocol.Remove(1, 100 + i));
+        var pixels = read(backend.renderWorld(270, 150), 270, 150);
+        try {
+            int at = (75 * 270 + 135) * 4;
+            require(Byte.toUnsignedInt(pixels.get(at)) == 207 && Byte.toUnsignedInt(pixels.get(at + 1)) == 48, "Arena growth/reuse corrupted existing sections");
+            require(backend.optimizationStats()[3] >= 3, "Arena growth was not exercised");
+        } finally { MemoryUtil.memFree(pixels); backend.finishWorldFrame(); }
+        System.out.println("MESH_ARENA_SMOKE=OK (async growth, replacement, removal, preserved existing geometry)");
     }
     /**
      * Opaque grey at z=.2 (depth .6), translucent blue at z=0 (depth .5) and red at z=-.2 (depth .4), all alpha 128.

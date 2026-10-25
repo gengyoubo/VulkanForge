@@ -50,6 +50,7 @@ public final class MainWindowBackend implements AutoCloseable {
         try {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 context.initializeInterop(uuid, Boolean.getBoolean("vulkanforge.requireValidation"));
+                log("DEVICE_CAPABILITIES=" + context.capabilities);
                 timers = new GpuTimers(context, FRAMES_IN_FLIGHT, this::log, "COPY", "PRESENT_PREPARE");
                 log("VALIDATION=" + (context.validationEnabled() ? "ENABLED" : "UNAVAILABLE"));
                 log("SYNC_VALIDATION_REQUESTED=" + "1".equals(System.getenv("VK_VALIDATION_VALIDATE_SYNC")));
@@ -95,7 +96,7 @@ public final class MainWindowBackend implements AutoCloseable {
     public int generations() { return generations; }
     public long earlyAcquires() { return earlyAcquires; }
     public long lateAcquires() { return lateAcquires; }
-    public boolean gpuDrivenEnabled() { return context.capabilities.gpuDriven() && !Boolean.getBoolean("vulkanforge.disableGpuDriven"); }
+    public boolean gpuDrivenEnabled() { return world != null && world.gpuDrivenEnabled(); }
     public long[] optimizationStats() { return world == null ? new long[4] : world.optimizationStats(); }
     public long[] uploadStats() { return context.uploads.stats(); }
     public int validationErrors() { return context.validationErrors(); }

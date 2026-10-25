@@ -123,7 +123,7 @@ final class VulkanContext implements AutoCloseable {
             queue = new VkQueue(pointer.get(0), device);
             System.out.println("DEVICE_CAPABILITIES=" + capabilities);
             System.out.println("GPU_DRIVEN_ENABLED=" + driven);
-            uploads = new AsyncUploads(this, capabilities.timeline());
+            uploads = new AsyncUploads(this, capabilities.timeline() && !Boolean.getBoolean("vulkanforge.disableUploadTimeline"));
             System.out.println("DEVICE_CREATED=true");
         }
     }

@@ -14,6 +14,7 @@ import static org.lwjgl.opengl.GL30.*;
 /** Real GPU test: distinct native GL/Vulkan windows and exported images/semaphores. */
 public final class NativePresentSmoke {
     public static void main(String[] args) throws Exception {
+        FrameGraphSmoke.run();
         if (GpuTimers.elapsedTicks(250, 5, 8) != 11 || GpuTimers.elapsedTicks(-4, 3, 64) != 7
                 || GpuTimers.elapsedTicks(0xfffffff0L, 0x10, 32) != 32) throw new AssertionError("Timestamp wrap conversion failed");
         org.lwjgl.system.Configuration.STACK_SIZE.set(1024);

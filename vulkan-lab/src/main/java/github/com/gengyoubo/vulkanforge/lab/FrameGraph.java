@@ -16,6 +16,7 @@ final class FrameGraph {
     private record Step(Pass pass, List<Transition> transitions) { }
     record Transition(Image image, State from, State to) { }
     private final List<Pass> passes = new ArrayList<>();
+    private List<Step> compiled;
     private static final long WRITES = VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT
             | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
     static State state(int layout, long stage, long access) { return new State(layout, stage, access, VK_QUEUE_FAMILY_IGNORED); }
@@ -26,10 +27,12 @@ final class FrameGraph {
         Set<Image> seen = new HashSet<>();
         for (Use use : uses) if (!seen.add(use.image)) throw new IllegalArgumentException("Declare a combined usage for " + use.image.name);
         passes.add(new Pass(name, List.of(uses), List.copyOf(after), commands));
+        compiled = null;
     }
 
     /** Dependencies combine explicit pass edges with read/write hazards in declaration order. */
     private List<Step> compile() {
+        if (compiled != null) return compiled;
         Map<String, Pass> names = new LinkedHashMap<>(); passes.forEach(p -> names.put(p.name, p));
         Map<Pass, Set<Pass>> dependencies = new LinkedHashMap<>();
         Map<Image, State> previousStates = new HashMap<>();
@@ -66,7 +69,7 @@ final class FrameGraph {
             }
             result.add(new Step(pass, transitions));
         }
-        return result;
+        return compiled = List.copyOf(result);
     }
     List<String> schedule() { return compile().stream().map(s -> s.pass.name).toList(); }
     int barriers() { return compile().stream().mapToInt(s -> s.transitions.size()).sum(); }

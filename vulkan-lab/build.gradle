@@ -58,4 +58,8 @@ tasks.register('smokePresent', JavaExec) {
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'github.com.gengyoubo.vulkanforge.lab.NativePresentSmoke'
     if (rootProject.hasProperty('validationSmoke')) systemProperty 'vulkanforge.requireValidation', 'true'
+    if (rootProject.hasProperty('legacyGpuSmoke')) {
+        systemProperty 'vulkanforge.disableGpuDriven', 'true'
+        systemProperty 'vulkanforge.disableUploadTimeline', 'true'
+    }
 }

@@ -34,7 +34,7 @@ public final class WorldClientSmoke {
     private static Path report;
 
     @SubscribeEvent public static void glyphs(net.minecraftforge.client.event.ScreenEvent.Render.Post event) {
-        if (Boolean.getBoolean("vulkanforge.worldSmoke") && stage == 40 && ticks > 10) {
+        if (Boolean.getBoolean("vulkanforge.worldSmoke") && (stage == 40 || stage == 41) && ticks > 10) {
             event.getGuiGraphics().drawString(Minecraft.getInstance().font, "P11 ¶¯Ì¬×ÖÐÎ ¦¸ §¨ ¤¢ h", 8, 8, -1);
         }
     }
@@ -146,6 +146,11 @@ public final class WorldClientSmoke {
                     require(shaders.getOrDefault("position_tex_color_normal", 0L) > 0, "Clouds not captured: " + shaders);
                     log("PASS P10 sky and clouds: sky draws=" + skyWindow[0] + " in " + skyWindow[1] + " terrain submits (Vulkan sky draws=" + stats[24]
                             + "), clouds=" + shaders.get("position_tex_color_normal"));
+                    long[] optimized = NativeMainWindow.optimizationStats(), uploads = NativeMainWindow.uploadStats();
+                    require(optimized[0] > 0 && optimized[2] > 0, "GPU indirect count / device-local arena was not exercised");
+                    require(uploads[0] > 0 && uploads[4] == 1, "Timeline upload queue was not exercised");
+                    log("PASS GPU driven: indirect batches=" + optimized[0] + ", arena uploads=" + optimized[2] + ", grows=" + optimized[3]);
+                    log("PASS async uploads: submitted=" + uploads[0] + ", bytes=" + uploads[2] + ", backpressure waits=" + uploads[3]);
                     long[] hand = EntityDraws.stats(EntityDraws.Window.HAND), hud = GuiDraws.stats();
                     require(hand[0] > 0 && hand[1] > 0, "Held item / arm was not replayed by Vulkan: " + java.util.Arrays.toString(hand));
                     require(hud[0] > 0 && hud[1] > 0 && NativeMainWindow.guiPasses() > 0, "HUD was not replayed by Vulkan: " + java.util.Arrays.toString(hud) + " reasons=" + GuiDraws.fallbackReasons());

@@ -397,6 +397,7 @@ final class SharedWorldRenderer implements AutoCloseable {
                 overlayPasses, entity[0], entity[1], entity[2], entity[3], entity[4], skyDraws};
     }
     long[] optimizationStats() { long[] a = world.arenaStats(); return new long[]{world.indirectBatches(), a[0], a[1], a[2]}; }
+    boolean gpuDrivenEnabled() { return culler != null && culler.compact(); }
     private void destroyTargets() {
         for (Slot slot : slots) {
             if (slot.color != null) { slot.color.close(); slot.color = null; }

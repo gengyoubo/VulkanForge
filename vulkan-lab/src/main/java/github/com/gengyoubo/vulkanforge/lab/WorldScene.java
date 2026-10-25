@@ -168,6 +168,7 @@ final class WorldScene implements AutoCloseable {
     float blue() { return camera.blue(); }
 
     private void uploadAtlas(WorldProtocol.Atlas pixels) {
+        context.uploads.drain(); // Full atlas replacement is a reload boundary; ordinary rectangular patches stay asynchronous.
         if (atlas != null) { atlas.close(); atlas = null; }
         GpuImage next = new GpuImage(context, pixels.width(), pixels.height(), VK_FORMAT_R8G8B8A8_UNORM,
                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
