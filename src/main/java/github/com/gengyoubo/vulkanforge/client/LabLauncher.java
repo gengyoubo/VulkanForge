@@ -1,6 +1,6 @@
-package dev.vulkanforge.client;
+package github.com.gengyoubo.vulkanforge.client;
 
-import dev.vulkanforge.VulkanForge;
+import github.com.gengyoubo.vulkanforge.VulkanForge;
 import net.minecraftforge.fml.loading.FMLPaths;
 
 import java.io.IOException;

@@ -1,4 +1,4 @@
-package dev.vulkanforge;
+package github.com.gengyoubo.vulkanforge;
 
 import com.mojang.logging.LogUtils;
 import net.minecraftforge.fml.common.Mod;
@@ -10,6 +10,6 @@ public final class VulkanForge {
     public static final Logger LOGGER = LogUtils.getLogger();
 
     public VulkanForge() {
-        LOGGER.info("VulkanForge stage 1 loaded: Vulkan lab and capability detection");
+        LOGGER.info("VulkanForge loaded: in-window offscreen preview, Vulkan lab and capability detection");
     }
 }

@@ -38,3 +38,10 @@ tasks.register('runTriangle', JavaExec) {
     mainClass = application.mainClass
     args '--triangle'
 }
+// Explicit GPU integration check; ordinary build remains usable on machines without Vulkan.
+tasks.register('smokeBridge', JavaExec) {
+    dependsOn 'fatJar', 'testClasses'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.vulkanforge.lab.BridgeSmokeTest'
+    args tasks.named('fatJar', Jar).get().archiveFile.get().asFile.absolutePath
+}

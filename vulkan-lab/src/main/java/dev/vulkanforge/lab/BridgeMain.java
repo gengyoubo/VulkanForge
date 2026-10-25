@@ -1,10 +1,12 @@
 package dev.vulkanforge.lab;
 
 import dev.vulkanforge.bridge.FrameProtocol;
+import dev.vulkanforge.bridge.WorldProtocol;
 import org.lwjgl.vulkan.VK;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.locks.LockSupport;
 
 /** Binary frames on stdout; diagnostics on stderr. Closing stdin requests a graceful shutdown. */
@@ -15,9 +17,13 @@ final class BridgeMain {
         System.setOut(new PrintStream(System.err, true, StandardCharsets.UTF_8));
         VulkanContext context = new VulkanContext();
         AtomicBoolean stop = new AtomicBoolean();
+        ArrayBlockingQueue<WorldProtocol.Command> commands = new ArrayBlockingQueue<>(64);
         Thread control = new Thread(() -> {
-            try { System.in.read(); } catch (IOException ignored) { }
-            stop.set(true);
+            try (DataInputStream input = new DataInputStream(new BufferedInputStream(System.in, 65536))) {
+                while (true) commands.put(WorldProtocol.read(input));
+            } catch (EOFException ignored) { }
+            catch (Exception error) { System.err.println("World input failed: " + error); }
+            finally { stop.set(true); }
         }, "VulkanForge-bridge-control");
         control.setDaemon(true);
         try {
@@ -38,9 +44,11 @@ final class BridgeMain {
             context.initialize(0, loader, requireValidation);
             control.start();
             long frames = 0;
-            try (OffscreenRenderer renderer = new OffscreenRenderer(context, FrameProtocol.WIDTH, FrameProtocol.HEIGHT);
+            try (WorldScene world = new WorldScene(context);
+                 OffscreenRenderer renderer = new OffscreenRenderer(context, FrameProtocol.WIDTH, FrameProtocol.HEIGHT);
                  DataOutputStream output = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(FileDescriptor.out), 65536))) {
                 renderer.initialize();
+                world.initialize();
                 output.writeInt(FrameProtocol.MAGIC);
                 output.writeInt(FrameProtocol.WIDTH);
                 output.writeInt(FrameProtocol.HEIGHT);
@@ -48,8 +56,14 @@ final class BridgeMain {
                 byte[] rgba = new byte[FrameProtocol.BYTES];
                 long start = System.nanoTime(), next = start;
                 while (!stop.get() && (maxFrames == 0 || frames < maxFrames)) {
-                    renderer.render((System.nanoTime() - start) / 1_000_000_000.0f * 0.7f, rgba);
+                    for (int i = 0; i < 8; i++) {
+                        WorldProtocol.Command update = commands.poll();
+                        if (update == null) break;
+                        world.apply(update);
+                    }
+                    renderer.render((System.nanoTime() - start) / 1_000_000_000.0f * 0.7f, rgba, world);
                     output.writeLong(++frames);
+                    output.writeLong(world.renderedEpoch());
                     output.writeInt(rgba.length);
                     output.write(rgba);
                     output.flush();

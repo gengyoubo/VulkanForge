@@ -20,6 +20,7 @@ final class OffscreenRenderer implements AutoCloseable {
     private VkCommandBuffer command;
     private ByteBuffer mapped;
     private boolean coherent;
+    private GpuImage depth;
 
     OffscreenRenderer(VulkanContext context, int width, int height) {
         this.context = context;
@@ -77,6 +78,7 @@ final class OffscreenRenderer implements AutoCloseable {
             check(vkCreatePipelineLayout(context.device, layoutInfo, null, handle), "vkCreatePipelineLayout(offscreen)");
             layout = handle.get(0);
             pipeline = GraphicsPipeline.create(context, layout, FORMAT, "/shaders/offscreen.vert", stack);
+            depth = new GpuImage(context, width, height, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
             System.out.printf("OFFSCREEN_TARGET=%dx%d RGBA8 coherent=%s%n", width, height, coherent);
         }
     }
@@ -101,6 +103,11 @@ final class OffscreenRenderer implements AutoCloseable {
     }
 
     void render(float angle, byte[] output) {
+        render(angle, output, null);
+    }
+
+    void render(float angle, byte[] output, WorldScene world) {
+        boolean terrain = world != null && world.ready();
         if (output.length != bytes) throw new IllegalArgumentException("Wrong RGBA buffer size");
         try (MemoryStack stack = MemoryStack.stackPush()) {
             check(vkResetCommandBuffer(command, 0), "vkResetCommandBuffer(offscreen)");
@@ -114,18 +121,37 @@ final class OffscreenRenderer implements AutoCloseable {
                     .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
             VkDependencyInfo dependency = VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barrier);
             vkCmdPipelineBarrier2(command, dependency);
+            if (terrain) {
+                var depthBarrier = VkImageMemoryBarrier2.calloc(1, stack).sType$Default().srcStageMask(VK_PIPELINE_STAGE_2_NONE)
+                        .dstStageMask(VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT)
+                        .dstAccessMask(VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)
+                        .oldLayout(VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                        .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).image(depth.image)
+                        .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).levelCount(1).layerCount(1));
+                vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(depthBarrier));
+            }
             VkRenderingAttachmentInfo.Buffer color = VkRenderingAttachmentInfo.calloc(1, stack).sType$Default()
                     .imageView(view).imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
                     .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
             color.clearValue().color().float32(0, 0.025f).float32(1, 0.04f).float32(2, 0.075f).float32(3, 1);
+            if (terrain) color.clearValue().color().float32(0, world.red()).float32(1, world.green()).float32(2, world.blue());
             VkRenderingInfo rendering = VkRenderingInfo.calloc(stack).sType$Default().layerCount(1).pColorAttachments(color)
                     .renderArea(r -> r.offset(o -> o.set(0, 0)).extent(e -> e.set(width, height)));
+            if (terrain) {
+                var depthAttachment = VkRenderingAttachmentInfo.calloc(stack).sType$Default().imageView(depth.view)
+                        .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL).loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR).storeOp(VK_ATTACHMENT_STORE_OP_DONT_CARE);
+                depthAttachment.clearValue().depthStencil().depth(1.0f).stencil(0);
+                rendering.pDepthAttachment(depthAttachment);
+            }
             vkCmdBeginRendering(command, rendering);
-            vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
             vkCmdSetViewport(command, 0, VkViewport.calloc(1, stack).width(width).height(height).minDepth(0).maxDepth(1));
             vkCmdSetScissor(command, 0, VkRect2D.calloc(1, stack).offset(o -> o.set(0, 0)).extent(e -> e.set(width, height)));
-            vkCmdPushConstants(command, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, stack.floats(angle, (float) width / height));
-            vkCmdDraw(command, 3, 1, 0, 0);
+            if (terrain) world.draw(command, stack);
+            else {
+                vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+                vkCmdPushConstants(command, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, stack.floats(angle, (float) width / height));
+                vkCmdDraw(command, 3, 1, 0, 0);
+            }
             vkCmdEndRendering(command);
             barrier.srcStageMask(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT).srcAccessMask(VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT)
                     .dstStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).dstAccessMask(VK_ACCESS_2_TRANSFER_READ_BIT)
@@ -155,6 +181,7 @@ final class OffscreenRenderer implements AutoCloseable {
     @Override public void close() {
         if (context.device == null) return;
         vkDeviceWaitIdle(context.device);
+        if (depth != null) { depth.close(); depth = null; }
         if (mapped != null) { vkUnmapMemory(context.device, stagingMemory); mapped = null; }
         if (pipeline != NULL) { vkDestroyPipeline(context.device, pipeline, null); pipeline = NULL; }
         if (layout != NULL) { vkDestroyPipelineLayout(context.device, layout, null); layout = NULL; }

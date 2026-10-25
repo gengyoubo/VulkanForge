@@ -110,7 +110,7 @@ final class VulkanContext implements AutoCloseable {
             boolean swapchain = !offscreen && hasDeviceExtension(candidate, stack, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
             int family = findQueueFamily(candidate, stack);
             boolean dynamicRendering = false, synchronization2 = false;
-            if (api) {
+            if (props.apiVersion() >= org.lwjgl.vulkan.VK13.VK_API_VERSION_1_3) {
                 VkPhysicalDeviceVulkan13Features features13 = VkPhysicalDeviceVulkan13Features.calloc(stack).sType$Default();
                 VkPhysicalDeviceFeatures2 features = VkPhysicalDeviceFeatures2.calloc(stack).sType$Default().pNext(features13.address());
                 vkGetPhysicalDeviceFeatures2(candidate, features);
@@ -127,7 +127,7 @@ final class VulkanContext implements AutoCloseable {
             boolean suitable = api && family >= 0 && dynamicRendering && synchronization2 && (offscreen || (swapchain && presentation));
             System.out.printf("GPU[%d]=%s | API=%s | driverRaw=%s | vendor=0x%04x | device=0x%04x%n",
                     i, props.deviceNameString(), version(props.apiVersion()), Integer.toUnsignedString(props.driverVersion()), props.vendorID(), props.deviceID());
-            System.out.printf("  api14=%s swapchain=%s graphicsPresentQueue=%d dynamicRendering=%s synchronization2=%s presentation=%s eligible=%s%n",
+            System.out.printf("  api14=%s swapchain=%s graphicsQueue=%d dynamicRendering=%s synchronization2=%s presentation=%s eligible=%s%n",
                     api, swapchain, family, dynamicRendering, synchronization2, presentation, suitable);
             int score = props.deviceType() == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 100 : 10;
             if (suitable && score > best) {

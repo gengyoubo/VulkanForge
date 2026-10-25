@@ -1,7 +1,7 @@
-package dev.vulkanforge.client;
+package github.com.gengyoubo.vulkanforge.client;
 
 import com.mojang.blaze3d.platform.InputConstants;
-import dev.vulkanforge.VulkanForge;
+import github.com.gengyoubo.vulkanforge.VulkanForge;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.components.Button;
@@ -10,6 +10,8 @@ import net.minecraft.network.chat.Component;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.event.RegisterKeyMappingsEvent;
 import net.minecraftforge.client.event.ScreenEvent;
+import net.minecraftforge.client.event.RenderGuiEvent;
+import net.minecraftforge.event.GameShuttingDownEvent;
 import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
@@ -18,12 +20,15 @@ import org.lwjgl.glfw.GLFW;
 
 @Mod.EventBusSubscriber(modid = VulkanForge.MOD_ID, value = Dist.CLIENT)
 public final class ClientEvents {
-    private static final KeyMapping TRIANGLE = new KeyMapping("key.vulkanforge.triangle",
+    private static final KeyMapping PREVIEW = new KeyMapping("key.vulkanforge.preview",
             InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_F8, "key.categories.vulkanforge");
+    private static final KeyMapping TRIANGLE = new KeyMapping("key.vulkanforge.triangle",
+            InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_F9, "key.categories.vulkanforge");
 
     @SubscribeEvent
     public static void tick(TickEvent.ClientTickEvent event) {
         if (event.phase == TickEvent.Phase.END) {
+            while (PREVIEW.consumeClick()) VulkanPreview.toggle();
             while (TRIANGLE.consumeClick()) launchTriangle();
         }
     }
@@ -31,10 +36,32 @@ public final class ClientEvents {
     @SubscribeEvent
     public static void screenInit(ScreenEvent.Init.Post event) {
         if (event.getScreen() instanceof TitleScreen screen) {
-            event.addListener(Button.builder(Component.translatable("vulkanforge.triangle"), b -> launchTriangle())
+            event.addListener(Button.builder(Component.translatable("vulkanforge.preview"), b -> VulkanPreview.toggle())
                     .bounds(6, screen.height - 30, 150, 20).build());
         }
     }
+
+    @SubscribeEvent
+    public static void renderScreen(ScreenEvent.Render.Post event) { VulkanPreview.render(event.getGuiGraphics()); }
+
+    @SubscribeEvent
+    public static void screenKey(ScreenEvent.KeyPressed.Pre event) {
+        if (PREVIEW.matches(event.getKeyCode(), event.getScanCode())) {
+            VulkanPreview.toggle();
+            event.setCanceled(true);
+        } else if (TRIANGLE.matches(event.getKeyCode(), event.getScanCode())) {
+            launchTriangle();
+            event.setCanceled(true);
+        }
+    }
+
+    @SubscribeEvent
+    public static void renderHud(RenderGuiEvent.Post event) {
+        if (Minecraft.getInstance().screen == null) VulkanPreview.render(event.getGuiGraphics());
+    }
+
+    @SubscribeEvent
+    public static void shutdown(GameShuttingDownEvent event) { VulkanPreview.close(); }
 
     private static void launchTriangle() {
         boolean started = LabLauncher.triangle();
@@ -47,7 +74,7 @@ public final class ClientEvents {
     @Mod.EventBusSubscriber(modid = VulkanForge.MOD_ID, value = Dist.CLIENT, bus = Mod.EventBusSubscriber.Bus.MOD)
     public static final class Lifecycle {
         @SubscribeEvent
-        public static void keys(RegisterKeyMappingsEvent event) { event.register(TRIANGLE); }
+        public static void keys(RegisterKeyMappingsEvent event) { event.register(PREVIEW); event.register(TRIANGLE); }
 
         @SubscribeEvent
         public static void setup(FMLClientSetupEvent event) { event.enqueueWork(LabLauncher::probe); }

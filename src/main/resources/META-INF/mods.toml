@@ -8,7 +8,7 @@ version="${version}"
 displayName="VulkanForge"
 authors="gengy"
 displayTest="IGNORE_ALL_VERSION"
-description='''Experimental Vulkan 1.4 laboratory for Minecraft Forge 1.20.1. Runs capability detection and a separate triangle window; game rendering is still vanilla.'''
+description='''Experimental Vulkan 1.4 renderer for Forge 1.20.1. Includes GPU detection, a rotating Vulkan offscreen preview inside the game window (F8) and a standalone swapchain test (F9). Preview uses CPU readback and OpenGL upload; world rendering is still vanilla.'''
 
 [[dependencies.vulkanforge]]
 modId="forge"
