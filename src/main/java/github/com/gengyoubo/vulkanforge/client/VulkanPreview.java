@@ -13,6 +13,10 @@ final class VulkanPreview {
     private static boolean enabled;
     private static OffscreenBridge bridge;
     private static FrameTexture texture;
+    private static SharedFrameTexture sharedTexture;
+    private static WorldSink sink;
+    private static boolean direct;
+    private static int frameWidth = FrameProtocol.WIDTH, frameHeight = FrameProtocol.HEIGHT;
     private static long uploaded;
     private static long lastLogged;
     private static long uploadedEpoch;
@@ -28,17 +32,24 @@ final class VulkanPreview {
         else {
             enabled = true;
             uploaded = lastLogged = 0;
-            bridge = new OffscreenBridge();
+            direct = NativeMainWindow.active();
+            if (direct) sink = NativeMainWindow::sendWorld;
+            else { bridge = new OffscreenBridge(); sink = bridge; }
+            VulkanForge.LOGGER.info("Vulkan terrain transport: {}", direct ? "same-process shared GPU image" : "legacy subprocess RGBA fallback");
             WORLD.invalidate();
         }
     }
 
     static void terrain(net.minecraftforge.client.event.RenderLevelStageEvent event) {
-        if (!enabled || bridge == null) return;
+        if (!enabled || sink == null) return;
+        if (direct && !NativeMainWindow.worldVisible()) { uploadedEpoch = 0; return; }
         try {
-            WORLD.update(event, bridge);
-            upload();
-            if (!inset && bridge.status() == OffscreenBridge.Status.RUNNING && uploadedEpoch != 0 && uploadedEpoch == WORLD.epoch() && texture != null) PRESENTER.draw(texture);
+            WORLD.update(event, sink);
+            if (direct) renderShared(); else upload();
+            if (!inset && uploadedEpoch != 0 && uploadedEpoch == WORLD.epoch()) {
+                if (direct && sharedTexture != null) PRESENTER.draw(sharedTexture.getId());
+                else if (texture != null && bridge.status() == OffscreenBridge.Status.RUNNING) PRESENTER.draw(texture);
+            }
         }
         catch (Exception error) {
             VulkanForge.LOGGER.error("Could not capture solid terrain for Vulkan", error);
@@ -53,18 +64,41 @@ final class VulkanPreview {
     static long atlasPatches() { return WORLD.atlasPatches(); }
     static long lightUpdates() { return WORLD.lightUpdates(); }
     static int capturedCutoutBlocks() { return WORLD.cutoutBlocks(); }
+    static boolean directWorld() { return enabled && direct; }
+    static long[] directWorldStats() { return directWorld() ? NativeMainWindow.worldStats() : new long[9]; }
     static int saveWorldFrame(java.nio.file.Path path) throws java.io.IOException {
         RenderSystem.assertOnRenderThread();
-        if (texture == null || worldEpoch() == 0) throw new IllegalStateException("No Vulkan world frame available");
+        // A diagnostic read acquires a fresh GL lease; normal terrain rendering never downloads pixels.
+        if (direct) renderShared();
+        if ((direct ? sharedTexture == null : texture == null) || worldEpoch() == 0) throw new IllegalStateException("No Vulkan world frame available");
         int previous = org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL11.GL_TEXTURE_BINDING_2D);
-        try (var image = new com.mojang.blaze3d.platform.NativeImage(FrameProtocol.WIDTH, FrameProtocol.HEIGHT, false)) {
-            texture.bind(); image.downloadTexture(0, false); image.writeToFile(path);
+        try (var image = new com.mojang.blaze3d.platform.NativeImage(frameWidth, frameHeight, false)) {
+            if (direct) sharedTexture.bind(); else texture.bind();
+            image.downloadTexture(0, false); image.writeToFile(path);
             return java.util.Arrays.hashCode(image.getPixelsRGBA());
         } finally { com.mojang.blaze3d.platform.GlStateManager._bindTexture(previous); }
     }
 
+    private static void renderShared() {
+        if (!NativeMainWindow.worldVisible()) { uploadedEpoch = 0; return; }
+        var target = Minecraft.getInstance().getMainRenderTarget();
+        int id = NativeMainWindow.renderWorld(target.viewWidth, target.viewHeight);
+        long[] stats = NativeMainWindow.worldStats();
+        if (id == 0) { uploadedEpoch = 0; return; }
+        uploadedEpoch = stats[0];
+        if (sharedTexture == null) {
+            sharedTexture = new SharedFrameTexture();
+            Minecraft.getInstance().getTextureManager().register(TEXTURE, sharedTexture);
+        }
+        sharedTexture.use(id); uploaded = stats[1]; frameWidth = (int)stats[4]; frameHeight = (int)stats[5];
+        if (lastLogged == 0 || uploaded - lastLogged >= 300) {
+            VulkanForge.LOGGER.info("Vulkan shared world: frame={}, epoch={}, sections={}, target={}x{}", uploaded, uploadedEpoch, stats[2], frameWidth, frameHeight);
+            lastLogged = uploaded;
+        }
+    }
+
     private static void upload() {
-        if (Minecraft.getInstance().level == null) WORLD.leave(bridge);
+        if (Minecraft.getInstance().level == null) WORLD.leave(sink);
         OffscreenBridge.Frame frame = bridge.take();
         if (frame == null) return;
         try {
@@ -74,6 +108,7 @@ final class VulkanPreview {
                 Minecraft.getInstance().getTextureManager().register(TEXTURE, texture);
             }
             texture.upload(frame.rgba());
+            frameWidth = FrameProtocol.WIDTH; frameHeight = FrameProtocol.HEIGHT;
             uploaded = frame.sequence();
             uploadedEpoch = frame.epoch();
             if (lastLogged == 0 || uploaded - lastLogged >= 300) {
@@ -84,12 +119,16 @@ final class VulkanPreview {
     }
 
     static void render(GuiGraphics graphics) {
-        if (!enabled || bridge == null) return;
+        if (!enabled || sink == null) return;
         RenderSystem.assertOnRenderThread();
         Minecraft minecraft = Minecraft.getInstance();
-        OffscreenBridge.Status status = bridge.status();
-        try { upload(); }
+        try {
+            if (direct) {
+                if (minecraft.level == null) { WORLD.leave(sink); renderShared(); }
+            } else upload();
+        }
         catch (RuntimeException error) { VulkanForge.LOGGER.error("Vulkan texture upload failed", error); close(); return; }
+        OffscreenBridge.Status status = direct ? (uploaded > 0 ? OffscreenBridge.Status.RUNNING : OffscreenBridge.Status.STARTING) : bridge.status();
         if (status == OffscreenBridge.Status.RUNNING && minecraft.level != null && !inset && uploadedEpoch != 0 && uploadedEpoch == WORLD.epoch()) {
             graphics.fill(4, 4, 222, 27, 0xc0111828);
             graphics.drawString(minecraft.font, Component.translatable("vulkanforge.world.status", WORLD.sections(), uploaded), 7, 7, 0xffaaddff);
@@ -97,11 +136,11 @@ final class VulkanPreview {
             return;
         }
         int width = Math.min(Math.max(1, graphics.guiWidth() - 16), Math.min(220, Math.max(120, graphics.guiWidth() / 3)));
-        int height = Math.max(1, width * FrameProtocol.HEIGHT / FrameProtocol.WIDTH);
+        int height = Math.max(1, width * frameHeight / frameWidth);
         int x = graphics.guiWidth() - width - 8, y = 8;
         graphics.fill(x - 2, y - 2, x + width + 2, y + height + 26, 0xe6111828);
-        if (uploaded > 0 && texture != null && uploadedEpoch == WORLD.epoch()) {
-            graphics.blit(TEXTURE, x, y, width, height, 0, 0, FrameProtocol.WIDTH, FrameProtocol.HEIGHT, FrameProtocol.WIDTH, FrameProtocol.HEIGHT);
+        if (uploaded > 0 && (direct ? sharedTexture != null : texture != null) && uploadedEpoch == WORLD.epoch()) {
+            graphics.blit(TEXTURE, x, y, width, height, 0, 0, frameWidth, frameHeight, frameWidth, frameHeight);
         }
         Component label = switch (status) {
             case STARTING -> Component.translatable("vulkanforge.preview.starting");
@@ -110,7 +149,7 @@ final class VulkanPreview {
             case STOPPED -> Component.translatable("vulkanforge.preview.stopped");
         };
         graphics.drawString(minecraft.font, label, x + 3, y + height + 3, status == OffscreenBridge.Status.FAILED ? 0xffff8888 : 0xffaaddff);
-        graphics.drawString(minecraft.font, Component.translatable("vulkanforge.preview.transport"), x + 3, y + height + 14, 0xffa0aabb);
+        graphics.drawString(minecraft.font, Component.translatable(direct ? "vulkanforge.world.controls" : "vulkanforge.preview.transport"), x + 3, y + height + 14, 0xffa0aabb);
     }
 
     static void close() {
@@ -118,9 +157,12 @@ final class VulkanPreview {
         enabled = false;
         if (bridge != null) { bridge.close(); bridge = null; }
         if (texture != null) { Minecraft.getInstance().getTextureManager().release(TEXTURE); texture.close(); texture = null; }
+        if (sharedTexture != null) { Minecraft.getInstance().getTextureManager().release(TEXTURE); sharedTexture.close(); sharedTexture = null; }
+        if (direct) NativeMainWindow.closeWorld();
         PRESENTER.close();
         uploaded = 0;
         uploadedEpoch = 0;
         WORLD.close();
+        sink = null; direct = false;
     }
 }

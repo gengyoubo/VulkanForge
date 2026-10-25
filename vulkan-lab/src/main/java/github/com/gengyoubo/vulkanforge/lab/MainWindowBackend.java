@@ -34,6 +34,8 @@ public final class MainWindowBackend implements AutoCloseable {
     private String capture;
     private PrintWriter report;
     private GpuTimers timers;
+    private SharedWorldRenderer world;
+    private Function<long[], Consumer<int[]>> terrainImporter;
     private final Function<long[], Consumer<int[]>> importer;
     private final Runnable finishGL;
 
@@ -95,8 +97,28 @@ public final class MainWindowBackend implements AutoCloseable {
     public void captureNext(String path) { capture = path; }
     public void setVsync(boolean enabled) { if (vsync != enabled) { vsync = enabled; dirty = true; } }
 
+    public Consumer<Object[]> worldCommands(Function<long[], Consumer<int[]>> terrainImporter) {
+        this.terrainImporter = terrainImporter;
+        return packet -> world().apply(dev.vulkanforge.bridge.WorldProtocol.unpack(packet));
+    }
+    private SharedWorldRenderer world() {
+        if (world == null) {
+            if (terrainImporter == null) throw new IllegalStateException("Missing host GL terrain importer");
+            world = new SharedWorldRenderer(context, terrainImporter, finishGL, this::log);
+        }
+        return world;
+    }
+    public int renderWorld(int width, int height) { return world().render(width, height); }
+    public long[] worldStats() { return world == null ? new long[9] : world.stats(); }
+    public void finishWorldFrame() { if (world != null) world.endRead(); }
+    public void closeWorld() { if (world != null) { world.close(); world = null; } }
+
     /** Wait for a slot/image before Minecraft polls input and advances its timer. */
-    public boolean beginFrame(int framebufferWidth, int framebufferHeight) { return acquire(framebufferWidth, framebufferHeight, true); }
+    public boolean beginFrame(int framebufferWidth, int framebufferHeight) {
+        boolean acquired = acquire(framebufferWidth, framebufferHeight, true);
+        if (acquired && world != null) world.prepareFrame();
+        return acquired;
+    }
     private boolean acquire(int framebufferWidth, int framebufferHeight, boolean early) {
         if (framebufferWidth <= 0 || framebufferHeight <= 0) return false;
         // Compare requested sizes: the surface may clamp them.
@@ -120,6 +142,7 @@ public final class MainWindowBackend implements AutoCloseable {
     }
 
     public void present(int sourceFramebuffer, int sourceWidth, int sourceHeight, int framebufferWidth, int framebufferHeight) throws IOException {
+        finishWorldFrame();
         if (!acquire(framebufferWidth, framebufferHeight, false)) return;
         FrameSlot slot = slots[(int)(frames % slots.length)];
         int timerSlot = (int)(frames % slots.length);
@@ -307,6 +330,7 @@ public final class MainWindowBackend implements AutoCloseable {
     }
     @Override public void close() {
         if (context.device != null) {
+            closeWorld();
             finishGL.run(); drainAcquired(); check(vkDeviceWaitIdle(context.device), "wait presentation shutdown");
             if (timers != null) { timers.collectAll(); timers.report(this::log); timers.close(); }
             destroySwapchain();

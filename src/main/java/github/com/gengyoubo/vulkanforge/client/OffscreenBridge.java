@@ -12,7 +12,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 
 /** Latest-frame mailbox. No pipe reads, process waits or Vulkan calls on the game render thread. */
-final class OffscreenBridge implements AutoCloseable {
+final class OffscreenBridge implements AutoCloseable, WorldSink {
     record Frame(long sequence, long epoch, byte[] rgba) { }
     enum Status { STARTING, RUNNING, FAILED, STOPPED }
     private static final ExecutorService IO = Executors.newCachedThreadPool(r -> {
@@ -21,6 +21,8 @@ final class OffscreenBridge implements AutoCloseable {
         return t;
     });
     private static final Set<OffscreenBridge> ACTIVE = ConcurrentHashMap.newKeySet();
+    private static final AtomicLong LAUNCHES = new AtomicLong();
+    static long launches() { return LAUNCHES.get(); }
     static {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> ACTIVE.forEach(OffscreenBridge::close), "VulkanForge-bridge-shutdown"));
     }
@@ -46,12 +48,12 @@ final class OffscreenBridge implements AutoCloseable {
 
     Frame take() { return latest.getAndSet(null); }
     void recycle(Frame frame) { if (frame != null) available.offer(frame.rgba()); }
-    boolean send(WorldProtocol.Command command) {
+    public boolean send(WorldProtocol.Command command) {
         if (closed.get() || !commands.offer(command)) return false;
         commandsReady.release(); return true;
     }
-    void camera(WorldProtocol.Camera value) { camera.set(value); commandsReady.release(); }
-    void reset(long epoch) { commands.clear(); camera.set(null); send(new WorldProtocol.Reset(epoch)); }
+    public void camera(WorldProtocol.Camera value) { camera.set(value); commandsReady.release(); }
+    public void reset(long epoch) { commands.clear(); camera.set(null); send(new WorldProtocol.Reset(epoch)); }
 
     private void writeCommands(Process process) {
         try (DataOutputStream output = new DataOutputStream(new BufferedOutputStream(process.getOutputStream(), 65536))) {
@@ -73,6 +75,7 @@ final class OffscreenBridge implements AutoCloseable {
             ProcessBuilder builder = LabLauncher.process("--bridge").redirectError(report.toFile());
             if (closed.get()) return;
             child = builder.start();
+            LAUNCHES.incrementAndGet();
             if (closed.get()) { requestStop(child); return; }
             Process process = child;
             IO.execute(() -> writeCommands(process));

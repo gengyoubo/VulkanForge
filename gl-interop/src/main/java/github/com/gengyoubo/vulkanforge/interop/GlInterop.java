@@ -28,7 +28,9 @@ public final class GlInterop {
         return org.lwjgl.system.JNI.callPP(hwnd, -6, function); // GWLP_HINSTANCE, Win64 ABI
     }
     /** memory HANDLE, allocation size, ready HANDLE, complete HANDLE, width, height. */
-    public static Consumer<int[]> importImage(long[] resources) { return new SharedImage(resources); }
+    public static Consumer<int[]> importImage(long[] resources) { return new SharedImage(resources, false); }
+    /** Commands: {0, textureId output} waits for Vulkan; {1} releases after all GL sampling. */
+    public static Consumer<int[]> importTerrain(long[] resources) { return new SharedImage(resources, true); }
     private static void check(String stage) {
         int error = glGetError();
         if (error != GL_NO_ERROR) throw new IllegalStateException(stage + ": GL error 0x" + Integer.toHexString(error));
@@ -36,7 +38,9 @@ public final class GlInterop {
     private static final class SharedImage implements Consumer<int[]>, AutoCloseable {
         private int texture, memory, framebuffer, ready, complete;
         private final int width, height;
-        SharedImage(long[] resources) {
+        private final boolean terrain;
+        SharedImage(long[] resources, boolean terrain) {
+            this.terrain = terrain;
             width = Math.toIntExact(resources[4]); height = Math.toIntExact(resources[5]);
             try {
                 check("before shared image import");
@@ -47,6 +51,10 @@ public final class GlInterop {
                 try {
                     texture = glGenTextures(); glBindTexture(GL_TEXTURE_2D, texture);
                     glTexStorageMem2DEXT(GL_TEXTURE_2D, 1, GL_RGBA8, width, height, memory, 0); check("shared texture storage");
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, org.lwjgl.opengl.GL12.GL_CLAMP_TO_EDGE);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, org.lwjgl.opengl.GL12.GL_CLAMP_TO_EDGE);
                 } finally { glBindTexture(GL_TEXTURE_2D, previous); }
                 previous = glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING);
                 try {
@@ -64,6 +72,12 @@ public final class GlInterop {
         @Override public void accept(int[] source) {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 var empty = stack.mallocInt(0); var textures = stack.ints(texture); var layouts = stack.ints(GL_LAYOUT_GENERAL_EXT);
+                if (terrain) {
+                    if (source[0] == 0) { glWaitSemaphoreEXT(ready, empty, textures, layouts); source[1] = texture; }
+                    else if (source[0] == 1) { glSignalSemaphoreEXT(complete, empty, textures, layouts); glFlush(); }
+                    else throw new IllegalArgumentException("Unknown shared terrain command");
+                    check("shared terrain handoff"); return;
+                }
                 glWaitSemaphoreEXT(ready, empty, textures, layouts);
                 int read = glGetInteger(GL_READ_FRAMEBUFFER_BINDING), draw = glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING);
                 boolean scissor = glIsEnabled(GL_SCISSOR_TEST), srgb = glIsEnabled(GL_FRAMEBUFFER_SRGB);

@@ -15,6 +15,9 @@ final class WorldScene implements AutoCloseable {
     }
     private final VulkanContext context;
     private final Map<Long, Section> sections = new LinkedHashMap<>();
+    private final Set<Long> tracked = new HashSet<>();
+    private final java.util.function.Consumer<String> log;
+    private int peakSections;
     private long epoch, descriptorLayout, descriptorPool, descriptorSet, layout, pipeline, sampler, lightSampler, pool, fence;
     private GpuImage atlas, lightMap;
     private long atlasPatches, lightUpdates;
@@ -22,7 +25,8 @@ final class WorldScene implements AutoCloseable {
     private WorldProtocol.Camera camera;
     private boolean receivedMesh;
 
-    WorldScene(VulkanContext context) { this.context = context; }
+    WorldScene(VulkanContext context) { this(context, System.out::println); }
+    WorldScene(VulkanContext context, java.util.function.Consumer<String> log) { this.context = context; this.log = log; }
 
     void initialize() {
         try (MemoryStack stack = MemoryStack.stackPush()) {
@@ -60,28 +64,33 @@ final class WorldScene implements AutoCloseable {
     void apply(WorldProtocol.Command command) {
         if (command instanceof WorldProtocol.Reset reset) {
             clear(); epoch = reset.epoch();
-            System.out.println("WORLD_RESET=" + epoch);
+            log.accept("WORLD_RESET=" + epoch);
             return;
         }
         if (command.epoch() != epoch || epoch == 0) return;
         if (command instanceof WorldProtocol.Camera view) camera = view;
         else if (command instanceof WorldProtocol.Atlas image) uploadAtlas(image);
         else if (command instanceof WorldProtocol.TexturePatch patch) updateTexture(patch);
-        else if (command instanceof WorldProtocol.Remove remove) { Section old = sections.remove(remove.key()); if (old != null) old.close(); }
+        else if (command instanceof WorldProtocol.Remove remove) { tracked.remove(remove.key()); Section old = sections.remove(remove.key()); if (old != null) old.close(); }
         else if (command instanceof WorldProtocol.Mesh mesh) {
             receivedMesh = true;
-            if (sections.size() >= 64 && !sections.containsKey(mesh.key())) throw new IllegalStateException("World section cache limit exceeded");
+            if (tracked.size() >= 64 && !tracked.contains(mesh.key())) throw new IllegalStateException("World section cache limit exceeded");
             Section replacement = mesh.vertices().length == 0 ? null : new Section(mesh.x(), mesh.y(), mesh.z(), mesh.vertices().length / WorldProtocol.STRIDE,
                     new GpuBuffer(context, mesh.vertices(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT));
             Section old = sections.remove(mesh.key());
             if (old != null) old.close();
             if (replacement != null) sections.put(mesh.key(), replacement);
-            System.out.printf("WORLD_MESH=%d vertices=%d cached=%d%n", mesh.key(), mesh.vertices().length / WorldProtocol.STRIDE, sections.size());
+            tracked.add(mesh.key()); peakSections = Math.max(peakSections, tracked.size());
+            log.accept("WORLD_MESH=" + mesh.key() + " vertices=" + mesh.vertices().length / WorldProtocol.STRIDE + " cached=" + sections.size() + " tracked=" + tracked.size());
         }
     }
 
     boolean ready() { return camera != null && atlas != null && lightMap != null && receivedMesh; }
     long renderedEpoch() { return ready() ? epoch : 0; }
+    long epoch() { return epoch; }
+    int trackedSections() { return tracked.size(); }
+    int peakSections() { return peakSections; }
+    int drawableSections() { return sections.size(); }
     float red() { return camera.red(); }
     float green() { return camera.green(); }
     float blue() { return camera.blue(); }
@@ -94,7 +103,7 @@ final class WorldScene implements AutoCloseable {
             uploadPixels(next, 0, 0, pixels.width(), pixels.height(), pixels.rgba(), true);
             updateDescriptor(0, next, sampler);
             atlas = next;
-            System.out.printf("WORLD_ATLAS=%dx%d%n", pixels.width(), pixels.height());
+            log.accept("WORLD_ATLAS=" + pixels.width() + "x" + pixels.height());
         } catch (Throwable error) { next.close(); throw error; }
     }
 
@@ -107,12 +116,12 @@ final class WorldScene implements AutoCloseable {
                 uploadPixels(image, 0, 0, 16, 16, patch.rgba(), fresh);
                 if (fresh) { updateDescriptor(1, image, lightSampler); lightMap = image; }
             } catch (Throwable error) { if (fresh) image.close(); throw error; }
-            if (++lightUpdates == 1 || lightUpdates % 100 == 0) System.out.println("WORLD_LIGHTMAP_UPDATES=" + lightUpdates);
+            if (++lightUpdates == 1 || lightUpdates % 100 == 0) log.accept("WORLD_LIGHTMAP_UPDATES=" + lightUpdates);
         } else {
             if (atlas == null || (long) patch.x() + patch.width() > atlas.width || (long) patch.y() + patch.height() > atlas.height)
                 throw new IllegalArgumentException("Atlas patch exceeds current image bounds");
             uploadPixels(atlas, patch.x(), patch.y(), patch.width(), patch.height(), patch.rgba(), false);
-            if (++atlasPatches == 1 || atlasPatches % 100 == 0) System.out.println("WORLD_ATLAS_PATCHES=" + atlasPatches);
+            if (++atlasPatches == 1 || atlasPatches % 100 == 0) log.accept("WORLD_ATLAS_PATCHES=" + atlasPatches);
         }
     }
 
@@ -172,7 +181,7 @@ final class WorldScene implements AutoCloseable {
     }
 
     private void clear() {
-        sections.values().forEach(Section::close); sections.clear(); camera = null; receivedMesh = false;
+        sections.values().forEach(Section::close); sections.clear(); tracked.clear(); camera = null; receivedMesh = false;
         if (atlas != null) { atlas.close(); atlas = null; }
         if (lightMap != null) { lightMap.close(); lightMap = null; }
     }

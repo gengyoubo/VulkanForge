@@ -77,11 +77,11 @@ final class WorldCapture {
                 buildNanos / (buildSlices * 1_000_000.0), maxBuildNanos / 1_000_000.0);
         buildSlices = buildNanos = maxBuildNanos = 0;
     }
-    void leave(OffscreenBridge bridge) {
+    void leave(WorldSink bridge) {
         if (epoch != 0) { close(); epoch = 0; sent.clear(); atlasSent = false; bridge.reset(0); }
     }
 
-    void update(RenderLevelStageEvent event, OffscreenBridge bridge) {
+    void update(RenderLevelStageEvent event, WorldSink bridge) {
         Minecraft mc = Minecraft.getInstance();
         if (mc.level == null) return;
         if (level != mc.level) {
@@ -150,7 +150,7 @@ final class WorldCapture {
         }
     }
 
-    private boolean syncTextures(Minecraft mc, OffscreenBridge bridge) {
+    private boolean syncTextures(Minecraft mc, WorldSink bridge) {
         if (System.nanoTime() >= nextTexturePoll) {
             nextTexturePoll = System.nanoTime() + 100_000_000L;
             lightReadback.request(RenderSystem.getShaderTexture(2));

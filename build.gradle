@@ -82,9 +82,16 @@ if (project.hasProperty('worldSmoke')) {
             }
             if (project.hasProperty('validationSmoke')) {
                 if (!window.text.contains('VALIDATION=ENABLED')) throw new GradleException('Vulkan validation layer was not enabled')
-                def bridge = file('run/logs/vulkanforge/bridge-report.txt')
-                if (!bridge.exists() || !bridge.text.contains('VALIDATION=ENABLED') || !bridge.text.contains('VALIDATION_ERRORS=0')) {
-                    throw new GradleException('Terrain bridge did not pass validation')
+                if (report.text.contains('PASS same-process WorldScene')) {
+                    if (!window.text.contains('WORLD_BACKEND=MAIN_WINDOW_SHARED_GPU') || !window.text.contains('WORLD_RGBA_READBACK_BYTES=0')
+                            || !window.text.contains('WORLD_FINAL_FRAMES=') || !window.text.contains('GPU_TERRAIN_MS samples=')) {
+                        throw new GradleException('Shared terrain did not finish rendering and releasing its resources')
+                    }
+                } else {
+                    def bridge = file('run/logs/vulkanforge/bridge-report.txt')
+                    if (!bridge.exists() || !bridge.text.contains('VALIDATION=ENABLED') || !bridge.text.contains('VALIDATION_ERRORS=0')) {
+                        throw new GradleException('Terrain bridge did not pass validation')
+                    }
                 }
             }
         }

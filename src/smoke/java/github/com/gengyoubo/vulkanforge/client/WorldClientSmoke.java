@@ -29,6 +29,7 @@ public final class WorldClientSmoke {
     private static long lightBaseline;
     private static int originalWidth, originalHeight, swapchainBaseline;
     private static long minimizedFrames;
+    private static long bridgeLaunches;
     private static final long START = System.nanoTime();
     private static Path report;
 
@@ -88,8 +89,16 @@ public final class WorldClientSmoke {
                             "Raw mouse input is not bound to the visible main window");
                     log("PASS vanilla cursor/raw mouse capture belongs to the visible main window");
                 }
+                bridgeLaunches = OffscreenBridge.launches();
                 VulkanPreview.toggle(); stage = 3; ticks = 0;
-            } else if (stage == 3 && ++ticks > 100 && VulkanPreview.worldEpoch() > 0 && VulkanPreview.capturedSections() >= 10) {
+            } else if (stage == 3 && ++ticks > 100 && VulkanPreview.worldEpoch() > 0 && VulkanPreview.capturedSections() >= (NativeMainWindow.active() ? 45 : 10)) {
+                if (NativeMainWindow.active()) {
+                    long[] stats = VulkanPreview.directWorldStats();
+                    require(VulkanPreview.directWorld() && stats[2] == 45 && stats[7] > 0, "WorldScene is not drawing 45 sections through the main backend");
+                    require(stats[8] == ProcessHandle.current().pid() && OffscreenBridge.launches() == bridgeLaunches, "Terrain still runs in a subprocess");
+                    require(stats[4] == mc.getMainRenderTarget().viewWidth && stats[5] == mc.getMainRenderTarget().viewHeight, "Shared terrain target does not match the main target");
+                    log("PASS same-process WorldScene, sections=" + stats[2] + ", pid=" + stats[8] + ", no terrain subprocess / FrameProtocol RGBA");
+                }
                 firstHash = VulkanPreview.saveWorldFrame(report.resolve("before.png"));
                 if (NativeMainWindow.active()) NativeMainWindow.captureNext(report.resolve("main-swapchain.png"));
                 net.minecraft.client.Screenshot.grab(mc.gameDirectory, "world-smoke-main.png", mc.getMainRenderTarget(), message -> { });
@@ -183,6 +192,22 @@ public final class WorldClientSmoke {
             } else if (stage == 17 && ++ticks > 10) {
                 verifyCapture(report.resolve("windowed-swapchain.png"), mc.getWindow().getWidth(), mc.getWindow().getHeight());
                 log("PASS fullscreen round trip, swapchain generations=" + NativeMainWindow.swapchainGenerations());
+                VulkanPreview.toggleInset();
+                NativeMainWindow.captureNext(report.resolve("inset-swapchain.png"));
+                stage = 20; ticks = 0;
+            } else if (stage == 20 && ++ticks > 10) {
+                verifyCapture(report.resolve("inset-swapchain.png"), mc.getWindow().getWidth(), mc.getWindow().getHeight());
+                log("PASS shared terrain sampling through GUI inset");
+                VulkanPreview.toggleInset();
+                VulkanPreview.toggle();
+                require(!VulkanPreview.directWorld() && NativeMainWindow.worldStats()[1] == 0, "F8 did not release shared world resources");
+                stage = 21; ticks = 0;
+            } else if (stage == 21 && ++ticks > 10) {
+                VulkanPreview.toggle();
+                stage = 22; ticks = 0;
+            } else if (stage == 22 && ++ticks > 60 && VulkanPreview.worldEpoch() > 0 && VulkanPreview.capturedSections() == 45) {
+                require(VulkanPreview.directWorldStats()[2] == 45 && OffscreenBridge.launches() == bridgeLaunches, "F8 reopen did not restore same-process sections");
+                log("PASS F8 shared world release/reopen, sections=45");
                 leaveWorld(mc);
             } else if (stage == 18 && mc.level == null && mc.screen instanceof TitleScreen && ++ticks > 20) {
                 require(VulkanPreview.worldEpoch() == 0, "Vulkan world state survived leaving the world");
@@ -222,6 +247,7 @@ public final class WorldClientSmoke {
     }
     private static void finish(Minecraft mc) throws java.io.IOException {
         if (NativeMainWindow.active()) {
+            require(VulkanPreview.directWorld() && OffscreenBridge.launches() == bridgeLaunches, "Terrain switched back to the RGBA subprocess");
             require(NativeMainWindow.acquiresBeforeInput() > NativeMainWindow.presentedFrames() * .9,
                     "Most acquisitions still happen after camera rendering");
             log("PASS acquire before input=" + NativeMainWindow.acquiresBeforeInput() + ", fallback acquire after render=" + NativeMainWindow.acquiresAfterRender());

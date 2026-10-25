@@ -24,6 +24,8 @@ public final class NativeMainWindow {
     private static Object backend;
     private static boolean revealed;
     private static Method present, beginFrame, setVsync, frames, generations, capture, close, earlyAcquires, lateAcquires;
+    private static Method renderWorld, worldStats, finishWorldFrame, closeWorld;
+    private static Consumer<Object[]> worldCommands;
 
     private NativeMainWindow() { }
 
@@ -48,6 +50,11 @@ public final class NativeMainWindow {
             setVsync = type.getMethod("setVsync", boolean.class);
             frames = type.getMethod("frames"); generations = type.getMethod("generations");
             capture = type.getMethod("captureNext", String.class); close = type.getMethod("close");
+            renderWorld = type.getMethod("renderWorld", int.class, int.class); worldStats = type.getMethod("worldStats");
+            finishWorldFrame = type.getMethod("finishWorldFrame"); closeWorld = type.getMethod("closeWorld");
+            Function<long[], Consumer<int[]>> terrainImporter = GlInterop::importTerrain;
+            @SuppressWarnings("unchecked") Consumer<Object[]> commands = (Consumer<Object[]>) type.getMethod("worldCommands", Function.class).invoke(backend, terrainImporter);
+            worldCommands = commands;
         } catch (Throwable error) {
             LOGGER.warn("Vulkan main-window probe failed; using the original OpenGL window. Report: logs/vulkanforge/main-window-report.txt", cause(error));
             releaseBackend();
@@ -105,6 +112,7 @@ public final class NativeMainWindow {
     }
     public static void swapBuffers(long window) {
         if (!active() || window != mainWindow) { GLFW.glfwSwapBuffers(window); return; }
+        call(finishWorldFrame);
         Minecraft mc = Minecraft.getInstance();
         var target = mc.getMainRenderTarget();
         if (target == null || target.frameBufferId < 0) return;
@@ -120,6 +128,14 @@ public final class NativeMainWindow {
     }
 
     public static long presentedFrames() { return active() ? ((Number) call(frames)).longValue() : 0; }
+    static boolean sendWorld(dev.vulkanforge.bridge.WorldProtocol.Command command) {
+        if (!active()) return false;
+        worldCommands.accept(dev.vulkanforge.bridge.WorldProtocol.pack(command)); return true;
+    }
+    static int renderWorld(int width, int height) { return active() ? ((Number)call(renderWorld, width, height)).intValue() : 0; }
+    static boolean worldVisible() { return active() && GLFW.glfwGetWindowAttrib(mainWindow, GLFW.GLFW_ICONIFIED) == 0; }
+    static long[] worldStats() { return active() ? (long[])call(worldStats) : new long[9]; }
+    static void closeWorld() { if (active()) call(closeWorld); }
     public static long acquiresBeforeInput() { return active() ? ((Number) call(earlyAcquires)).longValue() : 0; }
     public static long acquiresAfterRender() { return active() ? ((Number) call(lateAcquires)).longValue() : 0; }
     public static int swapchainGenerations() { return active() ? ((Number) call(generations)).intValue() : 0; }
@@ -144,6 +160,7 @@ public final class NativeMainWindow {
         catch (Throwable error) { LOGGER.error("Could not close Vulkan main-window resources", cause(error)); }
         finally {
             backend = null; present = beginFrame = setVsync = frames = generations = capture = close = earlyAcquires = lateAcquires = null;
+            renderWorld = worldStats = finishWorldFrame = closeWorld = null; worldCommands = null;
             try { if (loader != null) loader.close(); } catch (Exception error) { LOGGER.warn("Could not close backend loader", error); }
             loader = null;
         }

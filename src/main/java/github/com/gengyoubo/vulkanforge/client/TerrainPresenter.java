@@ -15,6 +15,9 @@ final class TerrainPresenter implements AutoCloseable {
     private static final Matrix4f IDENTITY = new Matrix4f();
 
     void draw(FrameTexture texture) {
+        draw(texture.getId());
+    }
+    void draw(int texture) {
         if (quad == null) {
             builder.begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.POSITION_TEX);
             builder.vertex(-1, -1, 0).uv(0, 1).endVertex();
@@ -33,7 +36,7 @@ final class TerrainPresenter implements AutoCloseable {
         try {
             RenderSystem.disableDepthTest(); RenderSystem.depthMask(false); RenderSystem.disableCull();
             RenderSystem.enableBlend(); RenderSystem.defaultBlendFunc();
-            RenderSystem.setShaderColor(1, 1, 1, 1); RenderSystem.setShaderTexture(0, texture.getId());
+            RenderSystem.setShaderColor(1, 1, 1, 1); RenderSystem.setShaderTexture(0, texture);
             quad.bind(); quad.drawWithShader(IDENTITY, IDENTITY, GameRenderer.getPositionTexShader());
         } finally {
             VertexBuffer.unbind();

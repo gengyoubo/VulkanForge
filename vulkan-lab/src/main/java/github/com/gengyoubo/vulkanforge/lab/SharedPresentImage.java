@@ -12,7 +12,7 @@ import static org.lwjgl.vulkan.KHRExternalSemaphoreWin32.*;
 /** Exported Vulkan allocation; imported GL objects belong to the host's existing LWJGL. */
 final class SharedPresentImage implements AutoCloseable {
     final VulkanContext context;
-    long image, memory, ready, complete;
+    long image, memory, ready, complete, view;
     private long memoryHandle, readyHandle, completeHandle;
     private Consumer<int[]> glImage;
     SharedPresentImage(VulkanContext context, int width, int height, Function<long[], Consumer<int[]>> importer) {
@@ -50,6 +50,18 @@ final class SharedPresentImage implements AutoCloseable {
                 .semaphore(semaphore).handleType(VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT), handle), "export GL semaphore"); return handle.get(0);
     }
     void copyFromGL(int source, int width, int height) { glImage.accept(new int[]{source, width, height}); }
+    long view() {
+        if (view == 0) try (MemoryStack stack = MemoryStack.stackPush()) {
+            var handle = stack.mallocLong(1);
+            check(vkCreateImageView(context.device, VkImageViewCreateInfo.calloc(stack).sType$Default().image(image)
+                    .viewType(VK_IMAGE_VIEW_TYPE_2D).format(VK_FORMAT_R8G8B8A8_UNORM)
+                    .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1)), null, handle), "shared terrain view");
+            view = handle.get(0);
+        }
+        return view;
+    }
+    int beginReadGL() { int[] result = {0, 0}; glImage.accept(result); return result[1]; }
+    void endReadGL() { glImage.accept(new int[]{1}); }
     private static void closeHandle(long handle) {
         long function = org.lwjgl.system.windows.Kernel32.getLibrary().getFunctionAddress("CloseHandle");
         if (org.lwjgl.system.JNI.callPI(handle, function) == 0) throw new IllegalStateException("CloseHandle failed");
@@ -61,6 +73,7 @@ final class SharedPresentImage implements AutoCloseable {
         }
         if (ready != 0) { vkDestroySemaphore(context.device, ready, null); ready = 0; }
         if (complete != 0) { vkDestroySemaphore(context.device, complete, null); complete = 0; }
+        if (view != 0) { vkDestroyImageView(context.device, view, null); view = 0; }
         if (image != 0) { vkDestroyImage(context.device, image, null); image = 0; }
         if (memory != 0) { vkFreeMemory(context.device, memory, null); memory = 0; }
         if (memoryHandle != 0) { closeHandle(memoryHandle); memoryHandle = 0; }

@@ -19,6 +19,31 @@ public final class WorldProtocol {
 
     private WorldProtocol() { }
 
+    /** JDK-only payloads for isolated class loaders; vertex/atlas arrays are immutable and shared, not serialized. */
+    public static Object[] pack(Command command) {
+        long epoch = command.epoch();
+        if (command instanceof Reset) return new Object[]{1, epoch};
+        if (command instanceof Atlas a) return new Object[]{2, epoch, a.width(), a.height(), a.rgba()};
+        if (command instanceof Mesh m) return new Object[]{3, epoch, m.key(), m.x(), m.y(), m.z(), m.vertices()};
+        if (command instanceof Remove r) return new Object[]{4, epoch, r.key()};
+        if (command instanceof Camera c) return new Object[]{5, epoch, c.x(), c.y(), c.z(), c.matrix(), c.red(), c.green(), c.blue()};
+        TexturePatch p = (TexturePatch) command;
+        return new Object[]{6, epoch, p.target(), p.x(), p.y(), p.width(), p.height(), p.rgba()};
+    }
+
+    public static Command unpack(Object[] p) {
+        long epoch = (Long) p[1];
+        return switch ((Integer) p[0]) {
+            case 1 -> new Reset(epoch);
+            case 2 -> new Atlas(epoch, (Integer)p[2], (Integer)p[3], (byte[])p[4]);
+            case 3 -> new Mesh(epoch, (Long)p[2], (Integer)p[3], (Integer)p[4], (Integer)p[5], (byte[])p[6]);
+            case 4 -> new Remove(epoch, (Long)p[2]);
+            case 5 -> new Camera(epoch, (Double)p[2], (Double)p[3], (Double)p[4], (float[])p[5], (Float)p[6], (Float)p[7], (Float)p[8]);
+            case 6 -> new TexturePatch(epoch, (Integer)p[2], (Integer)p[3], (Integer)p[4], (Integer)p[5], (Integer)p[6], (byte[])p[7]);
+            default -> throw new IllegalArgumentException("Unknown local world command");
+        };
+    }
+
     public static void write(DataOutputStream out, Command command) throws IOException {
         out.writeByte(command instanceof Reset ? 1 : command instanceof Atlas ? 2 : command instanceof Mesh ? 3 : command instanceof Remove ? 4 : command instanceof Camera ? 5 : 6);
         out.writeLong(command.epoch());
