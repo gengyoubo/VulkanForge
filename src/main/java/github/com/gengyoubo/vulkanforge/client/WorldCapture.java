@@ -37,6 +37,33 @@ final class WorldCapture {
     private long nextTexturePoll;
     private long atlasPatches, lightUpdates;
     private int cutoutBlocks;
+    private final TextureCapture.Readback atlasReadback = new TextureCapture.Readback();
+    private final TextureCapture.Readback lightReadback = new TextureCapture.Readback();
+    private SectionBuild build;
+    private long buildSlices, buildNanos, maxBuildNanos;
+
+    private final class SectionBuild {
+        final SectionPos section;
+        final LevelChunkSection states;
+        final Map<BlockPos, ModelData> modelData;
+        final PoseStack poses = new PoseStack();
+        final RandomSource random = RandomSource.create();
+        final BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        final boolean empty;
+        int next;
+        boolean bufferOpen;
+        SectionBuild(SectionPos section) {
+            this.section = section;
+            states = level.getChunk(section.x(), section.z()).getSection(level.getSectionIndexFromSectionY(section.y()));
+            empty = states.hasOnlyAir();
+            modelData = empty ? Map.of() : level.getModelDataManager().getAt(new ChunkPos(section.x(), section.z()));
+            if (!empty) { builder.begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.BLOCK); bufferOpen = true; }
+        }
+    }
+    private void cancelBuild() {
+        if (build != null && build.bufferOpen) { builder.end().release(); builder.discard(); }
+        build = null;
+    }
 
     long epoch() { return epoch; }
     int sections() { return sent.size(); }
@@ -44,14 +71,22 @@ final class WorldCapture {
     long lightUpdates() { return lightUpdates; }
     int cutoutBlocks() { return cutoutBlocks; }
     void invalidate() { level = null; }
+    void close() {
+        cancelBuild(); atlasReadback.close(); lightReadback.close(); invalidate();
+        if (buildSlices > 0) VulkanForge.LOGGER.info("Vulkan mesh capture slices={}, meanMs={}, maxMs={}", buildSlices,
+                buildNanos / (buildSlices * 1_000_000.0), maxBuildNanos / 1_000_000.0);
+        buildSlices = buildNanos = maxBuildNanos = 0;
+    }
     void leave(OffscreenBridge bridge) {
-        if (epoch != 0) { epoch = 0; level = null; sent.clear(); atlasSent = false; bridge.reset(0); }
+        if (epoch != 0) { close(); epoch = 0; sent.clear(); atlasSent = false; bridge.reset(0); }
     }
 
     void update(RenderLevelStageEvent event, OffscreenBridge bridge) {
         Minecraft mc = Minecraft.getInstance();
         if (mc.level == null) return;
         if (level != mc.level) {
+            cancelBuild();
+            atlasReadback.close(); lightReadback.close();
             level = mc.level;
             epoch = EPOCHS.incrementAndGet();
             sent.clear(); cursor = 0; atlasSent = false;
@@ -88,18 +123,27 @@ final class WorldCapture {
             long key = old.next();
             if (!keys.contains(key) && bridge.send(new WorldProtocol.Remove(epoch, key))) old.remove();
         }
-        if (wanted.isEmpty() || System.nanoTime() < nextBuild) return;
-        nextBuild = System.nanoTime() + 50_000_000L;
-        SectionPos selected = null;
-        for (SectionPos section : wanted) {
-            if (!sent.containsKey(section.asLong()) && level.hasChunk(section.x(), section.z())) { selected = section; break; }
+        if (build != null && (!keys.contains(build.section.asLong()) || !level.hasChunk(build.section.x(), build.section.z()))) cancelBuild();
+        if (build == null) {
+            if (wanted.isEmpty() || System.nanoTime() < nextBuild) return;
+            nextBuild = System.nanoTime() + 50_000_000L;
+            SectionPos selected = null;
+            for (SectionPos section : wanted) {
+                if (!sent.containsKey(section.asLong()) && level.hasChunk(section.x(), section.z())) { selected = section; break; }
+            }
+            if (selected == null) selected = wanted.get(cursor++ % wanted.size());
+            if (!level.hasChunk(selected.x(), selected.z())) {
+                if (bridge.send(new WorldProtocol.Remove(epoch, selected.asLong()))) sent.remove(selected.asLong());
+                return;
+            }
+            build = new SectionBuild(selected);
         }
-        if (selected == null) selected = wanted.get(cursor++ % wanted.size());
-        if (!level.hasChunk(selected.x(), selected.z())) {
-            if (bridge.send(new WorldProtocol.Remove(epoch, selected.asLong()))) sent.remove(selected.asLong());
-            return;
-        }
-        byte[] vertices = captureSection(mc, selected);
+        SectionPos selected = build.section;
+        long start = System.nanoTime();
+        byte[] vertices = captureSection(mc, build);
+        long elapsed = System.nanoTime() - start; buildSlices++; buildNanos += elapsed; maxBuildNanos = Math.max(maxBuildNanos, elapsed);
+        if (vertices == null) return;
+        build = null;
         if (!Arrays.equals(sent.get(selected.asLong()), vertices) && bridge.send(new WorldProtocol.Mesh(epoch, selected.asLong(), selected.minBlockX(), selected.minBlockY(), selected.minBlockZ(), vertices))) {
             sent.put(selected.asLong(), vertices);
             if (sent.size() == 1 || sent.size() % 15 == 0) VulkanForge.LOGGER.info("Vulkan world mesh: sections={}, lastVertices={}", sent.size(), vertices.length / WorldProtocol.STRIDE);
@@ -107,15 +151,19 @@ final class WorldCapture {
     }
 
     private boolean syncTextures(Minecraft mc, OffscreenBridge bridge) {
-        if (System.nanoTime() < nextTexturePoll) return true;
-        nextTexturePoll = System.nanoTime() + 100_000_000L;
-        var light = TextureCapture.read(RenderSystem.getShaderTexture(2));
-        if (light.width() != 16 || light.height() != 16) throw new IllegalStateException("Expected Minecraft 16x16 lightmap");
-        if (!Arrays.equals(lightSnapshot, light.rgba()) && bridge.send(new WorldProtocol.TexturePatch(epoch, WorldProtocol.LIGHT_MAP, 0, 0, 16, 16, light.rgba()))) {
+        if (System.nanoTime() >= nextTexturePoll) {
+            nextTexturePoll = System.nanoTime() + 100_000_000L;
+            lightReadback.request(RenderSystem.getShaderTexture(2));
+            atlasReadback.request(mc.getTextureManager().getTexture(InventoryMenu.BLOCK_ATLAS).getId());
+        }
+        var light = lightReadback.poll();
+        if (light != null && (light.width() != 16 || light.height() != 16)) throw new IllegalStateException("Expected Minecraft 16x16 lightmap");
+        if (light != null && !Arrays.equals(lightSnapshot, light.rgba()) && bridge.send(new WorldProtocol.TexturePatch(epoch, WorldProtocol.LIGHT_MAP, 0, 0, 16, 16, light.rgba()))) {
             lightSnapshot = light.rgba(); lightUpdates++;
             if (lightUpdates == 1 || lightUpdates % 100 == 0) VulkanForge.LOGGER.info("Vulkan lightmap updates={}", lightUpdates);
         }
-        var current = TextureCapture.read(mc.getTextureManager().getTexture(InventoryMenu.BLOCK_ATLAS).getId());
+        var current = atlasReadback.poll();
+        if (current == null) return true;
         if (current.width() != atlasSnapshot.width() || current.height() != atlasSnapshot.height()) { invalidate(); return false; }
         int budget = 8;
         int columns = (current.width() + 31) / 32, tiles = columns * ((current.height() + 31) / 32);
@@ -141,19 +189,18 @@ final class WorldCapture {
         return true;
     }
 
-    private byte[] captureSection(Minecraft mc, SectionPos section) {
-        LevelChunk chunk = level.getChunk(section.x(), section.z());
-        LevelChunkSection states = chunk.getSection(level.getSectionIndexFromSectionY(section.y()));
-        if (states.hasOnlyAir()) return new byte[0];
-        var modelData = level.getModelDataManager().getAt(new ChunkPos(section.x(), section.z()));
-        PoseStack poses = new PoseStack();
-        RandomSource random = RandomSource.create();
-        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
-        builder.begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.BLOCK);
+    private byte[] captureSection(Minecraft mc, SectionBuild job) {
+        if (job.empty) return new byte[0];
+        SectionPos section = job.section;
+        var states = job.states; var modelData = job.modelData;
+        var poses = job.poses; var random = job.random; var pos = job.pos;
+        long deadline = System.nanoTime() + 1_000_000L;
         ModelBlockRenderer.enableCaching();
         BufferBuilder.RenderedBuffer rendered = null;
         try {
-            for (int y = 0; y < 16; y++) for (int z = 0; z < 16; z++) for (int x = 0; x < 16; x++) {
+            while (job.next < 4096) {
+                if (System.nanoTime() >= deadline) return null;
+                int index = job.next++, x = index & 15, z = (index >>> 4) & 15, y = index >>> 8;
                 var state = states.getBlockState(x, y, z);
                 if (state.getRenderShape() != RenderShape.MODEL) continue;
                 pos.set(section.minBlockX() + x, section.minBlockY() + y, section.minBlockZ() + z);
@@ -169,6 +216,7 @@ final class WorldCapture {
                 }
             }
             rendered = builder.end();
+            job.bufferOpen = false;
             int vertices = rendered.drawState().vertexCount();
             int stride = DefaultVertexFormat.BLOCK.getVertexSize();
             if (vertices % 4 != 0 || (long) vertices / 4 * 6 * WorldProtocol.STRIDE > WorldProtocol.MAX_MESH_BYTES) throw new IllegalStateException("Invalid or oversized solid section mesh");
@@ -185,7 +233,6 @@ final class WorldCapture {
             return output.array();
         } finally {
             if (rendered != null) rendered.release();
-            else builder.discard();
             ModelBlockRenderer.clearCache();
         }
     }

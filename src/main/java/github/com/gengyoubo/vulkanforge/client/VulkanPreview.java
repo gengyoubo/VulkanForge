@@ -121,6 +121,6 @@ final class VulkanPreview {
         PRESENTER.close();
         uploaded = 0;
         uploadedEpoch = 0;
-        WORLD.invalidate();
+        WORLD.close();
     }
 }

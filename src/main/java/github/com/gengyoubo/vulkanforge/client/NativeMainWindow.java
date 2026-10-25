@@ -20,6 +20,7 @@ public final class NativeMainWindow {
     private static long mainWindow, hiddenContext;
     private static URLClassLoader loader;
     private static Object backend;
+    private static boolean revealed;
     private static Method present, setVsync, frames, generations, capture, close;
 
     private NativeMainWindow() { }
@@ -58,8 +59,11 @@ public final class NativeMainWindow {
             if (created == 0) throw new IllegalStateException("GLFW_NO_API main window creation failed");
             long hwnd = GLFWNativeWin32.glfwGetWin32Window(created);
             backend.getClass().getMethod("attach", long.class, long.class).invoke(backend, hwnd, GlInterop.windowInstance(hwnd));
+            int[] framebufferWidth = {0}, framebufferHeight = {0};
+            GLFW.glfwGetFramebufferSize(created, framebufferWidth, framebufferHeight);
+            backend.getClass().getMethod("prepare", int.class, int.class).invoke(backend, framebufferWidth[0], framebufferHeight[0]);
             hiddenContext = legacy; mainWindow = created;
-            GLFW.glfwHideWindow(legacy); GLFW.glfwShowWindow(created);
+            revealed = false;
             GLFW.glfwMakeContextCurrent(hiddenContext);
             LOGGER.info("Minecraft main window now uses Vulkan Surface/Swapchain; legacy OpenGL context is hidden");
             return created;
@@ -88,6 +92,11 @@ public final class NativeMainWindow {
         if (GLFW.glfwGetWindowAttrib(window, GLFW.GLFW_ICONIFIED) != 0) return;
         call(setVsync, mc.options.enableVsync().get());
         call(present, target.frameBufferId, target.viewWidth, target.viewHeight, width[0], height[0]);
+        if (!revealed && presentedFrames() > 0) {
+            // Keep Forge's loading window visible until the Vulkan-only window has real content.
+            GLFW.glfwShowWindow(mainWindow); GLFW.glfwHideWindow(hiddenContext); revealed = true;
+            LOGGER.info("Vulkan main window revealed after its first completed frame");
+        }
     }
 
     public static long presentedFrames() { return active() ? ((Number) call(frames)).longValue() : 0; }

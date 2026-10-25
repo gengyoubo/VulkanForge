@@ -29,6 +29,7 @@ final class OffscreenBridge implements AutoCloseable {
     private final ArrayBlockingQueue<byte[]> available = new ArrayBlockingQueue<>(3);
     private final ArrayBlockingQueue<WorldProtocol.Command> commands = new ArrayBlockingQueue<>(64);
     private final AtomicReference<WorldProtocol.Camera> camera = new AtomicReference<>();
+    private final Semaphore commandsReady = new Semaphore(0);
     private final long started = System.nanoTime();
     private volatile long lastFrame = started;
     private volatile Process child;
@@ -45,15 +46,19 @@ final class OffscreenBridge implements AutoCloseable {
 
     Frame take() { return latest.getAndSet(null); }
     void recycle(Frame frame) { if (frame != null) available.offer(frame.rgba()); }
-    boolean send(WorldProtocol.Command command) { return !closed.get() && commands.offer(command); }
-    void camera(WorldProtocol.Camera value) { camera.set(value); }
+    boolean send(WorldProtocol.Command command) {
+        if (closed.get() || !commands.offer(command)) return false;
+        commandsReady.release(); return true;
+    }
+    void camera(WorldProtocol.Camera value) { camera.set(value); commandsReady.release(); }
     void reset(long epoch) { commands.clear(); camera.set(null); send(new WorldProtocol.Reset(epoch)); }
 
     private void writeCommands(Process process) {
         try (DataOutputStream output = new DataOutputStream(new BufferedOutputStream(process.getOutputStream(), 65536))) {
             while (!closed.get() && process.isAlive()) {
-                WorldProtocol.Command command = commands.poll(20, TimeUnit.MILLISECONDS);
-                if (command != null) WorldProtocol.write(output, command);
+                commandsReady.tryAcquire(20, TimeUnit.MILLISECONDS);
+                commandsReady.drainPermits();
+                for (WorldProtocol.Command command; (command = commands.poll()) != null;) WorldProtocol.write(output, command);
                 WorldProtocol.Camera view = camera.getAndSet(null);
                 if (view != null) WorldProtocol.write(output, view);
                 output.flush();
