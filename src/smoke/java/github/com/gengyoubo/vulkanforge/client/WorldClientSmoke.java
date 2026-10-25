@@ -98,6 +98,9 @@ public final class WorldClientSmoke {
                     require(stats[8] == ProcessHandle.current().pid() && OffscreenBridge.launches() == bridgeLaunches, "Terrain still runs in a subprocess");
                     require(stats[4] == mc.getMainRenderTarget().viewWidth && stats[5] == mc.getMainRenderTarget().viewHeight, "Shared terrain target does not match the main target");
                     log("PASS same-process WorldScene, sections=" + stats[2] + ", pid=" + stats[8] + ", no terrain subprocess / FrameProtocol RGBA");
+                    long[] passes = TerrainPasses.stats();
+                    require(passes[0] > 0 && passes[1] > 0, "Vanilla Solid/Cutout sections were not replaced");
+                    log("PASS P4 vanilla terrain skipped: solid=" + passes[0] + ", cutout=" + passes[1] + ", fallback=" + passes[2]);
                 }
                 firstHash = VulkanPreview.saveWorldFrame(report.resolve("before.png"));
                 if (NativeMainWindow.active()) NativeMainWindow.captureNext(report.resolve("main-swapchain.png"));

@@ -27,6 +27,10 @@ import java.util.concurrent.atomic.AtomicLong;
 final class WorldCapture {
     private static final AtomicLong EPOCHS = new AtomicLong();
     private final Map<Long, byte[]> sent = new HashMap<>();
+    private final Set<Long> valid = new HashSet<>(), invalidated = new HashSet<>();
+    private final Set<Long> dirty = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private volatile int centerX, centerY, centerZ, radius = 1;
+    private long completedBuilds;
     private final BufferBuilder builder = new BufferBuilder(262144);
     private ClientLevel level;
     private long epoch, nextBuild;
@@ -67,6 +71,15 @@ final class WorldCapture {
 
     long epoch() { return epoch; }
     int sections() { return sent.size(); }
+    boolean covers(BlockPos origin) {
+        long key = SectionPos.of(origin).asLong();
+        return level == Minecraft.getInstance().level && valid.contains(key) && !dirty.contains(key);
+    }
+    void markDirty(int x, int y, int z) {
+        if (level != null && Math.abs(x - centerX) <= radius && Math.abs(y - centerY) <= 2 && Math.abs(z - centerZ) <= radius)
+            dirty.add(SectionPos.asLong(x, y, z));
+    }
+    long builds() { return completedBuilds; }
     long atlasPatches() { return atlasPatches; }
     long lightUpdates() { return lightUpdates; }
     int cutoutBlocks() { return cutoutBlocks; }
@@ -89,7 +102,7 @@ final class WorldCapture {
             atlasReadback.close(); lightReadback.close();
             level = mc.level;
             epoch = EPOCHS.incrementAndGet();
-            sent.clear(); cursor = 0; atlasSent = false;
+            sent.clear(); valid.clear(); invalidated.clear(); dirty.clear(); cursor = 0; atlasSent = false;
             atlasSnapshot = null; lightSnapshot = null; nextTexturePoll = 0; cutoutBlocks = 0;
             textureCursor = 0;
             bridge.reset(epoch);
@@ -111,8 +124,10 @@ final class WorldCapture {
         int sx = SectionPos.blockToSectionCoord((int) Math.floor(position.x));
         int sy = SectionPos.blockToSectionCoord((int) Math.floor(position.y));
         int sz = SectionPos.blockToSectionCoord((int) Math.floor(position.z));
-        List<SectionPos> wanted = new ArrayList<>(45);
-        for (int x = sx - 1; x <= sx + 1; x++) for (int z = sz - 1; z <= sz + 1; z++) {
+        centerX = sx; centerY = sy; centerZ = sz;
+        radius = Math.max(1, Math.min(4, (mc.options.renderDistance().get() + 3) / 8));
+        List<SectionPos> wanted = new ArrayList<>((radius * 2 + 1) * (radius * 2 + 1) * 5);
+        for (int x = sx - radius; x <= sx + radius; x++) for (int z = sz - radius; z <= sz + radius; z++) {
             for (int y = Math.max(sy - 2, level.getMinSection()); y <= Math.min(sy + 2, level.getMaxSection() - 1); y++) wanted.add(SectionPos.of(x, y, z));
         }
         wanted.sort(Comparator.comparingDouble(p -> p.center().distToCenterSqr(position)));
@@ -121,21 +136,27 @@ final class WorldCapture {
         Iterator<Long> old = sent.keySet().iterator();
         while (old.hasNext()) {
             long key = old.next();
-            if (!keys.contains(key) && bridge.send(new WorldProtocol.Remove(epoch, key))) old.remove();
+            if (!keys.contains(key) && bridge.send(new WorldProtocol.Remove(epoch, key))) { old.remove(); valid.remove(key); invalidated.remove(key); }
         }
-        if (build != null && (!keys.contains(build.section.asLong()) || !level.hasChunk(build.section.x(), build.section.z()))) cancelBuild();
+        dirty.retainAll(keys);
+        for (long key : dirty) if (sent.containsKey(key) && !invalidated.contains(key) && bridge.send(new WorldProtocol.Remove(epoch, key))) {
+            valid.remove(key); invalidated.add(key);
+        }
+        if (build != null && (dirty.contains(build.section.asLong()) || !keys.contains(build.section.asLong()) || !level.hasChunk(build.section.x(), build.section.z()))) cancelBuild();
         if (build == null) {
             if (wanted.isEmpty() || System.nanoTime() < nextBuild) return;
             nextBuild = System.nanoTime() + 50_000_000L;
             SectionPos selected = null;
+            for (SectionPos section : wanted) if (dirty.contains(section.asLong()) && sent.containsKey(section.asLong()) && level.hasChunk(section.x(), section.z())) { selected = section; break; }
             for (SectionPos section : wanted) {
-                if (!sent.containsKey(section.asLong()) && level.hasChunk(section.x(), section.z())) { selected = section; break; }
+                if (selected == null && !sent.containsKey(section.asLong()) && level.hasChunk(section.x(), section.z())) { selected = section; break; }
             }
-            if (selected == null) selected = wanted.get(cursor++ % wanted.size());
+            if (selected == null) return;
             if (!level.hasChunk(selected.x(), selected.z())) {
                 if (bridge.send(new WorldProtocol.Remove(epoch, selected.asLong()))) sent.remove(selected.asLong());
                 return;
             }
+            dirty.remove(selected.asLong());
             build = new SectionBuild(selected);
         }
         SectionPos selected = build.section;
@@ -144,10 +165,13 @@ final class WorldCapture {
         long elapsed = System.nanoTime() - start; buildSlices++; buildNanos += elapsed; maxBuildNanos = Math.max(maxBuildNanos, elapsed);
         if (vertices == null) return;
         build = null;
-        if (!Arrays.equals(sent.get(selected.asLong()), vertices) && bridge.send(new WorldProtocol.Mesh(epoch, selected.asLong(), selected.minBlockX(), selected.minBlockY(), selected.minBlockZ(), vertices))) {
+        completedBuilds++;
+        if (dirty.contains(selected.asLong())) return;
+        if ((!valid.contains(selected.asLong()) || !Arrays.equals(sent.get(selected.asLong()), vertices)) && bridge.send(new WorldProtocol.Mesh(epoch, selected.asLong(), selected.minBlockX(), selected.minBlockY(), selected.minBlockZ(), vertices))) {
             sent.put(selected.asLong(), vertices);
+            valid.add(selected.asLong()); invalidated.remove(selected.asLong());
             if (sent.size() == 1 || sent.size() % 15 == 0) VulkanForge.LOGGER.info("Vulkan world mesh: sections={}, lastVertices={}", sent.size(), vertices.length / WorldProtocol.STRIDE);
-        }
+        } else if (!valid.contains(selected.asLong())) dirty.add(selected.asLong());
     }
 
     private boolean syncTextures(Minecraft mc, WorldSink bridge) {

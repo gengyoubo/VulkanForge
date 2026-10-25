@@ -9,11 +9,17 @@ import static github.com.gengyoubo.vulkanforge.lab.VulkanContext.check;
 final class GpuBuffer implements AutoCloseable {
     final VulkanContext context;
     long buffer, memory;
+    java.nio.ByteBuffer mapped;
     GpuBuffer(VulkanContext context, byte[] bytes, int usage) {
+        this(context, bytes.length, usage);
+        mapped.put(bytes).clear();
+        vkUnmapMemory(context.device, memory); mapped = null;
+    }
+    GpuBuffer(VulkanContext context, int capacity, int usage) {
         this.context = context;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             var handle = stack.mallocLong(1);
-            var info = VkBufferCreateInfo.calloc(stack).sType$Default().size(bytes.length).usage(usage).sharingMode(VK_SHARING_MODE_EXCLUSIVE);
+            var info = VkBufferCreateInfo.calloc(stack).sType$Default().size(capacity).usage(usage).sharingMode(VK_SHARING_MODE_EXCLUSIVE);
             check(vkCreateBuffer(context.device, info, null, handle), "vkCreateBuffer(world)"); buffer = handle.get(0);
             var requirements = VkMemoryRequirements.calloc(stack);
             vkGetBufferMemoryRequirements(context.device, buffer, requirements);
@@ -22,9 +28,8 @@ final class GpuBuffer implements AutoCloseable {
             check(vkAllocateMemory(context.device, allocation, null, handle), "vkAllocateMemory(world buffer)"); memory = handle.get(0);
             check(vkBindBufferMemory(context.device, buffer, memory, 0), "vkBindBufferMemory(world)");
             var pointer = stack.mallocPointer(1);
-            check(vkMapMemory(context.device, memory, 0, bytes.length, 0, pointer), "vkMapMemory(world)");
-            try { org.lwjgl.system.MemoryUtil.memByteBuffer(pointer.get(0), bytes.length).put(bytes); }
-            finally { vkUnmapMemory(context.device, memory); }
+            check(vkMapMemory(context.device, memory, 0, capacity, 0, pointer), "vkMapMemory(world)");
+            mapped = org.lwjgl.system.MemoryUtil.memByteBuffer(pointer.get(0), capacity).order(java.nio.ByteOrder.nativeOrder());
         } catch (Throwable error) { close(); throw error; }
     }
 
@@ -36,6 +41,7 @@ final class GpuBuffer implements AutoCloseable {
     }
 
     @Override public void close() {
+        if (mapped != null) { vkUnmapMemory(context.device, memory); mapped = null; }
         if (buffer != 0) { vkDestroyBuffer(context.device, buffer, null); buffer = 0; }
         if (memory != 0) { vkFreeMemory(context.device, memory, null); memory = 0; }
     }

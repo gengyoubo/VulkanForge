@@ -87,6 +87,11 @@ public final class ClientEvents {
 
     @Mod.EventBusSubscriber(modid = VulkanForge.MOD_ID, value = Dist.CLIENT, bus = Mod.EventBusSubscriber.Bus.MOD)
     public static final class Lifecycle {
+        @SubscribeEvent public static void shaders(net.minecraftforge.client.event.RegisterShadersEvent event) throws java.io.IOException {
+            event.registerShader(new net.minecraft.client.renderer.ShaderInstance(event.getResourceProvider(),
+                    net.minecraft.resources.ResourceLocation.fromNamespaceAndPath(VulkanForge.MOD_ID, "terrain_composite"),
+                    com.mojang.blaze3d.vertex.DefaultVertexFormat.POSITION_TEX), TerrainPresenter::shader);
+        }
         @SubscribeEvent
         public static void keys(RegisterKeyMappingsEvent event) { event.register(PREVIEW); event.register(TRIANGLE); event.register(INSET); }
 

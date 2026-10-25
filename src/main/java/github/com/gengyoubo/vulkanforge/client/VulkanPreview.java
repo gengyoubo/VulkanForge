@@ -16,6 +16,7 @@ final class VulkanPreview {
     private static SharedFrameTexture sharedTexture;
     private static WorldSink sink;
     private static boolean direct;
+    private static int sharedDepth;
     private static int frameWidth = FrameProtocol.WIDTH, frameHeight = FrameProtocol.HEIGHT;
     private static long uploaded;
     private static long lastLogged;
@@ -47,7 +48,7 @@ final class VulkanPreview {
             WORLD.update(event, sink);
             if (direct) renderShared(); else upload();
             if (!inset && uploadedEpoch != 0 && uploadedEpoch == WORLD.epoch()) {
-                if (direct && sharedTexture != null) PRESENTER.draw(sharedTexture.getId());
+                if (direct && sharedTexture != null) PRESENTER.draw(sharedTexture.getId(), sharedDepth);
                 else if (texture != null && bridge.status() == OffscreenBridge.Status.RUNNING) PRESENTER.draw(texture);
             }
         }
@@ -58,12 +59,18 @@ final class VulkanPreview {
     }
 
     static void invalidateWorld() { WORLD.invalidate(); }
+    static void markDirty(int x, int y, int z) { if (enabled) WORLD.markDirty(x, y, z); }
     static void toggleInset() { inset = !inset; }
     static long worldEpoch() { return uploadedEpoch == WORLD.epoch() ? uploadedEpoch : 0; }
     static int capturedSections() { return WORLD.sections(); }
+    static long rebuiltSections() { return WORLD.builds(); }
     static long atlasPatches() { return WORLD.atlasPatches(); }
     static long lightUpdates() { return WORLD.lightUpdates(); }
     static int capturedCutoutBlocks() { return WORLD.cutoutBlocks(); }
+    static boolean replacesSection(net.minecraft.core.BlockPos origin) {
+        return enabled && direct && !inset && sharedDepth > 0 && TerrainPresenter.depthReady()
+                && uploadedEpoch != 0 && uploadedEpoch == WORLD.epoch() && WORLD.covers(origin);
+    }
     static boolean directWorld() { return enabled && direct; }
     static long[] directWorldStats() { return directWorld() ? NativeMainWindow.worldStats() : new long[9]; }
     static int saveWorldFrame(java.nio.file.Path path) throws java.io.IOException {
@@ -86,6 +93,7 @@ final class VulkanPreview {
         long[] stats = NativeMainWindow.worldStats();
         if (id == 0) { uploadedEpoch = 0; return; }
         uploadedEpoch = stats[0];
+        sharedDepth = (int)stats[9];
         if (sharedTexture == null) {
             sharedTexture = new SharedFrameTexture();
             Minecraft.getInstance().getTextureManager().register(TEXTURE, sharedTexture);
@@ -164,5 +172,6 @@ final class VulkanPreview {
         uploadedEpoch = 0;
         WORLD.close();
         sink = null; direct = false;
+        sharedDepth = 0;
     }
 }

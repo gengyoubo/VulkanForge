@@ -10,7 +10,7 @@ import static org.lwjgl.vulkan.VK13.*;
 
 /** GPU section cache. Commands are applied on the Vulkan thread after the previous frame fence. */
 final class WorldScene implements AutoCloseable {
-    private record Section(int x, int y, int z, int vertices, GpuBuffer buffer) implements AutoCloseable {
+    private record Section(int x, int y, int z, int vertices, GpuBuffer buffer, float[] bounds) implements AutoCloseable {
         @Override public void close() { buffer.close(); }
     }
     private final VulkanContext context;
@@ -24,6 +24,8 @@ final class WorldScene implements AutoCloseable {
     private VkCommandBuffer upload;
     private WorldProtocol.Camera camera;
     private boolean receivedMesh;
+    private java.util.function.Consumer<Runnable> retirement = Runnable::run;
+    void retireUsing(java.util.function.Consumer<Runnable> retirement) { this.retirement = retirement; }
 
     WorldScene(VulkanContext context) { this(context, System.out::println); }
     WorldScene(VulkanContext context, java.util.function.Consumer<String> log) { this.context = context; this.log = log; }
@@ -71,14 +73,14 @@ final class WorldScene implements AutoCloseable {
         if (command instanceof WorldProtocol.Camera view) camera = view;
         else if (command instanceof WorldProtocol.Atlas image) uploadAtlas(image);
         else if (command instanceof WorldProtocol.TexturePatch patch) updateTexture(patch);
-        else if (command instanceof WorldProtocol.Remove remove) { tracked.remove(remove.key()); Section old = sections.remove(remove.key()); if (old != null) old.close(); }
+        else if (command instanceof WorldProtocol.Remove remove) { tracked.remove(remove.key()); Section old = sections.remove(remove.key()); if (old != null) retirement.accept(old::close); }
         else if (command instanceof WorldProtocol.Mesh mesh) {
             receivedMesh = true;
-            if (tracked.size() >= 64 && !tracked.contains(mesh.key())) throw new IllegalStateException("World section cache limit exceeded");
+            if (tracked.size() >= GpuCuller.CAPACITY && !tracked.contains(mesh.key())) throw new IllegalStateException("World section cache limit exceeded");
             Section replacement = mesh.vertices().length == 0 ? null : new Section(mesh.x(), mesh.y(), mesh.z(), mesh.vertices().length / WorldProtocol.STRIDE,
-                    new GpuBuffer(context, mesh.vertices(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT));
+                    new GpuBuffer(context, mesh.vertices(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT), bounds(mesh.vertices()));
             Section old = sections.remove(mesh.key());
-            if (old != null) old.close();
+            if (old != null) retirement.accept(old::close);
             if (replacement != null) sections.put(mesh.key(), replacement);
             tracked.add(mesh.key()); peakSections = Math.max(peakSections, tracked.size());
             log.accept("WORLD_MESH=" + mesh.key() + " vertices=" + mesh.vertices().length / WorldProtocol.STRIDE + " cached=" + sections.size() + " tracked=" + tracked.size());
@@ -162,7 +164,30 @@ final class WorldScene implements AutoCloseable {
         }
     }
 
-    void draw(VkCommandBuffer command, MemoryStack stack) {
+    private static float[] bounds(byte[] vertices) {
+        float[] result = {Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY,
+                Float.NEGATIVE_INFINITY, Float.NEGATIVE_INFINITY, Float.NEGATIVE_INFINITY};
+        var bytes = java.nio.ByteBuffer.wrap(vertices).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        for (int offset = 0; offset < vertices.length; offset += WorldProtocol.STRIDE) for (int axis = 0; axis < 3; axis++) {
+            float value = bytes.getFloat(offset + axis * 4);
+            result[axis] = Math.min(result[axis], value); result[axis + 3] = Math.max(result[axis + 3], value);
+        }
+        return result;
+    }
+    void prepareCulling(VkCommandBuffer command, MemoryStack stack, GpuCuller culler, int slot) {
+        var input = culler.input(slot); input.clear();
+        for (Section section : sections.values()) {
+            double[] offset = {section.x() - camera.x(), section.y() - camera.y(), section.z() - camera.z()};
+            for (int bound = 0; bound < 2; bound++) {
+                for (int axis = 0; axis < 3; axis++) input.putFloat((float)(offset[axis] + section.bounds()[bound * 3 + axis]) + (bound == 0 ? -.001f : .001f));
+                input.putFloat(0);
+            }
+            input.putInt(section.vertices()).putInt(0).putInt(0).putInt(0);
+        }
+        culler.record(command, slot, camera.matrix(), sections.size(), stack);
+    }
+    void draw(VkCommandBuffer command, MemoryStack stack) { draw(command, stack, null, 0); }
+    void draw(VkCommandBuffer command, MemoryStack stack, GpuCuller culler, int slot) {
         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, stack.longs(descriptorSet), null);
         var push = stack.mallocFloat(20);
@@ -170,13 +195,16 @@ final class WorldScene implements AutoCloseable {
         push.put(0).put(0).put(0).put(0).flip();
         var buffers = stack.mallocLong(1);
         var offsets = stack.longs(0);
+        int index = 0;
         for (Section section : sections.values()) {
             // Subtract in double before conversion: preserves precision at large world coordinates.
             push.put(16, (float) (section.x() - camera.x())).put(17, (float) (section.y() - camera.y())).put(18, (float) (section.z() - camera.z()));
             vkCmdPushConstants(command, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, push);
             buffers.put(0, section.buffer().buffer);
             vkCmdBindVertexBuffers(command, 0, buffers, offsets);
-            vkCmdDraw(command, section.vertices(), 1, 0, 0);
+            if (culler == null) vkCmdDraw(command, section.vertices(), 1, 0, 0);
+            else culler.draw(command, slot, index);
+            index++;
         }
     }
 

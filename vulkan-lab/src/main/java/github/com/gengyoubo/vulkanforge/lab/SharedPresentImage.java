@@ -15,15 +15,21 @@ final class SharedPresentImage implements AutoCloseable {
     long image, memory, ready, complete, view;
     private long memoryHandle, readyHandle, completeHandle;
     private Consumer<int[]> glImage;
+    private final int format, aspect;
     SharedPresentImage(VulkanContext context, int width, int height, Function<long[], Consumer<int[]>> importer) {
+        this(context, width, height, importer, false);
+    }
+    SharedPresentImage(VulkanContext context, int width, int height, Function<long[], Consumer<int[]>> importer, boolean depth) {
         this.context = context;
+        format = depth ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+        aspect = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             var handle = stack.mallocLong(1);
             var external = VkExternalMemoryImageCreateInfo.calloc(stack).sType$Default().handleTypes(VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT);
             var info = VkImageCreateInfo.calloc(stack).sType$Default().pNext(external.address()).imageType(VK_IMAGE_TYPE_2D)
-                    .format(VK_FORMAT_R8G8B8A8_UNORM).extent(e -> e.set(width, height, 1)).mipLevels(1).arrayLayers(1)
+                    .format(format).extent(e -> e.set(width, height, 1)).mipLevels(1).arrayLayers(1)
                     .samples(VK_SAMPLE_COUNT_1_BIT).tiling(VK_IMAGE_TILING_OPTIMAL).sharingMode(VK_SHARING_MODE_EXCLUSIVE)
-                    .usage(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+                    .usage((depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
             check(vkCreateImage(context.device, info, null, handle), "create shared presentation image"); image = handle.get(0);
             var requirements = VkMemoryRequirements.calloc(stack); vkGetImageMemoryRequirements(context.device, image, requirements);
             var dedicated = VkMemoryDedicatedAllocateInfo.calloc(stack).sType$Default().image(image);
@@ -41,7 +47,7 @@ final class SharedPresentImage implements AutoCloseable {
             check(vkCreateSemaphore(context.device, semaphore, null, handle), "create GL-complete semaphore"); complete = handle.get(0);
             readyHandle = exportSemaphore(stack, ready); completeHandle = exportSemaphore(stack, complete);
             // Retain NT handles through the imported image lifetime, including deferred driver work.
-            glImage = importer.apply(new long[]{memoryHandle, requirements.size(), readyHandle, completeHandle, width, height});
+            glImage = importer.apply(new long[]{memoryHandle, requirements.size(), readyHandle, completeHandle, width, height, format});
         } catch (Throwable error) { close(); throw error; }
     }
     private long exportSemaphore(MemoryStack stack, long semaphore) {
@@ -54,8 +60,8 @@ final class SharedPresentImage implements AutoCloseable {
         if (view == 0) try (MemoryStack stack = MemoryStack.stackPush()) {
             var handle = stack.mallocLong(1);
             check(vkCreateImageView(context.device, VkImageViewCreateInfo.calloc(stack).sType$Default().image(image)
-                    .viewType(VK_IMAGE_VIEW_TYPE_2D).format(VK_FORMAT_R8G8B8A8_UNORM)
-                    .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1)), null, handle), "shared terrain view");
+                    .viewType(VK_IMAGE_VIEW_TYPE_2D).format(format)
+                    .subresourceRange(r -> r.aspectMask(aspect).levelCount(1).layerCount(1)), null, handle), "shared terrain view");
             view = handle.get(0);
         }
         return view;

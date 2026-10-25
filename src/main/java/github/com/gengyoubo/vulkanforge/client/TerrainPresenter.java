@@ -13,11 +13,17 @@ final class TerrainPresenter implements AutoCloseable {
     private VertexBuffer quad;
     private final BufferBuilder builder = new BufferBuilder(128);
     private static final Matrix4f IDENTITY = new Matrix4f();
+    private static net.minecraft.client.renderer.ShaderInstance depthShader;
+    static void shader(net.minecraft.client.renderer.ShaderInstance shader) { depthShader = shader; }
+    static boolean depthReady() { return depthShader != null; }
 
     void draw(FrameTexture texture) {
         draw(texture.getId());
     }
     void draw(int texture) {
+        draw(texture, 0);
+    }
+    void draw(int texture, int depthTexture) {
         if (quad == null) {
             builder.begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.POSITION_TEX);
             builder.vertex(-1, -1, 0).uv(0, 1).endVertex();
@@ -30,17 +36,23 @@ final class TerrainPresenter implements AutoCloseable {
         boolean depth = glIsEnabled(GL_DEPTH_TEST), cull = glIsEnabled(GL_CULL_FACE), blend = glIsEnabled(GL_BLEND);
         boolean writeDepth = glGetBoolean(GL_DEPTH_WRITEMASK);
         int sampler = RenderSystem.getShaderTexture(0), active = glGetInteger(GL_ACTIVE_TEXTURE);
+        int depthSampler = RenderSystem.getShaderTexture(1), depthFunc = glGetInteger(GL_DEPTH_FUNC);
+        boolean transferDepth = depthTexture > 0 && depthShader != null;
         int srcRGB = glGetInteger(GL_BLEND_SRC_RGB), dstRGB = glGetInteger(GL_BLEND_DST_RGB);
         int srcAlpha = glGetInteger(GL_BLEND_SRC_ALPHA), dstAlpha = glGetInteger(GL_BLEND_DST_ALPHA);
         float[] color = RenderSystem.getShaderColor().clone();
         try {
-            RenderSystem.disableDepthTest(); RenderSystem.depthMask(false); RenderSystem.disableCull();
+            if (transferDepth) { RenderSystem.enableDepthTest(); RenderSystem.depthFunc(GL_LEQUAL); }
+            else RenderSystem.disableDepthTest();
+            RenderSystem.depthMask(transferDepth); RenderSystem.disableCull();
             RenderSystem.enableBlend(); RenderSystem.defaultBlendFunc();
             RenderSystem.setShaderColor(1, 1, 1, 1); RenderSystem.setShaderTexture(0, texture);
-            quad.bind(); quad.drawWithShader(IDENTITY, IDENTITY, GameRenderer.getPositionTexShader());
+            if (transferDepth) RenderSystem.setShaderTexture(1, depthTexture);
+            quad.bind(); quad.drawWithShader(IDENTITY, IDENTITY, transferDepth ? depthShader : GameRenderer.getPositionTexShader());
         } finally {
             VertexBuffer.unbind();
             RenderSystem.setShaderTexture(0, sampler); RenderSystem.setShaderColor(color[0], color[1], color[2], color[3]);
+            RenderSystem.setShaderTexture(1, depthSampler); RenderSystem.depthFunc(depthFunc);
             if (depth) RenderSystem.enableDepthTest(); else RenderSystem.disableDepthTest();
             if (cull) RenderSystem.enableCull(); else RenderSystem.disableCull();
             if (blend) RenderSystem.enableBlend(); else RenderSystem.disableBlend();

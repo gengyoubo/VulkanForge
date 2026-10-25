@@ -42,6 +42,7 @@ public final class GlInterop {
         SharedImage(long[] resources, boolean terrain) {
             this.terrain = terrain;
             width = Math.toIntExact(resources[4]); height = Math.toIntExact(resources[5]);
+            boolean depth = resources.length > 6 && resources[6] == 126; // VK_FORMAT_D32_SFLOAT
             try {
                 check("before shared image import");
                 memory = glCreateMemoryObjectsEXT(); glMemoryObjectParameteriEXT(memory, GL_DEDICATED_MEMORY_OBJECT_EXT, GL_TRUE);
@@ -50,7 +51,7 @@ public final class GlInterop {
                 int previous = glGetInteger(GL_TEXTURE_BINDING_2D);
                 try {
                     texture = glGenTextures(); glBindTexture(GL_TEXTURE_2D, texture);
-                    glTexStorageMem2DEXT(GL_TEXTURE_2D, 1, GL_RGBA8, width, height, memory, 0); check("shared texture storage");
+                    glTexStorageMem2DEXT(GL_TEXTURE_2D, 1, depth ? GL_DEPTH_COMPONENT32F : GL_RGBA8, width, height, memory, 0); check("shared texture storage");
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, org.lwjgl.opengl.GL12.GL_CLAMP_TO_EDGE);
@@ -59,7 +60,8 @@ public final class GlInterop {
                 previous = glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING);
                 try {
                     framebuffer = glGenFramebuffers(); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer);
-                    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+                    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, depth ? GL_DEPTH_ATTACHMENT : GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+                    if (depth) glDrawBuffer(GL_NONE);
                     int status = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
                     if (status != GL_FRAMEBUFFER_COMPLETE) throw new IllegalStateException("Shared GL framebuffer incomplete: " + status);
                 } finally { glBindFramebuffer(GL_DRAW_FRAMEBUFFER, previous); }

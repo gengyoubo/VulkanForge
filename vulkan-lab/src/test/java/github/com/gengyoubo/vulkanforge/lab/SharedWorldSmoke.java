@@ -31,6 +31,15 @@ final class SharedWorldSmoke {
                             && Byte.toUnsignedInt(pixels.get(offset + 3)) == 255, "Section output/stale texture: frame=" + frame + " section=" + (y * 9 + x));
                 }
             } finally { MemoryUtil.memFree(pixels); }
+            if (frame == 0 || frame == 11) {
+                int depth = (int)backend.worldStats()[9];
+                java.nio.FloatBuffer depths = MemoryUtil.memAllocFloat(width * height);
+                int bound = glGetInteger(GL_TEXTURE_BINDING_2D);
+                try {
+                    glBindTexture(GL_TEXTURE_2D, depth); glGetTexImage(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, GL_FLOAT, depths);
+                    require(Math.abs(depths.get(height / 2 * width + width / 2) - .6f) < .00001f, "Shared depth was not stored/exported");
+                } finally { glBindTexture(GL_TEXTURE_2D, bound); MemoryUtil.memFree(depths); }
+            }
             backend.finishWorldFrame();
         }
         long[] stats = backend.worldStats();
@@ -43,13 +52,14 @@ final class SharedWorldSmoke {
         requireAlpha(backend.renderWorld(270, 150), 270, 150, 0);
         backend.finishWorldFrame();
         send.accept(new WorldProtocol.Reset(2));
+        require(backend.worldStats()[10] > 0 && backend.worldStats()[12] >= 45, "GPU compute culling did not reject off-screen sections");
         send.accept(mesh(1, 99, 0, 0));
         require(backend.worldStats()[2] == 0 && backend.renderWorld(270, 150) == 0, "Stale mesh survived reset");
         backend.closeWorld();
         requireAlpha(backend.renderWorld(180, 100), 180, 100, 255); // Reopen as menu preview, close with a GL read lease open.
         backend.closeWorld();
         require(glGetError() == GL_NO_ERROR, "GL error in shared world path");
-        System.out.println("SHARED_WORLD_SMOKE=OK sections=45 draws=" + stats[7] + " (same-process textures, both slots, fresh pixels, resize, camera, removal, reset and reopen)");
+        System.out.println("SHARED_WORLD_SMOKE=OK sections=45 draws=" + stats[7] + " (shared color/depth, compute culling, both slots, fresh pixels, resize, camera, removal, reset and reopen)");
     }
     private static void requireAlpha(int texture, int width, int height, int alpha) {
         ByteBuffer pixels = read(texture, width, height);
