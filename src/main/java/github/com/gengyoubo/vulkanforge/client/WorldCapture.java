@@ -6,6 +6,7 @@ import dev.vulkanforge.bridge.WorldProtocol;
 import github.com.gengyoubo.vulkanforge.VulkanForge;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.ItemBlockRenderTypes;
 import net.minecraft.client.renderer.RenderType;
 import net.minecraft.client.renderer.block.ModelBlockRenderer;
 import net.minecraft.core.BlockPos;
@@ -23,15 +24,16 @@ import java.nio.*;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicLong;
 
-/** Render-thread capture of vanilla solid/cutout geometry, bounded to 3x3x5 sections. */
+/** Render-thread capture of vanilla solid/cutout/translucent block and fluid geometry around the camera. */
 final class WorldCapture {
     private static final AtomicLong EPOCHS = new AtomicLong();
-    private final Map<Long, byte[]> sent = new HashMap<>();
+    /** Last published {opaque, translucent} vertices per section. */
+    private final Map<Long, byte[][]> sent = new HashMap<>();
     private final Set<Long> valid = new HashSet<>(), invalidated = new HashSet<>();
     private final Set<Long> dirty = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private volatile int centerX, centerY, centerZ, radius = 1;
     private long completedBuilds;
-    private final BufferBuilder builder = new BufferBuilder(262144);
+    private final BufferBuilder builder = new BufferBuilder(262144), translucentBuilder = new BufferBuilder(65536);
     private ClientLevel level;
     private long epoch, nextBuild;
     private int cursor, textureCursor;
@@ -41,6 +43,7 @@ final class WorldCapture {
     private long nextTexturePoll;
     private long atlasPatches, lightUpdates;
     private int cutoutBlocks;
+    private long translucentQuads, fluidBlocks;
     private final TextureCapture.Readback atlasReadback = new TextureCapture.Readback();
     private final TextureCapture.Readback lightReadback = new TextureCapture.Readback();
     private SectionBuild build;
@@ -61,11 +64,17 @@ final class WorldCapture {
             states = level.getChunk(section.x(), section.z()).getSection(level.getSectionIndexFromSectionY(section.y()));
             empty = states.hasOnlyAir();
             modelData = empty ? Map.of() : level.getModelDataManager().getAt(new ChunkPos(section.x(), section.z()));
-            if (!empty) { builder.begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.BLOCK); bufferOpen = true; }
+            if (!empty) {
+                builder.begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.BLOCK);
+                translucentBuilder.begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.BLOCK); bufferOpen = true;
+            }
         }
     }
     private void cancelBuild() {
-        if (build != null && build.bufferOpen) { builder.end().release(); builder.discard(); }
+        if (build != null && build.bufferOpen) {
+            builder.end().release(); builder.discard();
+            translucentBuilder.end().release(); translucentBuilder.discard();
+        }
         build = null;
     }
 
@@ -83,6 +92,8 @@ final class WorldCapture {
     long atlasPatches() { return atlasPatches; }
     long lightUpdates() { return lightUpdates; }
     int cutoutBlocks() { return cutoutBlocks; }
+    long translucentQuads() { return translucentQuads; }
+    long fluidBlocks() { return fluidBlocks; }
     void invalidate() { level = null; }
     void close() {
         cancelBuild(); atlasReadback.close(); lightReadback.close(); invalidate();
@@ -103,7 +114,7 @@ final class WorldCapture {
             level = mc.level;
             epoch = EPOCHS.incrementAndGet();
             sent.clear(); valid.clear(); invalidated.clear(); dirty.clear(); cursor = 0; atlasSent = false;
-            atlasSnapshot = null; lightSnapshot = null; nextTexturePoll = 0; cutoutBlocks = 0;
+            atlasSnapshot = null; lightSnapshot = null; nextTexturePoll = 0; cutoutBlocks = 0; translucentQuads = fluidBlocks = 0;
             textureCursor = 0;
             bridge.reset(epoch);
             VulkanForge.LOGGER.info("Vulkan world capture reset: epoch={}, dimension={}", epoch, level.dimension().location());
@@ -161,16 +172,19 @@ final class WorldCapture {
         }
         SectionPos selected = build.section;
         long start = System.nanoTime();
-        byte[] vertices = captureSection(mc, build);
+        byte[][] vertices = captureSection(mc, build);
         long elapsed = System.nanoTime() - start; buildSlices++; buildNanos += elapsed; maxBuildNanos = Math.max(maxBuildNanos, elapsed);
         if (vertices == null) return;
         build = null;
         completedBuilds++;
         if (dirty.contains(selected.asLong())) return;
-        if ((!valid.contains(selected.asLong()) || !Arrays.equals(sent.get(selected.asLong()), vertices)) && bridge.send(new WorldProtocol.Mesh(epoch, selected.asLong(), selected.minBlockX(), selected.minBlockY(), selected.minBlockZ(), vertices))) {
+        if ((!valid.contains(selected.asLong()) || !Arrays.deepEquals(sent.get(selected.asLong()), vertices))
+                && bridge.send(new WorldProtocol.Mesh(epoch, selected.asLong(), selected.minBlockX(), selected.minBlockY(), selected.minBlockZ(), vertices[0], vertices[1]))) {
             sent.put(selected.asLong(), vertices);
+            translucentQuads += vertices[1].length / (6 * WorldProtocol.STRIDE);
             valid.add(selected.asLong()); invalidated.remove(selected.asLong());
-            if (sent.size() == 1 || sent.size() % 15 == 0) VulkanForge.LOGGER.info("Vulkan world mesh: sections={}, lastVertices={}", sent.size(), vertices.length / WorldProtocol.STRIDE);
+            if (sent.size() == 1 || sent.size() % 15 == 0) VulkanForge.LOGGER.info("Vulkan world mesh: sections={}, lastVertices={}, translucentVertices={}", sent.size(),
+                    vertices[0].length / WorldProtocol.STRIDE, vertices[1].length / WorldProtocol.STRIDE);
         } else if (!valid.contains(selected.asLong())) dirty.add(selected.asLong());
     }
 
@@ -213,51 +227,68 @@ final class WorldCapture {
         return true;
     }
 
-    private byte[] captureSection(Minecraft mc, SectionBuild job) {
-        if (job.empty) return new byte[0];
+    /** Returns {opaque, translucent} triangle vertices, or null when the 1 ms slice ran out. */
+    private byte[][] captureSection(Minecraft mc, SectionBuild job) {
+        if (job.empty) return new byte[][]{new byte[0], new byte[0]};
         SectionPos section = job.section;
         var states = job.states; var modelData = job.modelData;
         var poses = job.poses; var random = job.random; var pos = job.pos;
         long deadline = System.nanoTime() + 1_000_000L;
         ModelBlockRenderer.enableCaching();
-        BufferBuilder.RenderedBuffer rendered = null;
+        BufferBuilder.RenderedBuffer rendered = null, translucent = null;
         try {
             while (job.next < 4096) {
                 if (System.nanoTime() >= deadline) return null;
                 int index = job.next++, x = index & 15, z = (index >>> 4) & 15, y = index >>> 8;
                 var state = states.getBlockState(x, y, z);
-                if (state.getRenderShape() != RenderShape.MODEL) continue;
+                var fluid = state.getFluidState();
                 pos.set(section.minBlockX() + x, section.minBlockY() + y, section.minBlockZ() + z);
+                if (!fluid.isEmpty()) {
+                    // Water blocks have no MODEL shape; LiquidBlockRenderer already emits section-relative (pos & 15) positions.
+                    RenderType layer = ItemBlockRenderTypes.getRenderLayer(fluid);
+                    BufferBuilder target = layer == RenderType.translucent() ? translucentBuilder : opaque(layer) ? builder : null;
+                    if (target != null) { mc.getBlockRenderer().renderLiquid(pos, level, target, state, fluid); fluidBlocks++; }
+                }
+                if (state.getRenderShape() != RenderShape.MODEL) continue;
                 var model = mc.getBlockRenderer().getBlockModel(state);
                 ModelData data = model.getModelData(level, pos, state, modelData.getOrDefault(pos, ModelData.EMPTY));
                 random.setSeed(state.getSeed(pos));
                 for (RenderType type : model.getRenderTypes(state, random, data)) {
-                    if (type != RenderType.solid() && type != RenderType.cutout() && type != RenderType.cutoutMipped()) continue;
-                    if (type != RenderType.solid()) cutoutBlocks++;
+                    BufferBuilder target = type == RenderType.translucent() ? translucentBuilder : opaque(type) ? builder : null;
+                    if (target == null) continue;
+                    if (type == RenderType.cutout() || type == RenderType.cutoutMipped()) cutoutBlocks++;
                     poses.pushPose(); poses.translate(x, y, z);
-                    mc.getBlockRenderer().renderBatched(state, pos, level, poses, builder, true, random, data, type);
+                    mc.getBlockRenderer().renderBatched(state, pos, level, poses, target, true, random, data, type);
                     poses.popPose();
                 }
             }
-            rendered = builder.end();
+            rendered = builder.end(); translucent = translucentBuilder.end();
             job.bufferOpen = false;
-            int vertices = rendered.drawState().vertexCount();
-            int stride = DefaultVertexFormat.BLOCK.getVertexSize();
-            if (vertices % 4 != 0 || (long) vertices / 4 * 6 * WorldProtocol.STRIDE > WorldProtocol.MAX_MESH_BYTES) throw new IllegalStateException("Invalid or oversized solid section mesh");
-            ByteBuffer input = rendered.vertexBuffer().order(ByteOrder.LITTLE_ENDIAN);
-            ByteBuffer output = ByteBuffer.allocate(vertices / 4 * 6 * WorldProtocol.STRIDE).order(ByteOrder.LITTLE_ENDIAN);
-            int[] triangles = {0, 1, 2, 2, 3, 0};
-            for (int quad = 0; quad < vertices; quad += 4) for (int corner : triangles) {
-                int offset = (quad + corner) * stride;
-                output.putFloat(input.getFloat(offset)).putFloat(input.getFloat(offset + 4)).putFloat(input.getFloat(offset + 8));
-                output.putInt(input.getInt(offset + 12));
-                output.putFloat(input.getFloat(offset + 16)).putFloat(input.getFloat(offset + 20));
-                output.putShort(input.getShort(offset + 24)).putShort(input.getShort(offset + 26));
-            }
-            return output.array();
+            return new byte[][]{triangles(rendered), triangles(translucent)};
         } finally {
             if (rendered != null) rendered.release();
+            if (translucent != null) translucent.release();
             ModelBlockRenderer.clearCache();
         }
+    }
+
+    private static boolean opaque(RenderType type) { return type == RenderType.solid() || type == RenderType.cutout() || type == RenderType.cutoutMipped(); }
+
+    /** BLOCK-format quads -> 6 protocol vertices per quad (0,1,2 / 2,3,0). */
+    private static byte[] triangles(BufferBuilder.RenderedBuffer rendered) {
+        int vertices = rendered.drawState().vertexCount();
+        int stride = DefaultVertexFormat.BLOCK.getVertexSize();
+        if (vertices % 4 != 0 || (long) vertices / 4 * 6 * WorldProtocol.STRIDE > WorldProtocol.MAX_MESH_BYTES) throw new IllegalStateException("Invalid or oversized section mesh");
+        ByteBuffer input = rendered.vertexBuffer().order(ByteOrder.LITTLE_ENDIAN);
+        ByteBuffer output = ByteBuffer.allocate(vertices / 4 * 6 * WorldProtocol.STRIDE).order(ByteOrder.LITTLE_ENDIAN);
+        int[] corners = {0, 1, 2, 2, 3, 0};
+        for (int quad = 0; quad < vertices; quad += 4) for (int corner : corners) {
+            int offset = (quad + corner) * stride;
+            output.putFloat(input.getFloat(offset)).putFloat(input.getFloat(offset + 4)).putFloat(input.getFloat(offset + 8));
+            output.putInt(input.getInt(offset + 12));
+            output.putFloat(input.getFloat(offset + 16)).putFloat(input.getFloat(offset + 20));
+            output.putShort(input.getShort(offset + 24)).putShort(input.getShort(offset + 26));
+        }
+        return output.array();
     }
 }

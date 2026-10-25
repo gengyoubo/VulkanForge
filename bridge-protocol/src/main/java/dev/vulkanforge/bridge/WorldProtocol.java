@@ -10,7 +10,10 @@ public final class WorldProtocol {
     public sealed interface Command permits Reset, Atlas, Mesh, Remove, Camera, TexturePatch { long epoch(); }
     public record Reset(long epoch) implements Command { }
     public record Atlas(long epoch, int width, int height, byte[] rgba) implements Command { }
-    public record Mesh(long epoch, long key, int x, int y, int z, byte[] vertices) implements Command { }
+    /** vertices: solid/cutout triangles drawn opaque; translucent: triangles (6 vertices per source quad) sorted back to front. */
+    public record Mesh(long epoch, long key, int x, int y, int z, byte[] vertices, byte[] translucent) implements Command {
+        public Mesh(long epoch, long key, int x, int y, int z, byte[] vertices) { this(epoch, key, x, y, z, vertices, new byte[0]); }
+    }
     public record Remove(long epoch, long key) implements Command { }
     public record Camera(long epoch, double x, double y, double z, float[] matrix, float red, float green, float blue) implements Command { }
     public static final int BLOCK_ATLAS = 0, LIGHT_MAP = 1;
@@ -24,7 +27,7 @@ public final class WorldProtocol {
         long epoch = command.epoch();
         if (command instanceof Reset) return new Object[]{1, epoch};
         if (command instanceof Atlas a) return new Object[]{2, epoch, a.width(), a.height(), a.rgba()};
-        if (command instanceof Mesh m) return new Object[]{3, epoch, m.key(), m.x(), m.y(), m.z(), m.vertices()};
+        if (command instanceof Mesh m) return new Object[]{3, epoch, m.key(), m.x(), m.y(), m.z(), m.vertices(), m.translucent()};
         if (command instanceof Remove r) return new Object[]{4, epoch, r.key()};
         if (command instanceof Camera c) return new Object[]{5, epoch, c.x(), c.y(), c.z(), c.matrix(), c.red(), c.green(), c.blue()};
         TexturePatch p = (TexturePatch) command;
@@ -36,7 +39,7 @@ public final class WorldProtocol {
         return switch ((Integer) p[0]) {
             case 1 -> new Reset(epoch);
             case 2 -> new Atlas(epoch, (Integer)p[2], (Integer)p[3], (byte[])p[4]);
-            case 3 -> new Mesh(epoch, (Long)p[2], (Integer)p[3], (Integer)p[4], (Integer)p[5], (byte[])p[6]);
+            case 3 -> new Mesh(epoch, (Long)p[2], (Integer)p[3], (Integer)p[4], (Integer)p[5], (byte[])p[6], (byte[])p[7]);
             case 4 -> new Remove(epoch, (Long)p[2]);
             case 5 -> new Camera(epoch, (Double)p[2], (Double)p[3], (Double)p[4], (float[])p[5], (Float)p[6], (Float)p[7], (Float)p[8]);
             case 6 -> new TexturePatch(epoch, (Integer)p[2], (Integer)p[3], (Integer)p[4], (Integer)p[5], (Integer)p[6], (byte[])p[7]);
@@ -52,6 +55,7 @@ public final class WorldProtocol {
         } else if (command instanceof Mesh mesh) {
             out.writeLong(mesh.key()); out.writeInt(mesh.x()); out.writeInt(mesh.y()); out.writeInt(mesh.z());
             out.writeInt(mesh.vertices().length); out.write(mesh.vertices());
+            out.writeInt(mesh.translucent().length); out.write(mesh.translucent());
         } else if (command instanceof TexturePatch patch) {
             out.writeInt(patch.target()); out.writeInt(patch.x()); out.writeInt(patch.y());
             out.writeInt(patch.width()); out.writeInt(patch.height()); out.writeInt(patch.rgba().length); out.write(patch.rgba());
@@ -79,7 +83,10 @@ public final class WorldProtocol {
                 long key = in.readLong(); int x = in.readInt(), y = in.readInt(), z = in.readInt(), size = in.readInt();
                 if (size < 0 || size > MAX_MESH_BYTES || size % (STRIDE * 3) != 0) throw new IOException("Invalid section mesh size");
                 byte[] data = new byte[size]; in.readFully(data);
-                yield new Mesh(epoch, key, x, y, z, data);
+                int translucentSize = in.readInt();
+                if (translucentSize < 0 || translucentSize > MAX_MESH_BYTES || translucentSize % (STRIDE * 6) != 0) throw new IOException("Invalid translucent mesh size");
+                byte[] translucent = new byte[translucentSize]; in.readFully(translucent);
+                yield new Mesh(epoch, key, x, y, z, data, translucent);
             }
             case 4 -> new Remove(epoch, in.readLong());
             case 5 -> {

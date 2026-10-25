@@ -134,7 +134,7 @@ public final class NativeMainWindow {
     }
     static int renderWorld(int width, int height) { return active() ? ((Number)call(renderWorld, width, height)).intValue() : 0; }
     static boolean worldVisible() { return active() && GLFW.glfwGetWindowAttrib(mainWindow, GLFW.GLFW_ICONIFIED) == 0; }
-    static long[] worldStats() { return active() ? (long[])call(worldStats) : new long[9]; }
+    static long[] worldStats() { return active() ? (long[])call(worldStats) : new long[18]; }
     static void closeWorld() { if (active()) call(closeWorld); }
     public static long acquiresBeforeInput() { return active() ? ((Number) call(earlyAcquires)).longValue() : 0; }
     public static long acquiresAfterRender() { return active() ? ((Number) call(lateAcquires)).longValue() : 0; }

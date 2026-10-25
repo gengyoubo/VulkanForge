@@ -54,6 +54,7 @@ public final class ClientEvents {
     public static void terrain(RenderLevelStageEvent event) {
         // This stage carries the view pose; AFTER_LEVEL in 1.20.1 carries a different pose stack.
         if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_CUTOUT_BLOCKS) VulkanPreview.terrain(event);
+        else if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_TRANSLUCENT_BLOCKS) VulkanPreview.translucent();
     }
 
     @SubscribeEvent
@@ -91,6 +92,9 @@ public final class ClientEvents {
             event.registerShader(new net.minecraft.client.renderer.ShaderInstance(event.getResourceProvider(),
                     net.minecraft.resources.ResourceLocation.fromNamespaceAndPath(VulkanForge.MOD_ID, "terrain_composite"),
                     com.mojang.blaze3d.vertex.DefaultVertexFormat.POSITION_TEX), TerrainPresenter::shader);
+            event.registerShader(new net.minecraft.client.renderer.ShaderInstance(event.getResourceProvider(),
+                    net.minecraft.resources.ResourceLocation.fromNamespaceAndPath(VulkanForge.MOD_ID, "terrain_translucent"),
+                    com.mojang.blaze3d.vertex.DefaultVertexFormat.POSITION_TEX), TerrainPresenter::translucentShader);
         }
         @SubscribeEvent
         public static void keys(RegisterKeyMappingsEvent event) { event.register(PREVIEW); event.register(TRIANGLE); event.register(INSET); }

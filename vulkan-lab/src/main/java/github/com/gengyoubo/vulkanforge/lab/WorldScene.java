@@ -10,15 +10,61 @@ import static org.lwjgl.vulkan.VK13.*;
 
 /** GPU section cache. Commands are applied on the Vulkan thread after the previous frame fence. */
 final class WorldScene implements AutoCloseable {
-    private record Section(int x, int y, int z, int vertices, GpuBuffer buffer, float[] bounds) implements AutoCloseable {
-        @Override public void close() { buffer.close(); }
+    /** buffer is null when the section only has translucent geometry; translucent is null when it has none. */
+    private record Section(int x, int y, int z, int vertices, GpuBuffer buffer, float[] bounds, Translucent translucent) implements AutoCloseable {
+        @Override public void close() { if (buffer != null) buffer.close(); if (translucent != null) translucent.close(); }
+    }
+    /** Frame slots that may record translucent draws concurrently; matches SharedWorldRenderer. */
+    static final int TRANSLUCENT_SLOTS = 2;
+    /** Re-sorts beyond a section's first sort per slot, per frame; the nearest stale sections go first. */
+    private static final int RESORT_BUDGET = 16;
+    /** Triangles stay in quad order (6 vertices per quad); each frame slot owns an index buffer it rewrites only after its fence. */
+    private final class Translucent implements AutoCloseable {
+        final GpuBuffer vertices;
+        final GpuBuffer[] indices = new GpuBuffer[TRANSLUCENT_SLOTS];
+        final int quads;
+        final float[] centers;
+        final double[] sortedAt = new double[TRANSLUCENT_SLOTS * 3];
+        final boolean[] sorted = new boolean[TRANSLUCENT_SLOTS];
+        Translucent(byte[] bytes) {
+            quads = bytes.length / (6 * WorldProtocol.STRIDE);
+            centers = new float[quads * 3];
+            var data = java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            int[] corners = {0, 1, 2, 4}; // the four distinct quad corners among 0,1,2 / 2,3,0
+            for (int quad = 0; quad < quads; quad++) for (int corner : corners) for (int axis = 0; axis < 3; axis++)
+                centers[quad * 3 + axis] += data.getFloat((quad * 6 + corner) * WorldProtocol.STRIDE + axis * 4) * .25f;
+            GpuBuffer created = new GpuBuffer(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+            try { for (int slot = 0; slot < TRANSLUCENT_SLOTS; slot++) indices[slot] = new GpuBuffer(context, quads * 6 * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT); }
+            catch (Throwable error) { created.close(); for (GpuBuffer index : indices) if (index != null) index.close(); throw error; }
+            vertices = created;
+        }
+        boolean stale(int slot, double x, double y, double z) {
+            double dx = x - sortedAt[slot * 3], dy = y - sortedAt[slot * 3 + 1], dz = z - sortedAt[slot * 3 + 2];
+            return !sorted[slot] || dx * dx + dy * dy + dz * dz > 1;
+        }
+        /** x/y/z: camera relative to the section origin. Farthest quad first. */
+        void sort(int slot, double x, double y, double z) {
+            long[] keys = new long[quads];
+            for (int quad = 0; quad < quads; quad++) {
+                float dx = (float)(centers[quad * 3] - x), dy = (float)(centers[quad * 3 + 1] - y), dz = (float)(centers[quad * 3 + 2] - z);
+                // Non-negative float bits order like the floats themselves.
+                keys[quad] = (long) Float.floatToIntBits(dx * dx + dy * dy + dz * dz) << 32 | quad;
+            }
+            Arrays.sort(keys);
+            var out = indices[slot].mapped.asIntBuffer();
+            for (int i = quads - 1; i >= 0; i--) { int base = (int) keys[i] * 6; for (int k = 0; k < 6; k++) out.put(base + k); }
+            sortedAt[slot * 3] = x; sortedAt[slot * 3 + 1] = y; sortedAt[slot * 3 + 2] = z; sorted[slot] = true;
+            translucentSorts++;
+        }
+        @Override public void close() { vertices.close(); for (GpuBuffer index : indices) if (index != null) index.close(); }
     }
     private final VulkanContext context;
     private final Map<Long, Section> sections = new LinkedHashMap<>();
     private final Set<Long> tracked = new HashSet<>();
     private final java.util.function.Consumer<String> log;
     private int peakSections;
-    private long epoch, descriptorLayout, descriptorPool, descriptorSet, layout, pipeline, sampler, lightSampler, pool, fence;
+    private long epoch, descriptorLayout, descriptorPool, descriptorSet, layout, pipeline, translucentPipeline, sampler, lightSampler, pool, fence;
+    private long translucentSorts, translucentDraws;
     private GpuImage atlas, lightMap;
     private long atlasPatches, lightUpdates;
     private VkCommandBuffer upload;
@@ -47,6 +93,7 @@ final class WorldScene implements AutoCloseable {
             var layoutInfo = VkPipelineLayoutCreateInfo.calloc(stack).sType$Default().pSetLayouts(stack.longs(descriptorLayout)).pPushConstantRanges(push);
             check(vkCreatePipelineLayout(context.device, layoutInfo, null, handle), "world pipeline layout"); layout = handle.get(0);
             pipeline = GraphicsPipeline.create(context, layout, VK_FORMAT_R8G8B8A8_UNORM, "/shaders/world.vert", true, stack);
+            translucentPipeline = GraphicsPipeline.create(context, layout, VK_FORMAT_R8G8B8A8_UNORM, "/shaders/world.vert", "/shaders/world_translucent.frag", true, true, stack);
             var samplerInfo = VkSamplerCreateInfo.calloc(stack).sType$Default().magFilter(VK_FILTER_NEAREST).minFilter(VK_FILTER_NEAREST)
                     .mipmapMode(VK_SAMPLER_MIPMAP_MODE_NEAREST).addressModeU(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
                     .addressModeV(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE).addressModeW(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE).maxLod(0);
@@ -77,13 +124,20 @@ final class WorldScene implements AutoCloseable {
         else if (command instanceof WorldProtocol.Mesh mesh) {
             receivedMesh = true;
             if (tracked.size() >= GpuCuller.CAPACITY && !tracked.contains(mesh.key())) throw new IllegalStateException("World section cache limit exceeded");
-            Section replacement = mesh.vertices().length == 0 ? null : new Section(mesh.x(), mesh.y(), mesh.z(), mesh.vertices().length / WorldProtocol.STRIDE,
-                    new GpuBuffer(context, mesh.vertices(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT), bounds(mesh.vertices()));
+            Section replacement = null;
+            if (mesh.vertices().length > 0 || mesh.translucent().length > 0) {
+                GpuBuffer opaque = mesh.vertices().length == 0 ? null : new GpuBuffer(context, mesh.vertices(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+                try {
+                    replacement = new Section(mesh.x(), mesh.y(), mesh.z(), mesh.vertices().length / WorldProtocol.STRIDE, opaque,
+                            bounds(mesh.vertices().length > 0 ? mesh.vertices() : mesh.translucent()), mesh.translucent().length == 0 ? null : new Translucent(mesh.translucent()));
+                } catch (Throwable error) { if (opaque != null) opaque.close(); throw error; }
+            }
             Section old = sections.remove(mesh.key());
             if (old != null) retirement.accept(old::close);
             if (replacement != null) sections.put(mesh.key(), replacement);
             tracked.add(mesh.key()); peakSections = Math.max(peakSections, tracked.size());
-            log.accept("WORLD_MESH=" + mesh.key() + " vertices=" + mesh.vertices().length / WorldProtocol.STRIDE + " cached=" + sections.size() + " tracked=" + tracked.size());
+            log.accept("WORLD_MESH=" + mesh.key() + " vertices=" + mesh.vertices().length / WorldProtocol.STRIDE + " translucent=" + mesh.translucent().length / WorldProtocol.STRIDE
+                    + " cached=" + sections.size() + " tracked=" + tracked.size());
         }
     }
 
@@ -93,6 +147,9 @@ final class WorldScene implements AutoCloseable {
     int trackedSections() { return tracked.size(); }
     int peakSections() { return peakSections; }
     int drawableSections() { return sections.size(); }
+    int translucentSections() { int count = 0; for (Section section : sections.values()) if (section.translucent() != null) count++; return count; }
+    long translucentSorts() { return translucentSorts; }
+    long translucentDraws() { return translucentDraws; }
     float red() { return camera.red(); }
     float green() { return camera.green(); }
     float blue() { return camera.blue(); }
@@ -200,12 +257,53 @@ final class WorldScene implements AutoCloseable {
             // Subtract in double before conversion: preserves precision at large world coordinates.
             push.put(16, (float) (section.x() - camera.x())).put(17, (float) (section.y() - camera.y())).put(18, (float) (section.z() - camera.z()));
             vkCmdPushConstants(command, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, push);
-            buffers.put(0, section.buffer().buffer);
-            vkCmdBindVertexBuffers(command, 0, buffers, offsets);
-            if (culler == null) vkCmdDraw(command, section.vertices(), 1, 0, 0);
-            else culler.draw(command, slot, index);
+            if (section.buffer() != null) {
+                buffers.put(0, section.buffer().buffer);
+                vkCmdBindVertexBuffers(command, 0, buffers, offsets);
+                if (culler == null) vkCmdDraw(command, section.vertices(), 1, 0, 0);
+                else culler.draw(command, slot, index);
+            }
             index++;
         }
+    }
+
+    /** Back-to-front sections, each with back-to-front quads; drawn after opaque terrain into the translucent target. */
+    void drawTranslucent(VkCommandBuffer command, MemoryStack stack, int slot) {
+        if (slot < 0 || slot >= TRANSLUCENT_SLOTS) throw new IllegalArgumentException("Translucent slot out of range: " + slot);
+        List<Section> ordered = new ArrayList<>();
+        for (Section section : sections.values()) if (section.translucent() != null) ordered.add(section);
+        if (ordered.isEmpty()) return;
+        ordered.sort(Comparator.comparingDouble(section -> -distanceSquared(section)));
+        int resorts = 0;
+        // Nearest stale sections spend the re-sort budget first; never-sorted slots are always filled before use.
+        for (int i = ordered.size() - 1; i >= 0; i--) {
+            Section section = ordered.get(i); Translucent translucent = section.translucent();
+            double x = camera.x() - section.x(), y = camera.y() - section.y(), z = camera.z() - section.z();
+            if (!translucent.sorted[slot]) translucent.sort(slot, x, y, z);
+            else if (resorts < RESORT_BUDGET && translucent.stale(slot, x, y, z)) { translucent.sort(slot, x, y, z); resorts++; }
+        }
+        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, translucentPipeline);
+        vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, stack.longs(descriptorSet), null);
+        var push = stack.mallocFloat(20);
+        push.put(camera.matrix());
+        push.put(0).put(0).put(0).put(0).flip();
+        var buffers = stack.mallocLong(1);
+        var offsets = stack.longs(0);
+        for (Section section : ordered) {
+            Translucent translucent = section.translucent();
+            push.put(16, (float) (section.x() - camera.x())).put(17, (float) (section.y() - camera.y())).put(18, (float) (section.z() - camera.z()));
+            vkCmdPushConstants(command, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, push);
+            buffers.put(0, translucent.vertices.buffer);
+            vkCmdBindVertexBuffers(command, 0, buffers, offsets);
+            vkCmdBindIndexBuffer(command, translucent.indices[slot].buffer, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(command, translucent.quads * 6, 1, 0, 0, 0);
+            translucentDraws++;
+        }
+    }
+
+    private double distanceSquared(Section section) {
+        double x = section.x() + 8 - camera.x(), y = section.y() + 8 - camera.y(), z = section.z() + 8 - camera.z();
+        return x * x + y * y + z * z;
     }
 
     private void clear() {
@@ -217,6 +315,7 @@ final class WorldScene implements AutoCloseable {
     @Override public void close() {
         vkDeviceWaitIdle(context.device); clear();
         if (pipeline != 0) { vkDestroyPipeline(context.device, pipeline, null); pipeline = 0; }
+        if (translucentPipeline != 0) { vkDestroyPipeline(context.device, translucentPipeline, null); translucentPipeline = 0; }
         if (layout != 0) { vkDestroyPipelineLayout(context.device, layout, null); layout = 0; }
         if (descriptorPool != 0) { vkDestroyDescriptorPool(context.device, descriptorPool, null); descriptorPool = 0; }
         if (descriptorLayout != 0) { vkDestroyDescriptorSetLayout(context.device, descriptorLayout, null); descriptorLayout = 0; }

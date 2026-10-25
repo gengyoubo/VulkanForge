@@ -29,7 +29,8 @@ final class SharedPresentImage implements AutoCloseable {
             var info = VkImageCreateInfo.calloc(stack).sType$Default().pNext(external.address()).imageType(VK_IMAGE_TYPE_2D)
                     .format(format).extent(e -> e.set(width, height, 1)).mipLevels(1).arrayLayers(1)
                     .samples(VK_SAMPLE_COUNT_1_BIT).tiling(VK_IMAGE_TILING_OPTIMAL).sharingMode(VK_SHARING_MODE_EXCLUSIVE)
-                    .usage((depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+                    // Depth targets are also copy destinations: translucent depth starts as a copy of opaque depth.
+                    .usage((depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
             check(vkCreateImage(context.device, info, null, handle), "create shared presentation image"); image = handle.get(0);
             var requirements = VkMemoryRequirements.calloc(stack); vkGetImageMemoryRequirements(context.device, image, requirements);
             var dedicated = VkMemoryDedicatedAllocateInfo.calloc(stack).sType$Default().image(image);

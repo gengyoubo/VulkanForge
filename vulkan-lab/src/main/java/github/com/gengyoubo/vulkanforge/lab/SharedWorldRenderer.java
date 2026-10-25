@@ -15,6 +15,9 @@ final class SharedWorldRenderer implements AutoCloseable {
     private static final class Slot {
         SharedPresentImage color;
         SharedPresentImage depth;
+        SharedPresentImage translucentColor, translucentDepth;
+        /** Order fixes semaphore wait stages in render(). */
+        SharedPresentImage[] images() { return new SharedPresentImage[]{color, depth, translucentColor, translucentDepth}; }
         VkCommandBuffer command;
         long fence;
         boolean used, pending;
@@ -34,7 +37,10 @@ final class SharedWorldRenderer implements AutoCloseable {
     private long pool, triangleLayout, trianglePipeline, frames, terrainFrames, sectionDraws;
     private final long started = System.nanoTime();
     private int width, height, generations, reading = -1;
-    private int depthTexture;
+    private int depthTexture, translucentTexture, translucentDepthTexture;
+    private long translucentSectionDraws;
+    private static final long DEPTH_STAGES = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    private static final long DEPTH_ACCESS = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
     SharedWorldRenderer(VulkanContext context, Function<long[], Consumer<int[]>> importer, Runnable finishGL, Consumer<String> log) {
         this.context = context; this.importer = importer; this.finishGL = finishGL; this.log = log;
@@ -44,7 +50,7 @@ final class SharedWorldRenderer implements AutoCloseable {
             world.retireUsing(resource -> {
                 if (completedFrames >= frames) resource.run(); else retired.addLast(new Retired(frames, resource));
             });
-            timers = new GpuTimers(context, SLOT_COUNT, log, "TERRAIN", "TERRAIN_RELEASE", "TRIANGLE", "CULLING");
+            timers = new GpuTimers(context, SLOT_COUNT, log, "TERRAIN", "TERRAIN_RELEASE", "TRIANGLE", "CULLING", "TRANSLUCENT");
             var familyCount = stack.ints(0);
             vkGetPhysicalDeviceQueueFamilyProperties(context.physical, familyCount, null);
             var families = VkQueueFamilyProperties.calloc(familyCount.get(0), stack);
@@ -92,34 +98,25 @@ final class SharedWorldRenderer implements AutoCloseable {
             check(vkBeginCommandBuffer(command, VkCommandBufferBeginInfo.calloc(stack).sType$Default()
                     .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)), "begin shared world command");
             timers.begin(command, index);
-            var barriers = VkImageMemoryBarrier2.calloc(2, stack);
-            barriers.get(0).sType$Default().srcStageMask(slot.used ? VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_2_NONE)
-                    .dstStageMask(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT).dstAccessMask(VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT)
-                    .oldLayout(slot.used ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
-                    .srcQueueFamilyIndex(slot.used ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED)
-                    .dstQueueFamilyIndex(slot.used ? context.queueFamily : VK_QUEUE_FAMILY_IGNORED).image(slot.color.image)
-                    .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
-            barriers.get(1).sType$Default()
-                    .srcStageMask(slot.used ? VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT : VK_PIPELINE_STAGE_2_NONE)
-                    .dstStageMask(VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT)
-                    .dstAccessMask(VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)
-                    .oldLayout(slot.used ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-                    .srcQueueFamilyIndex(slot.used ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED)
-                    .dstQueueFamilyIndex(slot.used ? context.queueFamily : VK_QUEUE_FAMILY_IGNORED).image(slot.depth.image)
-                    .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).levelCount(1).layerCount(1));
-            vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barriers));
+            // Opaque color/depth feed the AFTER_CUTOUT composite; translucent color plus its own depth (a copy of opaque depth,
+            // then nearest translucent surface) feed the AFTER_TRANSLUCENT composite. All four are leased to GL every frame.
+            var acquire = VkImageMemoryBarrier2.calloc(4, stack);
+            acquireBarrier(acquire.get(0), slot, slot.color, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, false);
+            acquireBarrier(acquire.get(1), slot, slot.depth, DEPTH_STAGES, DEPTH_ACCESS, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, true);
+            acquireBarrier(acquire.get(2), slot, slot.translucentColor, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, false);
+            acquireBarrier(acquire.get(3), slot, slot.translucentDepth, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, true);
+            vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(acquire));
             var color = VkRenderingAttachmentInfo.calloc(1, stack).sType$Default().imageView(slot.color.view())
                     .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL).loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
             color.clearValue().color().float32(0, terrain ? world.red() : .025f).float32(1, terrain ? world.green() : .04f)
                     .float32(2, terrain ? world.blue() : .075f).float32(3, terrain ? 0 : 1);
             var rendering = VkRenderingInfo.calloc(stack).sType$Default().layerCount(1).pColorAttachments(color)
                     .renderArea(r -> r.offset(o -> o.set(0, 0)).extent(e -> e.set(width, height)));
-            if (terrain) {
-                var depth = VkRenderingAttachmentInfo.calloc(stack).sType$Default().imageView(slot.depth.view())
-                        .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL).loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
-                depth.clearValue().depthStencil().depth(1);
-                rendering.pDepthAttachment(depth);
-            }
+            var depth = VkRenderingAttachmentInfo.calloc(stack).sType$Default().imageView(slot.depth.view())
+                    .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL).loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+            depth.clearValue().depthStencil().depth(1);
+            // The menu triangle pipeline has no depth format; its depth contents are unused (translucent stays empty).
+            if (terrain) rendering.pDepthAttachment(depth);
             int metric = terrain ? 0 : 2;
             if (terrain && culler != null) {
                 timers.start(command, index, 3, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
@@ -128,8 +125,10 @@ final class SharedWorldRenderer implements AutoCloseable {
             }
             timers.start(command, index, metric, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             vkCmdBeginRendering(command, rendering);
-            vkCmdSetViewport(command, 0, VkViewport.calloc(1, stack).width(width).height(height).minDepth(0).maxDepth(1));
-            vkCmdSetScissor(command, 0, VkRect2D.calloc(1, stack).offset(o -> o.set(0, 0)).extent(e -> e.set(width, height)));
+            var viewport = VkViewport.calloc(1, stack).width(width).height(height).minDepth(0).maxDepth(1);
+            var scissor = VkRect2D.calloc(1, stack).offset(o -> o.set(0, 0)).extent(e -> e.set(width, height));
+            vkCmdSetViewport(command, 0, viewport);
+            vkCmdSetScissor(command, 0, scissor);
             if (terrain) world.draw(command, stack, culler, index);
             else {
                 vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, trianglePipeline);
@@ -139,49 +138,90 @@ final class SharedWorldRenderer implements AutoCloseable {
             }
             vkCmdEndRendering(command);
             timers.end(command, index, metric, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+            timers.start(command, index, 4, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+            var toCopy = VkImageMemoryBarrier2.calloc(1, stack);
+            layoutBarrier(toCopy.get(0), slot.depth, DEPTH_STAGES, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                    VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, true);
+            vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(toCopy));
+            var copy = VkImageCopy.calloc(1, stack).srcSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).layerCount(1))
+                    .dstSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).layerCount(1)).extent(e -> e.set(width, height, 1));
+            vkCmdCopyImage(command, slot.depth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.translucentDepth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy);
+            var toTest = VkImageMemoryBarrier2.calloc(1, stack);
+            layoutBarrier(toTest.get(0), slot.translucentDepth, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, DEPTH_STAGES, DEPTH_ACCESS,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, true);
+            vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(toTest));
+            var translucentColor = VkRenderingAttachmentInfo.calloc(1, stack).sType$Default().imageView(slot.translucentColor.view())
+                    .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL).loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+            translucentColor.clearValue().color().float32(0, 0).float32(1, 0).float32(2, 0).float32(3, 0);
+            var translucentDepth = VkRenderingAttachmentInfo.calloc(stack).sType$Default().imageView(slot.translucentDepth.view())
+                    .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL).loadOp(VK_ATTACHMENT_LOAD_OP_LOAD).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+            vkCmdBeginRendering(command, VkRenderingInfo.calloc(stack).sType$Default().layerCount(1).pColorAttachments(translucentColor).pDepthAttachment(translucentDepth)
+                    .renderArea(r -> r.offset(o -> o.set(0, 0)).extent(e -> e.set(width, height))));
+            vkCmdSetViewport(command, 0, viewport);
+            vkCmdSetScissor(command, 0, scissor);
+            if (terrain) world.drawTranslucent(command, stack, index);
+            vkCmdEndRendering(command);
+            timers.end(command, index, 4, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             timers.start(command, index, 1, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
-            var release = VkImageMemoryBarrier2.calloc(2, stack);
-            release.get(0).sType$Default().srcStageMask(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT)
-                    .srcAccessMask(VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT).dstStageMask(VK_PIPELINE_STAGE_2_NONE)
-                    .oldLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_GENERAL)
-                    .srcQueueFamilyIndex(context.queueFamily).dstQueueFamilyIndex(VK_QUEUE_FAMILY_EXTERNAL).image(slot.color.image)
-                    .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
-            release.get(1).sType$Default().srcStageMask(VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT)
-                    .srcAccessMask(VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)
-                    .oldLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_GENERAL)
-                    .srcQueueFamilyIndex(context.queueFamily).dstQueueFamilyIndex(VK_QUEUE_FAMILY_EXTERNAL).image(slot.depth.image)
-                    .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).levelCount(1).layerCount(1));
+            var release = VkImageMemoryBarrier2.calloc(4, stack);
+            releaseBarrier(release.get(0), slot.color, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, false);
+            releaseBarrier(release.get(1), slot.depth, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, true);
+            releaseBarrier(release.get(2), slot.translucentColor, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, false);
+            releaseBarrier(release.get(3), slot.translucentDepth, DEPTH_STAGES, DEPTH_ACCESS, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, true);
             vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(release));
             timers.end(command, index, 1, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             check(vkEndCommandBuffer(command), "end shared world command");
-            var signals = VkSemaphoreSubmitInfo.calloc(2, stack);
-            signals.get(0).sType$Default().semaphore(slot.color.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
-            signals.get(1).sType$Default().semaphore(slot.depth.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+            SharedPresentImage[] images = slot.images();
+            var signals = VkSemaphoreSubmitInfo.calloc(images.length, stack);
+            for (int i = 0; i < images.length; i++) signals.get(i).sType$Default().semaphore(images[i].ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             var submit = VkSubmitInfo2.calloc(1, stack).sType$Default()
                     .pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1, stack).sType$Default().commandBuffer(command)).pSignalSemaphoreInfos(signals);
             if (slot.used) {
-                var waits = VkSemaphoreSubmitInfo.calloc(2, stack);
-                waits.get(0).sType$Default().semaphore(slot.color.complete).stageMask(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
-                waits.get(1).sType$Default().semaphore(slot.depth.complete)
-                        .stageMask(VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT);
+                // Each wait stage matches the first use in this command buffer, which the acquire barriers chain from.
+                long[] stages = {VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, DEPTH_STAGES, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_2_COPY_BIT};
+                var waits = VkSemaphoreSubmitInfo.calloc(images.length, stack);
+                for (int i = 0; i < images.length; i++) waits.get(i).sType$Default().semaphore(images[i].complete).stageMask(stages[i]);
                 submit.pWaitSemaphoreInfos(waits);
             }
             check(vkResetFences(context.device, slot.fence), "reset shared world fence");
             check(vkQueueSubmit2(context.queue, submit, slot.fence), "submit shared world");
             slot.used = slot.pending = true; timers.submitted(index); frames++;
             slot.serial = frames;
-            if (terrain) { terrainFrames++; sectionDraws += world.drawableSections(); }
+            if (terrain) { terrainFrames++; sectionDraws += world.drawableSections(); translucentSectionDraws += world.translucentSections(); }
             // Keep the GL read lease open through terrain + HUD/inset sampling, and close it before final presentation.
             reading = index;
             int texture = slot.color.beginReadGL();
             depthTexture = slot.depth.beginReadGL();
+            translucentTexture = slot.translucentColor.beginReadGL();
+            translucentDepthTexture = slot.translucentDepth.beginReadGL();
             if (frames % 300 == 0) { log.accept("WORLD_RENDERED_FRAMES=" + frames + " sections=" + world.trackedSections()); timers.report(log); }
             return texture;
         }
     }
 
+    /** First use per frame: from the GL owner (GENERAL) or, on a fresh image, from UNDEFINED. */
+    private void acquireBarrier(VkImageMemoryBarrier2 barrier, Slot slot, SharedPresentImage image, long stage, long access, int layout, boolean depth) {
+        barrier.sType$Default().srcStageMask(slot.used ? stage : VK_PIPELINE_STAGE_2_NONE).dstStageMask(stage).dstAccessMask(access)
+                .oldLayout(slot.used ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED).newLayout(layout)
+                .srcQueueFamilyIndex(slot.used ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED)
+                .dstQueueFamilyIndex(slot.used ? context.queueFamily : VK_QUEUE_FAMILY_IGNORED).image(image.image)
+                .subresourceRange(r -> r.aspectMask(depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
+    }
+    private void releaseBarrier(VkImageMemoryBarrier2 barrier, SharedPresentImage image, long stage, long access, int layout, boolean depth) {
+        barrier.sType$Default().srcStageMask(stage).srcAccessMask(access).dstStageMask(VK_PIPELINE_STAGE_2_NONE)
+                .oldLayout(layout).newLayout(VK_IMAGE_LAYOUT_GENERAL)
+                .srcQueueFamilyIndex(context.queueFamily).dstQueueFamilyIndex(VK_QUEUE_FAMILY_EXTERNAL).image(image.image)
+                .subresourceRange(r -> r.aspectMask(depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
+    }
+    private static void layoutBarrier(VkImageMemoryBarrier2 barrier, SharedPresentImage image, long srcStage, long srcAccess, long dstStage, long dstAccess,
+                                      int oldLayout, int newLayout, boolean depth) {
+        barrier.sType$Default().srcStageMask(srcStage).srcAccessMask(srcAccess).dstStageMask(dstStage).dstAccessMask(dstAccess)
+                .oldLayout(oldLayout).newLayout(newLayout).srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).image(image.image)
+                .subresourceRange(r -> r.aspectMask(depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
+    }
+
     void endRead() {
-        if (reading >= 0) { int index = reading; reading = -1; slots[index].color.endReadGL(); slots[index].depth.endReadGL(); }
+        if (reading >= 0) { int index = reading; reading = -1; for (SharedPresentImage image : slots[index].images()) image.endReadGL(); }
     }
     private void waitSlot(int index) {
         Slot slot = slots[index];
@@ -199,24 +239,29 @@ final class SharedWorldRenderer implements AutoCloseable {
         for (Slot slot : slots) {
             slot.color = new SharedPresentImage(context, width, height, importer);
             slot.depth = new SharedPresentImage(context, width, height, importer, true);
+            slot.translucentColor = new SharedPresentImage(context, width, height, importer);
+            slot.translucentDepth = new SharedPresentImage(context, width, height, importer, true);
         }
         log.accept("WORLD_TARGET[" + ++generations + "]=" + width + "x" + height + " slots=" + SLOT_COUNT);
     }
     long[] stats() {
         long[] culling = culler == null ? new long[3] : culler.stats();
         return new long[]{world.renderedEpoch(), frames, world.trackedSections(), world.peakSections(), width, height, terrainFrames, sectionDraws, ProcessHandle.current().pid(), depthTexture,
-                culling[0], culling[1], culling[2]};
+                culling[0], culling[1], culling[2], translucentTexture, translucentDepthTexture, world.translucentSections(), translucentSectionDraws, world.translucentSorts()};
     }
     private void destroyTargets() {
         for (Slot slot : slots) {
             if (slot.color != null) { slot.color.close(); slot.color = null; }
             if (slot.depth != null) { slot.depth.close(); slot.depth = null; }
+            if (slot.translucentColor != null) { slot.translucentColor.close(); slot.translucentColor = null; }
+            if (slot.translucentDepth != null) { slot.translucentDepth.close(); slot.translucentDepth = null; }
             slot.used = false;
         }
     }
     @Override public void close() {
         endRead(); finishGL.run(); waitAll();
         log.accept("WORLD_FINAL_FRAMES=" + frames + " terrain=" + terrainFrames + " sectionDraws=" + sectionDraws + " peakSections=" + world.peakSections());
+        log.accept("WORLD_TRANSLUCENT sectionDraws=" + translucentSectionDraws + " sorts=" + world.translucentSorts());
         log.accept("WORLD_RGBA_READBACK_BYTES=0");
         if (timers != null) { timers.report(log); timers.close(); timers = null; }
         if (culler != null) { culler.report(log); culler.close(); culler = null; }

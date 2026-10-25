@@ -8,7 +8,7 @@ import net.minecraft.client.renderer.chunk.ChunkRenderDispatcher;
 public final class TerrainPasses {
     private static boolean replace;
     private static RenderType layer;
-    private static long solidSkipped, cutoutSkipped, fallbackDraws;
+    private static long solidSkipped, cutoutSkipped, translucentSkipped, fallbackDraws;
     private TerrainPasses() { }
     public static void markDirty(net.minecraft.client.renderer.ViewArea area, int x, int y, int z, boolean important) {
         area.setDirty(x, y, z, important);
@@ -17,14 +17,15 @@ public final class TerrainPasses {
     public static VertexBuffer buffer(ChunkRenderDispatcher.RenderChunk chunk, RenderType type) {
         layer = type;
         replace = (type == RenderType.solid() || type == RenderType.cutout() || type == RenderType.cutoutMipped())
-                && VulkanPreview.replacesSection(chunk.getOrigin());
+                ? VulkanPreview.replacesSection(chunk.getOrigin())
+                : type == RenderType.translucent() && VulkanPreview.replacesTranslucent(chunk.getOrigin());
         return chunk.getBuffer(type);
     }
     public static void draw(VertexBuffer buffer) {
         if (replace) {
-            if (layer == RenderType.solid()) solidSkipped++; else cutoutSkipped++;
+            if (layer == RenderType.solid()) solidSkipped++; else if (layer == RenderType.translucent()) translucentSkipped++; else cutoutSkipped++;
         } else { fallbackDraws++; buffer.draw(); }
         replace = false;
     }
-    static long[] stats() { return new long[]{solidSkipped, cutoutSkipped, fallbackDraws}; }
+    static long[] stats() { return new long[]{solidSkipped, cutoutSkipped, fallbackDraws, translucentSkipped}; }
 }

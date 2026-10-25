@@ -16,7 +16,10 @@ final class VulkanPreview {
     private static SharedFrameTexture sharedTexture;
     private static WorldSink sink;
     private static boolean direct;
-    private static int sharedDepth;
+    private static int sharedDepth, sharedTranslucent, sharedTranslucentDepth;
+    /** True between this frame's Vulkan render and its AFTER_TRANSLUCENT composite; the GL lease stays open until swap. */
+    private static boolean translucentPending;
+    private static long translucentComposites;
     private static int frameWidth = FrameProtocol.WIDTH, frameHeight = FrameProtocol.HEIGHT;
     private static long uploaded;
     private static long lastLogged;
@@ -43,12 +46,17 @@ final class VulkanPreview {
 
     static void terrain(net.minecraftforge.client.event.RenderLevelStageEvent event) {
         if (!enabled || sink == null) return;
+        translucentPending = false;
         if (direct && !NativeMainWindow.worldVisible()) { uploadedEpoch = 0; return; }
         try {
             WORLD.update(event, sink);
             if (direct) renderShared(); else upload();
             if (!inset && uploadedEpoch != 0 && uploadedEpoch == WORLD.epoch()) {
-                if (direct && sharedTexture != null) PRESENTER.draw(sharedTexture.getId(), sharedDepth);
+                if (direct && sharedTexture != null) {
+                    PRESENTER.draw(sharedTexture.getId(), sharedDepth);
+                    translucentPending = sharedTranslucent > 0 && sharedTranslucentDepth > 0 && TerrainPresenter.translucentReady()
+                            && !Minecraft.useShaderTransparency();
+                }
                 else if (texture != null && bridge.status() == OffscreenBridge.Status.RUNNING) PRESENTER.draw(texture);
             }
         }
@@ -58,6 +66,18 @@ final class VulkanPreview {
         }
     }
 
+    /** AFTER_TRANSLUCENT_BLOCKS: after GL entities and the (partially skipped) vanilla translucent layer. */
+    static void translucent() {
+        if (!translucentPending) return;
+        translucentPending = false;
+        try { PRESENTER.drawTranslucent(sharedTranslucent, sharedTranslucentDepth); translucentComposites++; }
+        catch (Exception error) { VulkanForge.LOGGER.error("Could not composite Vulkan translucent terrain", error); close(); }
+    }
+    /** Fabulous mode renders translucency into its own target for the transparency post chain; leave that to vanilla. */
+    static boolean replacesTranslucent(net.minecraft.core.BlockPos origin) { return translucentPending && replacesSection(origin); }
+    static long translucentComposites() { return translucentComposites; }
+    static long translucentQuads() { return WORLD.translucentQuads(); }
+    static long fluidBlocks() { return WORLD.fluidBlocks(); }
     static void invalidateWorld() { WORLD.invalidate(); }
     static void markDirty(int x, int y, int z) { if (enabled) WORLD.markDirty(x, y, z); }
     static void toggleInset() { inset = !inset; }
@@ -72,7 +92,7 @@ final class VulkanPreview {
                 && uploadedEpoch != 0 && uploadedEpoch == WORLD.epoch() && WORLD.covers(origin);
     }
     static boolean directWorld() { return enabled && direct; }
-    static long[] directWorldStats() { return directWorld() ? NativeMainWindow.worldStats() : new long[9]; }
+    static long[] directWorldStats() { return directWorld() ? NativeMainWindow.worldStats() : new long[18]; }
     static int saveWorldFrame(java.nio.file.Path path) throws java.io.IOException {
         RenderSystem.assertOnRenderThread();
         // A diagnostic read acquires a fresh GL lease; normal terrain rendering never downloads pixels.
@@ -94,6 +114,7 @@ final class VulkanPreview {
         if (id == 0) { uploadedEpoch = 0; return; }
         uploadedEpoch = stats[0];
         sharedDepth = (int)stats[9];
+        sharedTranslucent = stats.length > 14 ? (int)stats[13] : 0; sharedTranslucentDepth = stats.length > 14 ? (int)stats[14] : 0;
         if (sharedTexture == null) {
             sharedTexture = new SharedFrameTexture();
             Minecraft.getInstance().getTextureManager().register(TEXTURE, sharedTexture);
@@ -172,6 +193,7 @@ final class VulkanPreview {
         uploadedEpoch = 0;
         WORLD.close();
         sink = null; direct = false;
-        sharedDepth = 0;
+        sharedDepth = sharedTranslucent = sharedTranslucentDepth = 0;
+        translucentPending = false;
     }
 }

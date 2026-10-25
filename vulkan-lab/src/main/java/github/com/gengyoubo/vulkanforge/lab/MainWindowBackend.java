@@ -109,7 +109,7 @@ public final class MainWindowBackend implements AutoCloseable {
         return world;
     }
     public int renderWorld(int width, int height) { return world().render(width, height); }
-    public long[] worldStats() { return world == null ? new long[9] : world.stats(); }
+    public long[] worldStats() { return world == null ? new long[18] : world.stats(); }
     public void finishWorldFrame() { if (world != null) world.endRead(); }
     public void closeWorld() { if (world != null) { world.close(); world = null; } }
 
