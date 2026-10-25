@@ -8,7 +8,7 @@ version="${version}"
 displayName="VulkanForge"
 authors="gengy"
 displayTest="IGNORE_ALL_VERSION"
-description='''Experimental Vulkan 1.4 renderer for Forge 1.20.1. F8 enables nearby solid terrain with baked block models, block atlas and depth testing. F10 switches full view/inset, F9 opens the standalone test. Vulkan color uses CPU readback and OpenGL presentation; vanilla still renders its passes for depth and unsupported layers.'''
+description='''Experimental Vulkan 1.4 renderer for Forge 1.20.1. F8 enables nearby solid and cutout terrain with baked models, live atlas updates, vanilla lightmap and depth testing. F10 switches full view/inset, F9 opens the standalone test. Uses CPU readback and OpenGL presentation; vanilla passes remain for depth and unsupported layers.'''
 
 [[dependencies.vulkanforge]]
 modId="forge"

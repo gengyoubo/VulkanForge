@@ -8,7 +8,7 @@ import static org.lwjgl.opengl.GL11.*;
 import static org.lwjgl.opengl.GL13.GL_ACTIVE_TEXTURE;
 import static org.lwjgl.opengl.GL14.*;
 
-/** Presents Vulkan color after the solid layer, before vanilla cutouts, entities, particles and hand. */
+/** Presents Vulkan solid/cutout color before vanilla entities, translucency, particles and hand. */
 final class TerrainPresenter implements AutoCloseable {
     private VertexBuffer quad;
     private final BufferBuilder builder = new BufferBuilder(128);

@@ -50,6 +50,9 @@ final class VulkanPreview {
     static void toggleInset() { inset = !inset; }
     static long worldEpoch() { return uploadedEpoch == WORLD.epoch() ? uploadedEpoch : 0; }
     static int capturedSections() { return WORLD.sections(); }
+    static long atlasPatches() { return WORLD.atlasPatches(); }
+    static long lightUpdates() { return WORLD.lightUpdates(); }
+    static int capturedCutoutBlocks() { return WORLD.cutoutBlocks(); }
     static int saveWorldFrame(java.nio.file.Path path) throws java.io.IOException {
         RenderSystem.assertOnRenderThread();
         if (texture == null || worldEpoch() == 0) throw new IllegalStateException("No Vulkan world frame available");

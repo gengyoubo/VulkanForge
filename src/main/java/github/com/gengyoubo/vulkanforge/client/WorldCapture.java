@@ -1,7 +1,5 @@
 package github.com.gengyoubo.vulkanforge.client;
 
-import com.mojang.blaze3d.platform.GlStateManager;
-import com.mojang.blaze3d.platform.NativeImage;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.*;
 import dev.vulkanforge.bridge.WorldProtocol;
@@ -24,20 +22,27 @@ import org.joml.Matrix4f;
 import java.nio.*;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicLong;
-import static org.lwjgl.opengl.GL11.*;
 
-/** Render-thread capture of vanilla baked solid geometry, bounded to 3x3x5 sections. */
+/** Render-thread capture of vanilla solid/cutout geometry, bounded to 3x3x5 sections. */
 final class WorldCapture {
     private static final AtomicLong EPOCHS = new AtomicLong();
     private final Map<Long, byte[]> sent = new HashMap<>();
     private final BufferBuilder builder = new BufferBuilder(262144);
     private ClientLevel level;
     private long epoch, nextBuild;
-    private int cursor;
+    private int cursor, textureCursor;
     private boolean atlasSent;
+    private TextureCapture.Snapshot atlasSnapshot;
+    private byte[] lightSnapshot;
+    private long nextTexturePoll;
+    private long atlasPatches, lightUpdates;
+    private int cutoutBlocks;
 
     long epoch() { return epoch; }
     int sections() { return sent.size(); }
+    long atlasPatches() { return atlasPatches; }
+    long lightUpdates() { return lightUpdates; }
+    int cutoutBlocks() { return cutoutBlocks; }
     void invalidate() { level = null; }
     void leave(OffscreenBridge bridge) {
         if (epoch != 0) { epoch = 0; level = null; sent.clear(); atlasSent = false; bridge.reset(0); }
@@ -50,10 +55,20 @@ final class WorldCapture {
             level = mc.level;
             epoch = EPOCHS.incrementAndGet();
             sent.clear(); cursor = 0; atlasSent = false;
+            atlasSnapshot = null; lightSnapshot = null; nextTexturePoll = 0; cutoutBlocks = 0;
+            textureCursor = 0;
             bridge.reset(epoch);
             VulkanForge.LOGGER.info("Vulkan world capture reset: epoch={}, dimension={}", epoch, level.dimension().location());
         }
-        if (!atlasSent) { atlasSent = bridge.send(captureAtlas(mc)); if (!atlasSent) return; }
+        if (!atlasSent) {
+            var snapshot = TextureCapture.read(mc.getTextureManager().getTexture(InventoryMenu.BLOCK_ATLAS).getId());
+            atlasSent = bridge.send(new WorldProtocol.Atlas(epoch, snapshot.width(), snapshot.height(), snapshot.rgba()));
+            if (!atlasSent) return;
+            // Published packet bytes are immutable; keep a separate baseline for incremental patches.
+            atlasSnapshot = new TextureCapture.Snapshot(snapshot.width(), snapshot.height(), snapshot.rgba().clone());
+            VulkanForge.LOGGER.info("Captured Vulkan block atlas: {}x{}", snapshot.width(), snapshot.height());
+        }
+        if (!syncTextures(mc, bridge)) return;
         var position = event.getCamera().getPosition();
         float[] matrix = new Matrix4f(event.getProjectionMatrix()).mul(event.getPoseStack().last().pose()).get(new float[16]);
         float[] fog = RenderSystem.getShaderFogColor();
@@ -91,25 +106,39 @@ final class WorldCapture {
         }
     }
 
-    private WorldProtocol.Atlas captureAtlas(Minecraft mc) {
-        int previous = glGetInteger(GL_TEXTURE_BINDING_2D);
-        try {
-            mc.getTextureManager().getTexture(InventoryMenu.BLOCK_ATLAS).bind();
-            int width = glGetTexLevelParameteri(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH);
-            int height = glGetTexLevelParameteri(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT);
-            if (width < 1 || height < 1 || (long) width * height * 4 > WorldProtocol.MAX_ATLAS_BYTES) throw new IllegalStateException("Block atlas exceeds bridge limit");
-            try (NativeImage image = new NativeImage(width, height, false)) {
-                image.downloadTexture(0, false);
-                int[] pixels = image.getPixelsRGBA();
-                byte[] rgba = new byte[pixels.length * 4];
-                for (int i = 0; i < pixels.length; i++) {
-                    int color = pixels[i];
-                    for (int component = 0; component < 4; component++) rgba[i * 4 + component] = (byte) (color >>> (component * 8));
-                }
-                VulkanForge.LOGGER.info("Captured Vulkan block atlas: {}x{}", width, height);
-                return new WorldProtocol.Atlas(epoch, width, height, rgba);
+    private boolean syncTextures(Minecraft mc, OffscreenBridge bridge) {
+        if (System.nanoTime() < nextTexturePoll) return true;
+        nextTexturePoll = System.nanoTime() + 100_000_000L;
+        var light = TextureCapture.read(RenderSystem.getShaderTexture(2));
+        if (light.width() != 16 || light.height() != 16) throw new IllegalStateException("Expected Minecraft 16x16 lightmap");
+        if (!Arrays.equals(lightSnapshot, light.rgba()) && bridge.send(new WorldProtocol.TexturePatch(epoch, WorldProtocol.LIGHT_MAP, 0, 0, 16, 16, light.rgba()))) {
+            lightSnapshot = light.rgba(); lightUpdates++;
+            if (lightUpdates == 1 || lightUpdates % 100 == 0) VulkanForge.LOGGER.info("Vulkan lightmap updates={}", lightUpdates);
+        }
+        var current = TextureCapture.read(mc.getTextureManager().getTexture(InventoryMenu.BLOCK_ATLAS).getId());
+        if (current.width() != atlasSnapshot.width() || current.height() != atlasSnapshot.height()) { invalidate(); return false; }
+        int budget = 8;
+        int columns = (current.width() + 31) / 32, tiles = columns * ((current.height() + 31) / 32);
+        // Round-robin prevents frequently changing low-index sprites from starving later atlas regions.
+        for (int checked = 0; checked < tiles && budget > 0; checked++) {
+            int tile = textureCursor;
+            textureCursor = (textureCursor + 1) % tiles;
+            int x = (tile % columns) * 32, y = (tile / columns) * 32;
+            int width = Math.min(32, current.width() - x), height = Math.min(32, current.height() - y);
+            boolean changed = false;
+            for (int row = 0; row < height && !changed; row++) {
+                int start = ((y + row) * current.width() + x) * 4;
+                changed = !Arrays.equals(current.rgba(), start, start + width * 4, atlasSnapshot.rgba(), start, start + width * 4);
             }
-        } finally { GlStateManager._bindTexture(previous); }
+            if (!changed) continue;
+            byte[] pixels = new byte[width * height * 4];
+            for (int row = 0; row < height; row++) System.arraycopy(current.rgba(), ((y + row) * current.width() + x) * 4, pixels, row * width * 4, width * 4);
+            if (!bridge.send(new WorldProtocol.TexturePatch(epoch, WorldProtocol.BLOCK_ATLAS, x, y, width, height, pixels))) return true;
+            for (int row = 0; row < height; row++) System.arraycopy(pixels, row * width * 4, atlasSnapshot.rgba(), ((y + row) * current.width() + x) * 4, width * 4);
+            atlasPatches++; budget--;
+            if (atlasPatches == 1 || atlasPatches % 100 == 0) VulkanForge.LOGGER.info("Vulkan animated atlas patches={}", atlasPatches);
+        }
+        return true;
     }
 
     private byte[] captureSection(Minecraft mc, SectionPos section) {
@@ -131,10 +160,13 @@ final class WorldCapture {
                 var model = mc.getBlockRenderer().getBlockModel(state);
                 ModelData data = model.getModelData(level, pos, state, modelData.getOrDefault(pos, ModelData.EMPTY));
                 random.setSeed(state.getSeed(pos));
-                if (!model.getRenderTypes(state, random, data).contains(RenderType.solid())) continue;
-                poses.pushPose(); poses.translate(x, y, z);
-                mc.getBlockRenderer().renderBatched(state, pos, level, poses, builder, true, random, data, RenderType.solid());
-                poses.popPose();
+                for (RenderType type : model.getRenderTypes(state, random, data)) {
+                    if (type != RenderType.solid() && type != RenderType.cutout() && type != RenderType.cutoutMipped()) continue;
+                    if (type != RenderType.solid()) cutoutBlocks++;
+                    poses.pushPose(); poses.translate(x, y, z);
+                    mc.getBlockRenderer().renderBatched(state, pos, level, poses, builder, true, random, data, type);
+                    poses.popPose();
+                }
             }
             rendered = builder.end();
             int vertices = rendered.drawState().vertexCount();
@@ -146,10 +178,9 @@ final class WorldCapture {
             for (int quad = 0; quad < vertices; quad += 4) for (int corner : triangles) {
                 int offset = (quad + corner) * stride;
                 output.putFloat(input.getFloat(offset)).putFloat(input.getFloat(offset + 4)).putFloat(input.getFloat(offset + 8));
-                float light = 0.25f + 0.75f * Math.min(1f, Math.max(Short.toUnsignedInt(input.getShort(offset + 24)), Short.toUnsignedInt(input.getShort(offset + 26))) / 240f);
-                for (int c = 0; c < 3; c++) output.put((byte) (Byte.toUnsignedInt(input.get(offset + 12 + c)) * light));
-                output.put(input.get(offset + 15));
+                output.putInt(input.getInt(offset + 12));
                 output.putFloat(input.getFloat(offset + 16)).putFloat(input.getFloat(offset + 20));
+                output.putShort(input.getShort(offset + 24)).putShort(input.getShort(offset + 26));
             }
             return output.array();
         } finally {

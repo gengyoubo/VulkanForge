@@ -7,9 +7,11 @@ import static dev.vulkanforge.lab.VulkanContext.check;
 
 final class GpuImage implements AutoCloseable {
     private final VulkanContext context;
+    final int width, height;
     long image, memory, view;
     GpuImage(VulkanContext context, int width, int height, int format, int usage, int aspect) {
         this.context = context;
+        this.width = width; this.height = height;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             var props = VkFormatProperties.calloc(stack);
             vkGetPhysicalDeviceFormatProperties(context.physical, format, props);

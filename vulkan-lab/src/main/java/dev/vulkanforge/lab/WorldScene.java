@@ -15,8 +15,9 @@ final class WorldScene implements AutoCloseable {
     }
     private final VulkanContext context;
     private final Map<Long, Section> sections = new LinkedHashMap<>();
-    private long epoch, descriptorLayout, descriptorPool, descriptorSet, layout, pipeline, sampler, pool, fence;
-    private GpuImage atlas;
+    private long epoch, descriptorLayout, descriptorPool, descriptorSet, layout, pipeline, sampler, lightSampler, pool, fence;
+    private GpuImage atlas, lightMap;
+    private long atlasPatches, lightUpdates;
     private VkCommandBuffer upload;
     private WorldProtocol.Camera camera;
     private boolean receivedMesh;
@@ -26,11 +27,12 @@ final class WorldScene implements AutoCloseable {
     void initialize() {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             var handle = stack.mallocLong(1);
-            var binding = VkDescriptorSetLayoutBinding.calloc(1, stack).binding(0).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
-                    .descriptorCount(1).stageFlags(VK_SHADER_STAGE_FRAGMENT_BIT);
+            var binding = VkDescriptorSetLayoutBinding.calloc(2, stack);
+            binding.get(0).binding(0).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1).stageFlags(VK_SHADER_STAGE_FRAGMENT_BIT);
+            binding.get(1).binding(1).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1).stageFlags(VK_SHADER_STAGE_VERTEX_BIT);
             check(vkCreateDescriptorSetLayout(context.device, VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(binding), null, handle), "world descriptor layout");
             descriptorLayout = handle.get(0);
-            var sizes = VkDescriptorPoolSize.calloc(1, stack).type(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1);
+            var sizes = VkDescriptorPoolSize.calloc(1, stack).type(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(2);
             check(vkCreateDescriptorPool(context.device, VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(1).pPoolSizes(sizes), null, handle), "world descriptor pool");
             descriptorPool = handle.get(0);
             check(vkAllocateDescriptorSets(context.device, VkDescriptorSetAllocateInfo.calloc(stack).sType$Default().descriptorPool(descriptorPool).pSetLayouts(stack.longs(descriptorLayout)), handle), "world descriptor set");
@@ -43,6 +45,8 @@ final class WorldScene implements AutoCloseable {
                     .mipmapMode(VK_SAMPLER_MIPMAP_MODE_NEAREST).addressModeU(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
                     .addressModeV(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE).addressModeW(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE).maxLod(0);
             check(vkCreateSampler(context.device, samplerInfo, null, handle), "world atlas sampler"); sampler = handle.get(0);
+            samplerInfo.magFilter(VK_FILTER_LINEAR).minFilter(VK_FILTER_LINEAR);
+            check(vkCreateSampler(context.device, samplerInfo, null, handle), "world lightmap sampler"); lightSampler = handle.get(0);
             check(vkCreateCommandPool(context.device, VkCommandPoolCreateInfo.calloc(stack).sType$Default().queueFamilyIndex(context.queueFamily)
                     .flags(VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT), null, handle), "world upload pool"); pool = handle.get(0);
             var pointer = stack.mallocPointer(1);
@@ -62,6 +66,7 @@ final class WorldScene implements AutoCloseable {
         if (command.epoch() != epoch || epoch == 0) return;
         if (command instanceof WorldProtocol.Camera view) camera = view;
         else if (command instanceof WorldProtocol.Atlas image) uploadAtlas(image);
+        else if (command instanceof WorldProtocol.TexturePatch patch) updateTexture(patch);
         else if (command instanceof WorldProtocol.Remove remove) { Section old = sections.remove(remove.key()); if (old != null) old.close(); }
         else if (command instanceof WorldProtocol.Mesh mesh) {
             receivedMesh = true;
@@ -75,7 +80,7 @@ final class WorldScene implements AutoCloseable {
         }
     }
 
-    boolean ready() { return camera != null && atlas != null && receivedMesh; }
+    boolean ready() { return camera != null && atlas != null && lightMap != null && receivedMesh; }
     long renderedEpoch() { return ready() ? epoch : 0; }
     float red() { return camera.red(); }
     float green() { return camera.green(); }
@@ -85,35 +90,67 @@ final class WorldScene implements AutoCloseable {
         if (atlas != null) { atlas.close(); atlas = null; }
         GpuImage next = new GpuImage(context, pixels.width(), pixels.height(), VK_FORMAT_R8G8B8A8_UNORM,
                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
-        try (GpuBuffer staging = new GpuBuffer(context, pixels.rgba(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        try {
+            uploadPixels(next, 0, 0, pixels.width(), pixels.height(), pixels.rgba(), true);
+            updateDescriptor(0, next, sampler);
+            atlas = next;
+            System.out.printf("WORLD_ATLAS=%dx%d%n", pixels.width(), pixels.height());
+        } catch (Throwable error) { next.close(); throw error; }
+    }
+
+    private void updateTexture(WorldProtocol.TexturePatch patch) {
+        if (patch.target() == WorldProtocol.LIGHT_MAP) {
+            boolean fresh = lightMap == null;
+            GpuImage image = fresh ? new GpuImage(context, 16, 16, VK_FORMAT_R8G8B8A8_UNORM,
+                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT) : lightMap;
+            try {
+                uploadPixels(image, 0, 0, 16, 16, patch.rgba(), fresh);
+                if (fresh) { updateDescriptor(1, image, lightSampler); lightMap = image; }
+            } catch (Throwable error) { if (fresh) image.close(); throw error; }
+            if (++lightUpdates == 1 || lightUpdates % 100 == 0) System.out.println("WORLD_LIGHTMAP_UPDATES=" + lightUpdates);
+        } else {
+            if (atlas == null || (long) patch.x() + patch.width() > atlas.width || (long) patch.y() + patch.height() > atlas.height)
+                throw new IllegalArgumentException("Atlas patch exceeds current image bounds");
+            uploadPixels(atlas, patch.x(), patch.y(), patch.width(), patch.height(), patch.rgba(), false);
+            if (++atlasPatches == 1 || atlasPatches % 100 == 0) System.out.println("WORLD_ATLAS_PATCHES=" + atlasPatches);
+        }
+    }
+
+    private void uploadPixels(GpuImage image, int x, int y, int width, int height, byte[] rgba, boolean fresh) {
+        try (GpuBuffer staging = new GpuBuffer(context, rgba, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
              MemoryStack stack = MemoryStack.stackPush()) {
             check(vkResetCommandBuffer(upload, 0), "reset atlas upload");
             check(vkBeginCommandBuffer(upload, VkCommandBufferBeginInfo.calloc(stack).sType$Default().flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)), "begin atlas upload");
-            var barrier = VkImageMemoryBarrier2.calloc(1, stack).sType$Default().srcStageMask(VK_PIPELINE_STAGE_2_NONE)
+            var barrier = VkImageMemoryBarrier2.calloc(1, stack).sType$Default()
+                    .srcStageMask(fresh ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT)
+                    .srcAccessMask(fresh ? 0 : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)
                     .dstStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).dstAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
-                    .oldLayout(VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
-                    .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).image(next.image)
+                    .oldLayout(fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                    .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).image(image.image)
                     .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
             var dependency = VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barrier);
             vkCmdPipelineBarrier2(upload, dependency);
             var region = VkBufferImageCopy.calloc(1, stack).imageSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1))
-                    .imageExtent(e -> e.set(pixels.width(), pixels.height(), 1));
-            vkCmdCopyBufferToImage(upload, staging.buffer, next.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+                    .imageOffset(o -> o.set(x, y, 0)).imageExtent(e -> e.set(width, height, 1));
+            vkCmdCopyBufferToImage(upload, staging.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
             barrier.srcStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).srcAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
-                    .dstStageMask(VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT).dstAccessMask(VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)
+                    .dstStageMask(VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT).dstAccessMask(VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)
                     .oldLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             vkCmdPipelineBarrier2(upload, dependency);
             check(vkEndCommandBuffer(upload), "end atlas upload");
             check(vkResetFences(context.device, fence), "reset atlas fence");
             check(vkQueueSubmit(context.queue, VkSubmitInfo.calloc(stack).sType$Default().pCommandBuffers(stack.pointers(upload.address())), fence), "submit atlas upload");
             check(vkWaitForFences(context.device, fence, true, 5_000_000_000L), "wait atlas upload");
-            var imageInfo = VkDescriptorImageInfo.calloc(1, stack).sampler(sampler).imageView(next.view).imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            var write = VkWriteDescriptorSet.calloc(1, stack).sType$Default().dstSet(descriptorSet).dstBinding(0)
+        }
+    }
+
+    private void updateDescriptor(int binding, GpuImage image, long imageSampler) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            var imageInfo = VkDescriptorImageInfo.calloc(1, stack).sampler(imageSampler).imageView(image.view).imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            var write = VkWriteDescriptorSet.calloc(1, stack).sType$Default().dstSet(descriptorSet).dstBinding(binding)
                     .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1).pImageInfo(imageInfo);
             vkUpdateDescriptorSets(context.device, write, null);
-            atlas = next;
-            System.out.printf("WORLD_ATLAS=%dx%d%n", pixels.width(), pixels.height());
-        } catch (Throwable error) { next.close(); throw error; }
+        }
     }
 
     void draw(VkCommandBuffer command, MemoryStack stack) {
@@ -137,6 +174,7 @@ final class WorldScene implements AutoCloseable {
     private void clear() {
         sections.values().forEach(Section::close); sections.clear(); camera = null; receivedMesh = false;
         if (atlas != null) { atlas.close(); atlas = null; }
+        if (lightMap != null) { lightMap.close(); lightMap = null; }
     }
 
     @Override public void close() {
@@ -146,6 +184,7 @@ final class WorldScene implements AutoCloseable {
         if (descriptorPool != 0) { vkDestroyDescriptorPool(context.device, descriptorPool, null); descriptorPool = 0; }
         if (descriptorLayout != 0) { vkDestroyDescriptorSetLayout(context.device, descriptorLayout, null); descriptorLayout = 0; }
         if (sampler != 0) { vkDestroySampler(context.device, sampler, null); sampler = 0; }
+        if (lightSampler != 0) { vkDestroySampler(context.device, lightSampler, null); lightSampler = 0; }
         if (pool != 0) { vkDestroyCommandPool(context.device, pool, null); pool = 0; }
         if (fence != 0) { vkDestroyFence(context.device, fence, null); fence = 0; }
     }

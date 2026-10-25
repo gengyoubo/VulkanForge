@@ -1,5 +1,5 @@
 {
-  "key.vulkanforge.preview": "Toggle Vulkan solid terrain / menu preview",
+  "key.vulkanforge.preview": "Toggle Vulkan terrain / menu preview",
   "key.vulkanforge.inset": "Switch Vulkan terrain between full view and inset",
   "key.vulkanforge.triangle": "Open separate Vulkan triangle window",
   "key.categories.vulkanforge": "VulkanForge",
@@ -9,7 +9,7 @@
   "vulkanforge.preview.failed": "Vulkan failed; see bridge report",
   "vulkanforge.preview.stopped": "Vulkan preview stopped",
   "vulkanforge.preview.transport": "Readback preview | F8 toggle",
-  "vulkanforge.world.status": "Vulkan solid | %s sections | frame %s",
+  "vulkanforge.world.status": "Vulkan terrain | %s sections | frame %s",
   "vulkanforge.world.controls": "F8 toggle | F10 inset comparison",
   "vulkanforge.launching": "Starting Vulkan test window. See logs/vulkanforge for the report.",
   "vulkanforge.busy": "A Vulkan test window is already running."

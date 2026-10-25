@@ -1,5 +1,5 @@
 {
-  "key.vulkanforge.preview": "开关 Vulkan 不透明地形 / 主菜单预览",
+  "key.vulkanforge.preview": "开关 Vulkan 地形 / 主菜单预览",
   "key.vulkanforge.inset": "切换 Vulkan 地形全屏 / 小窗对照",
   "key.vulkanforge.triangle": "打开独立 Vulkan 三角形窗口",
   "key.categories.vulkanforge": "VulkanForge",
