@@ -50,7 +50,7 @@ final class SharedWorldRenderer implements AutoCloseable {
     static final int MAX_OVERLAYS = 4;
     private int width, height, generations, reading = -1, overlayReading = -1;
     private EntityPass entities;
-    private long overlayPasses;
+    private long overlayPasses, skyDraws;
     private int depthTexture, translucentTexture, translucentDepthTexture;
     private long translucentSectionDraws;
     private static final long DEPTH_STAGES = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
@@ -65,7 +65,8 @@ final class SharedWorldRenderer implements AutoCloseable {
                 if (completedFrames >= frames) resource.run(); else retired.addLast(new Retired(frames, resource));
             };
             world.retireUsing(retire);
-            entities = new EntityPass(context, SLOT_COUNT * MAX_OVERLAYS, retire);
+            // Per slot: one ring set per overlay pass plus one for the sky drawn inside the terrain submit.
+            entities = new EntityPass(context, SLOT_COUNT * (MAX_OVERLAYS + 1), retire);
             timers = new GpuTimers(context, SLOT_COUNT, log, "TERRAIN", "TERRAIN_RELEASE", "TRIANGLE", "CULLING", "TRANSLUCENT");
             var familyCount = stack.ints(0);
             vkGetPhysicalDeviceQueueFamilyProperties(context.physical, familyCount, null);
@@ -106,7 +107,9 @@ final class SharedWorldRenderer implements AutoCloseable {
     }
     void prepareFrame() { waitSlot((int)(frames % SLOT_COUNT)); }
 
-    int render(int requestedWidth, int requestedHeight) {
+    int render(int requestedWidth, int requestedHeight) { return render(requestedWidth, requestedHeight, java.util.List.of()); }
+    /** P10: {@code sky} packets (captured renderSky draws) are drawn first in the opaque pass, under terrain, with its depth. */
+    int render(int requestedWidth, int requestedHeight, java.util.List<Object[]> sky) {
         endRead();
         boolean terrain = world.ready();
         if (requestedWidth <= 0 || requestedHeight <= 0 || (!terrain && world.epoch() != 0)) return 0;
@@ -150,7 +153,13 @@ final class SharedWorldRenderer implements AutoCloseable {
             var scissor = VkRect2D.calloc(1, stack).offset(o -> o.set(0, 0)).extent(e -> e.set(width, height));
             vkCmdSetViewport(command, 0, viewport);
             vkCmdSetScissor(command, 0, scissor);
-            if (terrain) world.draw(command, stack, culler, index);
+            if (terrain) {
+                if (!sky.isEmpty() && world.lightMapView() != 0) {
+                    entities.record(command, stack, index * (MAX_OVERLAYS + 1) + MAX_OVERLAYS, sky, world.lightMapView(), world.lightSampler());
+                    skyDraws += sky.size();
+                }
+                world.draw(command, stack, culler, index);
+            }
             else {
                 vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, trianglePipeline);
                 vkCmdPushConstants(command, triangleLayout, VK_SHADER_STAGE_VERTEX_BIT, 0,
@@ -272,7 +281,7 @@ final class SharedWorldRenderer implements AutoCloseable {
                     .renderArea(r -> r.offset(o -> o.set(0, 0)).extent(e -> e.set(width, height))));
             vkCmdSetViewport(command, 0, VkViewport.calloc(1, stack).width(width).height(height).minDepth(0).maxDepth(1));
             vkCmdSetScissor(command, 0, VkRect2D.calloc(1, stack).offset(o -> o.set(0, 0)).extent(e -> e.set(width, height)));
-            entities.record(command, stack, index * MAX_OVERLAYS + pass, packets, world.lightMapView(), world.lightSampler());
+            entities.record(command, stack, index * (MAX_OVERLAYS + 1) + pass, packets, world.lightMapView(), world.lightSampler());
             vkCmdEndRendering(command);
             var release = VkImageMemoryBarrier2.calloc(2, stack);
             releaseBarrier(release.get(0), slot.overlayColor, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, false);
@@ -366,7 +375,7 @@ final class SharedWorldRenderer implements AutoCloseable {
         long[] entity = entities == null ? new long[5] : entities.stats();
         return new long[]{world.renderedEpoch(), frames, world.trackedSections(), world.peakSections(), width, height, terrainFrames, sectionDraws, ProcessHandle.current().pid(), depthTexture,
                 culling[0], culling[1], culling[2], translucentTexture, translucentDepthTexture, world.translucentSections(), translucentSectionDraws, world.translucentSorts(),
-                overlayPasses, entity[0], entity[1], entity[2], entity[3], entity[4]};
+                overlayPasses, entity[0], entity[1], entity[2], entity[3], entity[4], skyDraws};
     }
     private void destroyTargets() {
         for (Slot slot : slots) {
@@ -387,7 +396,7 @@ final class SharedWorldRenderer implements AutoCloseable {
         log.accept("WORLD_RGBA_READBACK_BYTES=0");
         if (entities != null) {
             long[] entity = entities.stats();
-            log.accept("WORLD_OVERLAYS passes=" + overlayPasses + " draws=" + entity[0] + " vertices=" + entity[1] + " textures=" + entity[2] + " uploads=" + entity[3] + " missingTextures=" + entity[4]);
+            log.accept("WORLD_OVERLAYS passes=" + overlayPasses + " skyDraws=" + skyDraws + " draws=" + entity[0] + " vertices=" + entity[1] + " textures=" + entity[2] + " uploads=" + entity[3] + " missingTextures=" + entity[4]);
             entities.close(); entities = null;
         }
         if (timers != null) { timers.report(log); timers.close(); timers = null; }

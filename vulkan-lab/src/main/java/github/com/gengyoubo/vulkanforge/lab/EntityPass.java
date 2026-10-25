@@ -17,13 +17,19 @@ import static org.lwjgl.vulkan.VK13.*;
 final class EntityPass implements AutoCloseable {
     static final int H_FORMAT = 0, H_VARIANT = 1, H_FLAGS = 2, H_TEXTURE = 3, H_OVERLAY = 4, H_VERTICES = 5, H_MODE = 6, H_INDICES = 7, H_INDEX_SIZE = 8, HEADER = 9;
     static final int FORMAT_ENTITY = 0, FORMAT_TEXT = 1, FORMAT_PARTICLE = 2;
+    /** P10: POSITION, POSITION_COLOR, POSITION_TEX, POSITION_TEX_COLOR, POSITION_TEX_COLOR_NORMAL (sky, sun/moon, stars, clouds). */
+    static final int FORMAT_POSITION = 3, FORMAT_POSITION_COLOR = 4, FORMAT_POSITION_TEX = 5, FORMAT_POSITION_TEX_COLOR = 6, FORMAT_CLOUDS = 7;
+    /** Texture id of the built-in 1x1 white image used by untextured shaders. */
+    static final int WHITE_TEXTURE = 0;
     static final int MODE_QUADS = 0, MODE_TRIANGLES = 1;
-    static final int BLEND = 1, DEPTH_TEST = 2, DEPTH_WRITE = 4, CULL = 8;
+    /** BLEND: premultiplied "over"; BLEND_ADD: GL (SRC_ALPHA, ONE) additive; NO_COLOR: color writes off (cloud depth prepass). */
+    static final int BLEND = 1, DEPTH_TEST = 2, DEPTH_WRITE = 4, CULL = 8, BLEND_ADD = 16, NO_COLOR = 32;
     static final int TEXTURE_LINEAR = 1, TEXTURE_CLAMP = 2;
     static final int UNIFORM_FLOATS = 64;
     private static final int UNIFORM_STRIDE = 256; // == the largest allowed minUniformBufferOffsetAlignment
-    private static final int[] STRIDES = {36, 28, 28};
-    private static final String[] VERTEX_SHADERS = {"/shaders/entity.vert", "/shaders/text.vert", "/shaders/particle.vert"};
+    private static final int[] STRIDES = {36, 28, 28, 12, 16, 20, 24, 28};
+    private static final String[] VERTEX_SHADERS = {"/shaders/entity.vert", "/shaders/text.vert", "/shaders/particle.vert", "/shaders/simple_pos.vert",
+            "/shaders/simple_color.vert", "/shaders/simple_tex.vert", "/shaders/simple_tex_color.vert", "/shaders/simple_tex_color.vert"};
     private record Texture(GpuImage image, int flags) implements AutoCloseable { @Override public void close() { image.close(); } }
     private static final class SlotResources {
         GpuBuffer vertices, indices, uniforms;
@@ -73,6 +79,8 @@ final class EntityPass implements AutoCloseable {
             upload = new VkCommandBuffer(pointer.get(0), context.device);
             check(vkCreateFence(context.device, VkFenceCreateInfo.calloc(stack).sType$Default(), null, handle), "entity upload fence"); uploadFence = handle.get(0);
         } catch (Throwable error) { close(); throw error; }
+        try { texture(WHITE_TEXTURE, 1, 1, 0, new byte[]{-1, -1, -1, -1}); textureUploads = 0; }
+        catch (Throwable error) { close(); throw error; }
     }
 
     boolean hasTexture(int id) { return textures.containsKey(id); }
@@ -217,7 +225,7 @@ final class EntityPass implements AutoCloseable {
     }
 
     private long pipeline(int format, int flags) {
-        int key = format | flags << 2;
+        int key = format | flags << 3;
         Long existing = pipelines.get(key);
         if (existing != null) return existing;
         long vert = 0, frag = 0;
@@ -228,23 +236,37 @@ final class EntityPass implements AutoCloseable {
             stages.get(0).sType$Default().stage(VK_SHADER_STAGE_VERTEX_BIT).module(vert).pName(stack.UTF8("main"));
             stages.get(1).sType$Default().stage(VK_SHADER_STAGE_FRAGMENT_BIT).module(frag).pName(stack.UTF8("main"));
             boolean text = format == FORMAT_TEXT;
-            var attributes = VkVertexInputAttributeDescription.calloc(format == FORMAT_ENTITY ? 6 : 4, stack);
+            var attributes = VkVertexInputAttributeDescription.calloc(format == FORMAT_ENTITY ? 6 : format == FORMAT_POSITION ? 1
+                    : format == FORMAT_POSITION_COLOR || format == FORMAT_POSITION_TEX ? 2 : format >= FORMAT_POSITION_TEX_COLOR ? 3 : 4, stack);
             attributes.get(0).location(0).binding(0).format(VK_FORMAT_R32G32B32_SFLOAT).offset(0);
-            // PARTICLE orders UV0 before Color: Position, UV0, Color, UV2.
-            attributes.get(1).location(1).binding(0).format(VK_FORMAT_R8G8B8A8_UNORM).offset(format == FORMAT_PARTICLE ? 20 : 12);
-            attributes.get(2).location(2).binding(0).format(VK_FORMAT_R32G32_SFLOAT).offset(format == FORMAT_PARTICLE ? 12 : 16);
-            if (text || format == FORMAT_PARTICLE) attributes.get(3).location(3).binding(0).format(VK_FORMAT_R16G16_SINT).offset(24);
-            else {
-                attributes.get(3).location(3).binding(0).format(VK_FORMAT_R16G16_SINT).offset(24);
-                attributes.get(4).location(4).binding(0).format(VK_FORMAT_R16G16_SINT).offset(28);
-                // Normal (3 bytes) + padding read as one SNORM vec4; the shader uses xyz.
-                attributes.get(5).location(5).binding(0).format(VK_FORMAT_R8G8B8A8_SNORM).offset(32);
+            if (format >= FORMAT_POSITION) {
+                // Position always first; POSITION_TEX* put UV0 at 12 and Color after it, POSITION_COLOR has Color at 12.
+                if (format == FORMAT_POSITION_COLOR) attributes.get(1).location(1).binding(0).format(VK_FORMAT_R8G8B8A8_UNORM).offset(12);
+                if (format == FORMAT_POSITION_TEX) attributes.get(1).location(2).binding(0).format(VK_FORMAT_R32G32_SFLOAT).offset(12);
+                if (format >= FORMAT_POSITION_TEX_COLOR) {
+                    attributes.get(1).location(2).binding(0).format(VK_FORMAT_R32G32_SFLOAT).offset(12);
+                    attributes.get(2).location(1).binding(0).format(VK_FORMAT_R8G8B8A8_UNORM).offset(20);
+                }
+            } else {
+                // PARTICLE orders UV0 before Color: Position, UV0, Color, UV2.
+                attributes.get(1).location(1).binding(0).format(VK_FORMAT_R8G8B8A8_UNORM).offset(format == FORMAT_PARTICLE ? 20 : 12);
+                attributes.get(2).location(2).binding(0).format(VK_FORMAT_R32G32_SFLOAT).offset(format == FORMAT_PARTICLE ? 12 : 16);
+                if (text || format == FORMAT_PARTICLE) attributes.get(3).location(3).binding(0).format(VK_FORMAT_R16G16_SINT).offset(24);
+                else {
+                    attributes.get(3).location(3).binding(0).format(VK_FORMAT_R16G16_SINT).offset(24);
+                    attributes.get(4).location(4).binding(0).format(VK_FORMAT_R16G16_SINT).offset(28);
+                    // Normal (3 bytes) + padding read as one SNORM vec4; the shader uses xyz.
+                    attributes.get(5).location(5).binding(0).format(VK_FORMAT_R8G8B8A8_SNORM).offset(32);
+                }
             }
             var input = VkPipelineVertexInputStateCreateInfo.calloc(stack).sType$Default()
                     .pVertexBindingDescriptions(VkVertexInputBindingDescription.calloc(1, stack).binding(0).stride(STRIDES[format]).inputRate(VK_VERTEX_INPUT_RATE_VERTEX))
                     .pVertexAttributeDescriptions(attributes);
-            var attachment = VkPipelineColorBlendAttachmentState.calloc(1, stack)
-                    .colorWriteMask(VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT);
+            var attachment = VkPipelineColorBlendAttachmentState.calloc(1, stack).colorWriteMask((flags & NO_COLOR) != 0 ? 0
+                    : VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT);
+            if ((flags & BLEND_ADD) != 0) attachment.blendEnable(true).colorBlendOp(VK_BLEND_OP_ADD).alphaBlendOp(VK_BLEND_OP_ADD)
+                    .srcColorBlendFactor(VK_BLEND_FACTOR_ONE).dstColorBlendFactor(VK_BLEND_FACTOR_ONE)
+                    .srcAlphaBlendFactor(VK_BLEND_FACTOR_ZERO).dstAlphaBlendFactor(VK_BLEND_FACTOR_ONE);
             if ((flags & BLEND) != 0) attachment.blendEnable(true).colorBlendOp(VK_BLEND_OP_ADD).alphaBlendOp(VK_BLEND_OP_ADD)
                     .srcColorBlendFactor(VK_BLEND_FACTOR_ONE).dstColorBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
                     .srcAlphaBlendFactor(VK_BLEND_FACTOR_ONE).dstAlphaBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);

@@ -24,7 +24,7 @@ public final class NativeMainWindow {
     private static Object backend;
     private static boolean revealed;
     private static Method present, beginFrame, setVsync, frames, generations, capture, close, earlyAcquires, lateAcquires;
-    private static Method renderWorld, worldStats, finishWorldFrame, closeWorld, renderOverlay, finishOverlay, entityTexture;
+    private static Method renderWorld, renderWorldWithSky, worldStats, finishWorldFrame, closeWorld, renderOverlay, finishOverlay, entityTexture;
     private static Consumer<Object[]> worldCommands;
 
     private NativeMainWindow() { }
@@ -51,6 +51,7 @@ public final class NativeMainWindow {
             frames = type.getMethod("frames"); generations = type.getMethod("generations");
             capture = type.getMethod("captureNext", String.class); close = type.getMethod("close");
             renderWorld = type.getMethod("renderWorld", int.class, int.class); worldStats = type.getMethod("worldStats");
+            renderWorldWithSky = type.getMethod("renderWorldWithSky", int.class, int.class, Object[].class);
             finishWorldFrame = type.getMethod("finishWorldFrame"); closeWorld = type.getMethod("closeWorld");
             renderOverlay = type.getMethod("renderOverlay", Object[].class); finishOverlay = type.getMethod("finishOverlay");
             entityTexture = type.getMethod("entityTexture", Object[].class);
@@ -135,8 +136,13 @@ public final class NativeMainWindow {
         worldCommands.accept(dev.vulkanforge.bridge.WorldProtocol.pack(command)); return true;
     }
     static int renderWorld(int width, int height) { return active() ? ((Number)call(renderWorld, width, height)).intValue() : 0; }
+    /** P10: captured sky packets are drawn under the terrain in the same submit. */
+    static int renderWorld(int width, int height, Object[] sky) {
+        if (sky.length == 0) return renderWorld(width, height);
+        return active() ? ((Number)call(renderWorldWithSky, width, height, (Object) sky)).intValue() : 0;
+    }
     static boolean worldVisible() { return active() && GLFW.glfwGetWindowAttrib(mainWindow, GLFW.GLFW_ICONIFIED) == 0; }
-    static long[] worldStats() { return active() ? (long[])call(worldStats) : new long[24]; }
+    static long[] worldStats() { return active() ? (long[])call(worldStats) : new long[25]; }
     /** P7-P9: {color, depth} GL textures of one Vulkan overlay pass, or null; call finishOverlay() right after compositing. */
     static int[] renderOverlay(Object[] packets) { return active() ? (int[]) call(renderOverlay, (Object) packets) : null; }
     static void finishOverlay() { if (active()) call(finishOverlay); }
@@ -166,7 +172,7 @@ public final class NativeMainWindow {
         catch (Throwable error) { LOGGER.error("Could not close Vulkan main-window resources", cause(error)); }
         finally {
             backend = null; present = beginFrame = setVsync = frames = generations = capture = close = earlyAcquires = lateAcquires = null;
-            renderWorld = worldStats = finishWorldFrame = closeWorld = renderOverlay = finishOverlay = entityTexture = null; worldCommands = null;
+            renderWorld = renderWorldWithSky = worldStats = finishWorldFrame = closeWorld = renderOverlay = finishOverlay = entityTexture = null; worldCommands = null;
             try { if (loader != null) loader.close(); } catch (Exception error) { LOGGER.warn("Could not close backend loader", error); }
             loader = null;
         }

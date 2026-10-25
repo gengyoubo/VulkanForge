@@ -53,5 +53,34 @@ function initializeCoreMod() {
             ASMAPI.log('INFO', 'VulkanForge ASM installed Tesselator particle/weather capture');
             return node;
         }
+    },
+    // P10: renderSky's sunrise/sun/moon call BufferUploader directly; the sky disc, stars, dark disc and clouds are VertexBuffers
+    // uploaded and drawn only from LevelRenderer. Chunk sections upload elsewhere and draw with VertexBuffer.draw(), untouched here.
+    'vulkanforge_sky': {
+        'target': { 'type': 'CLASS', 'name': 'net.minecraft.client.renderer.LevelRenderer' },
+        'transformer': function(node) {
+            var hook = 'github/com/gengyoubo/vulkanforge/client/';
+            var vertexBuffer = 'com/mojang/blaze3d/vertex/VertexBuffer', rendered = 'Lcom/mojang/blaze3d/vertex/BufferBuilder$RenderedBuffer;';
+            var drawDesc = '(Lorg/joml/Matrix4f;Lorg/joml/Matrix4f;Lnet/minecraft/client/renderer/ShaderInstance;)V';
+            var immediate = 0, uploads = 0, draws = 0;
+            for (var m = 0; m < node.methods.size(); m++) {
+                var insns = node.methods.get(m).instructions;
+                var array = insns.toArray();
+                for (var i = 0; i < array.length; i++) {
+                    var insn = array[i];
+                    if (!(insn instanceof MethodInsnNode)) continue;
+                    if (insn.getOpcode() === Opcodes.INVOKESTATIC && insn.owner === 'com/mojang/blaze3d/vertex/BufferUploader' && insn.desc === '(' + rendered + ')V') {
+                        insns.set(insn, new MethodInsnNode(Opcodes.INVOKESTATIC, hook + 'EntityDraws', 'drawImmediate', '(' + rendered + ')V', false)); immediate++;
+                    } else if (insn.getOpcode() === Opcodes.INVOKEVIRTUAL && insn.owner === vertexBuffer && insn.desc === '(' + rendered + ')V') {
+                        insns.set(insn, new MethodInsnNode(Opcodes.INVOKESTATIC, hook + 'SkyBuffers', 'upload', '(L' + vertexBuffer + ';' + rendered + ')V', false)); uploads++;
+                    } else if (insn.getOpcode() === Opcodes.INVOKEVIRTUAL && insn.owner === vertexBuffer && insn.desc === drawDesc) {
+                        insns.set(insn, new MethodInsnNode(Opcodes.INVOKESTATIC, hook + 'SkyBuffers', 'draw', '(L' + vertexBuffer + ';' + drawDesc.substring(1), false)); draws++;
+                    }
+                }
+            }
+            if (immediate < 3 || uploads !== 4 || draws !== 4) throw new Error('VulkanForge sky ASM mismatch: immediate=' + immediate + ', uploads=' + uploads + ', draws=' + draws);
+            ASMAPI.log('INFO', 'VulkanForge ASM installed sky/cloud capture: immediate=' + immediate + ', uploads=' + uploads + ', draws=' + draws);
+            return node;
+        }
     }};
 }

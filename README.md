@@ -9,7 +9,7 @@ Minecraft **1.20.1 / Forge 47.4.28 / Java 17** 客户端 Vulkan 渲染实验。
 - 游戏主窗口预览：同进程 Vulkan 绘制旋转三角形 → 导出共享 GPU 图像 → 原有 GL 上下文采样 → 主菜单 / HUD 显示。
 - 世界不透明和镂空方块：采集原版烘焙模型、贴图 UV、染色、环境遮蔽与光照坐标 → 分区顶点缓冲 → Vulkan 图集/光照图采样、相机变换、alpha 丢弃、D32 深度测试 → 在原版 cutout 阶段之后合成。
 
-**这是混合渲染原型。主窗口的最终呈现已交给 Vulkan；Windows 主窗口路径中的 WorldScene 已接入同一个 Vulkan 后端，solid、cutout、cutoutMipped 地形通过共享 GPU 纹理合成，正常地形帧不经过 CPU 像素读回或 FrameProtocol。** Vulkan 覆盖范围内的半透明方块与水也由 Vulkan 绘制（P6 第一步），常见实体、方块实体和告示牌文字（P7/P8），以及粒子和雨雪（P9）由 Vulkan 叠加层通道回放；天空、云、范围外地形、Fabulous 模式下的半透明层、不支持的着色器、手持物和 HUD 仍在隐藏的 OpenGL 上下文中绘制，然后统一由主窗口 Swapchain 呈现。关闭主窗口 Vulkan 路径时保留旧的子进程读回预览作为兼容路径。
+**这是混合渲染原型。主窗口的最终呈现已交给 Vulkan；Windows 主窗口路径中的 WorldScene 已接入同一个 Vulkan 后端，solid、cutout、cutoutMipped 地形通过共享 GPU 纹理合成，正常地形帧不经过 CPU 像素读回或 FrameProtocol。** Vulkan 覆盖范围内的半透明方块与水也由 Vulkan 绘制（P6 第一步），常见实体、方块实体和告示牌文字（P7/P8）、粒子和雨雪（P9）以及云（P10）由 Vulkan 叠加层通道回放，天空在地形提交中由 Vulkan 先行绘制（P10）；范围外地形、Fabulous 模式下的半透明层、不支持的着色器、手持物和 HUD 仍在隐藏的 OpenGL 上下文中绘制，然后统一由主窗口 Swapchain 呈现。关闭主窗口 Vulkan 路径时保留旧的子进程读回预览作为兼容路径。
 
 ## 构建和启动
 
@@ -92,7 +92,7 @@ IntelliJ IDEA：导入根目录的 `build.gradle`，将 **Gradle JVM** 和 **Pro
 # Windows 主窗口：呈现/故障恢复，以及同进程 45 个非空 Section 的像素、双缓冲、相机、缩放、删除、重置与关闭后重开
 .\gradlew.bat :vulkan-lab:smokePresent
 
-# 完整 Forge 检查：ASM 钩子、Vulkan 主窗口、世界、水池与染色玻璃（P6 半透明）、箱子/告示牌/牛（P7/P8 实体通道）、营火/火把粒子与降雨（P9）、重载、昼夜光照、缩放、最小化恢复、全屏往返、切换世界，然后退出
+# 完整 Forge 检查：ASM 钩子、Vulkan 主窗口、世界、水池与染色玻璃（P6 半透明）、箱子/告示牌/牛（P7/P8 实体通道）、营火/火把粒子与降雨（P9）、天空/太阳/精美云（P10）、重载、昼夜光照、缩放、最小化恢复、全屏往返、切换世界，然后退出
 # 退出超过 30 秒或主窗口报告缺少 FINAL_PRESENTED_FRAMES / VALIDATION_ERRORS=0 时判定失败；检查期间会短暂全屏，请保持游戏窗口在前台
 # 测试源集不会被打入模组 JAR；会在 run/saves 留下测试世界和日志中的 PNG
 .\gradlew.bat -PworldSmoke runClient
@@ -159,13 +159,27 @@ Fabulous 图形模式会把半透明层画进独立目标供透明后处理链�
 
 三个窗口共用每槽位的一对共享叠加层图像。GL 合成后立即 `finishOverlay()` 发出完成信号量，下一个窗口的 Vulkan 提交等待它后清屏复用，因此每个窗口都是独立的“等待 → 绘制 → 信号 → GL 租用”往返。每个窗口重新从当帧地形深度开始，每个“槽位 × 窗口”有独立的命令缓冲、fence、顶点/索引/uniform 环形缓冲和描述符池，同一帧内的多次提交互不覆盖。
 
-粒子在 Vulkan 中只与地形深度测试，水、实体等 GL 深度由合成时的深度测试处理：位于水面后的粒子会被剔除，与原版先画水再画粒子的行为一致。尚未覆盖：使用自定义着色器或 `CUSTOM` 渲染类型自行绘制的模组粒子、云（P10）。
+粒子在 Vulkan 中只与地形深度测试，水、实体等 GL 深度由合成时的深度测试处理：位于水面后的粒子会被剔除，与原版先画水再画粒子的行为一致。尚未覆盖：使用自定义着色器或 `CUSTOM` 渲染类型自行绘制的模组粒子。
 
-## 后续阶段（P10–P11）
+## 天空与云（P10）
 
-两个阶段都复用“捕获 → 镜像贴图 → Vulkan 回放 → 带深度合成”框架，主要工作是增加捕获点和着色器移植：
+天空的绘制路径与实体不同：天空盘、星空和地平线下的暗盘是 `LevelRenderer` 启动时上传的静态 `VertexBuffer`，用自己的矩阵调用 `drawWithShader`；日出扇形、太阳和月亮直接调用 `BufferUploader`；云是变化时重建的 `VertexBuffer`。`coremods/entities.js` 只改写 `LevelRenderer` 内的这些调用点（按 owner/描述符匹配并检查数量：4 次上传、4 次绘制、至少 3 次直接上传）。`SkyBuffers` 只为这几块缓冲保留 CPU 副本；区块网格和即时绘制在别处上传，不会被复制。
 
-- **P10 天空与云**：天空使用 `VertexBuffer.drawWithShader`（`position`、`position_tex`、`position_color` 着色器），云使用 `rendertype_clouds`。需要镜像静态 `VertexBuffer` 网格（天空、星星、云在重建时上传一次），在地形之前绘制到同一个 Vulkan 场景目标中；这样地形清屏不再需要原版天空。
+| 窗口 | 打开 | 关闭 | 绘制位置 |
+| --- | --- | --- | --- |
+| SKY | `ViewportEvent.ComputeFogColor`（清屏和画天空之前） | `AFTER_SKY` | 同帧地形提交中，先于地形画进不透明目标 |
+| WEATHER（P9 已有） | `AFTER_PARTICLES` | `AFTER_WEATHER` | 叠加层：云（精美云的“仅深度”预通道加颜色通道）与雨雪 |
+
+天空不需要额外提交：Vulkan 地形目标清为雾色、alpha 0，天空先以不写深度的方式画入，再画地形。合成时天空像素的 Vulkan 深度为 1.0，只有在 GL 深度也是 1.0（没有 GL 回退地形）的位置通过测试，因此范围外的 GL 地形仍会挡住天空。只有上一帧完成了 Vulkan 地形合成（非小窗模式）时，才会捕获本帧天空；如果本帧地形提交没有执行，这一帧会只显示雾色清屏。
+
+新增着色器移植：`position`（天空盘、星空、暗盘，带雾）、`position_color`（日出扇形）、`position_tex`（太阳、月亮）、`position_tex_color`（末地天空）、`position_tex_color_normal`（云，带雾），对应 `simple_*.vert` 和片元着色器的两个新分支（在乘颜色调制之前，按 alpha == 0 或 < 0.1 丢弃）。没有贴图的着色器使用后端内置的 1×1 白图。`TRIANGLE_FAN` 在捕获时转换为带索引的三角形列表。新增两种状态：太阳、月亮和星星使用的加法混合 `(SRC_ALPHA, ONE)`，在 Vulkan 中按“加 rgb·a、不改变覆盖率”实现；颜色写掩码全关（云的深度预通道）。
+
+尚未覆盖：维度特效或模组自定义的天空/云渲染（`DimensionSpecialEffects.renderSky/renderClouds` 返回 true 时原版代码不执行）、Fabulous 模式的云目标。测试场景通过会话内设置开启“精美”云：开发环境的 `options.txt` 关闭了云；1.20.1 在渲染距离小于 4 时也会关闭云。
+
+## 后续阶段（P11）
+
+继续复用“捕获 → 镜像贴图 → Vulkan 回放 → 带深度合成”框架：
+
 - **P11 手持物与 GUI**：手持物经 `RenderType.end`（可直接扩展 P8 捕获窗口）。GUI 由 `GuiGraphics` 产生，包括 `position_color`、`position_tex`、文字和物品图标。由于最终呈现已在 Vulkan 交换链，GUI 适合在 blit 之后直接画进交换链图像，不再经过 GL 合成。字体字形页需要随动态上传增量镜像。
 
 ## 接入结构

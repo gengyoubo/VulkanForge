@@ -56,7 +56,8 @@ public final class WorldClientSmoke {
                 }
                 stage = 1;
                 mc.options.pauseOnLostFocus = false;
-                mc.options.renderDistance().set(3);
+                mc.options.renderDistance().set(4); // clouds are off below 4 (Options.getCloudsType)
+                mc.options.cloudStatus().set(net.minecraft.client.CloudStatus.FANCY); // P10: two-pass clouds (depth prepass + color)
                 mc.options.graphicsMode().set(net.minecraft.client.GraphicsStatus.FANCY);
                 mc.options.gamma().set(0.0);
                 createWorld(mc, "VulkanForge Smoke ");
@@ -130,6 +131,14 @@ public final class WorldClientSmoke {
                     require(weather[0] > 0 && weather[1] > 0, "Rain was not replayed by Vulkan: " + java.util.Arrays.toString(weather));
                     log("PASS P9 particles and weather: particle draws=" + particles[0] + " composites=" + particles[1] + ", rain/snow draws=" + weather[0]
                             + " composites=" + weather[1] + ", overlay passes=" + stats[18]);
+                    long[] skyWindow = EntityDraws.stats(EntityDraws.Window.SKY);
+                    var shaders = EntityDraws.capturedShaders();
+                    require(skyWindow[0] > 0 && skyWindow[1] > 0 && stats[24] > 0, "Sky was not drawn by the terrain submit: " + java.util.Arrays.toString(skyWindow) + " skyDraws=" + stats[24]);
+                    require(shaders.getOrDefault("position", 0L) > 0 && shaders.getOrDefault("position_tex", 0L) > 0, "Sky disc or sun/moon not captured: " + shaders);
+                    require(shaders.getOrDefault("position_tex_color_normal", 0L) > 0, "Clouds not captured: " + shaders);
+                    log("PASS P10 sky and clouds: sky draws=" + skyWindow[0] + " in " + skyWindow[1] + " terrain submits (Vulkan sky draws=" + stats[24]
+                            + "), clouds=" + shaders.get("position_tex_color_normal"));
+                    log("INFO captured shaders: " + shaders);
                     log("INFO GL fallback shaders: " + EntityDraws.fallbackShaders());
                     var clear = mc.getSingleplayerServer();
                     clear.execute(() -> clear.overworld().setWeatherParameters(6000, 0, false, false));

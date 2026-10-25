@@ -53,13 +53,18 @@ public final class ClientEvents {
     @SubscribeEvent
     public static void terrain(RenderLevelStageEvent event) {
         // This stage carries the view pose; AFTER_LEVEL in 1.20.1 carries a different pose stack.
-        if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_CUTOUT_BLOCKS) VulkanPreview.terrain(event);
+        if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_SKY) VulkanPreview.skyEnd();
+        else if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_CUTOUT_BLOCKS) VulkanPreview.terrain(event);
         else if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_BLOCK_ENTITIES) VulkanPreview.entities();
         else if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_TRANSLUCENT_BLOCKS) VulkanPreview.translucent();
         else if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_TRIPWIRE_BLOCKS) VulkanPreview.particlesBegin();
         else if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_PARTICLES) VulkanPreview.particlesEnd();
         else if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_WEATHER) VulkanPreview.weather();
     }
+
+    /** Fired by FogRenderer.setupColor right before LevelRenderer clears and renders the sky (P10). */
+    @SubscribeEvent
+    public static void skyFog(net.minecraftforge.client.event.ViewportEvent.ComputeFogColor event) { VulkanPreview.skyBegin(); }
 
     @SubscribeEvent
     public static void screenKey(ScreenEvent.KeyPressed.Pre event) {

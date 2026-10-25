@@ -48,13 +48,16 @@ final class VulkanPreview {
         if (!enabled || sink == null) return;
         translucentPending = false;
         EntityDraws.cancel();
-        if (direct && !NativeMainWindow.worldVisible()) { uploadedEpoch = 0; return; }
+        // P10: the next frame's sky may be captured only while this frame's terrain composite covers the screen.
+        boolean composited = false;
+        if (direct && !NativeMainWindow.worldVisible()) { uploadedEpoch = 0; EntityDraws.armSky(false); return; }
         try {
             WORLD.update(event, sink);
             if (direct) renderShared(); else upload();
             if (!inset && uploadedEpoch != 0 && uploadedEpoch == WORLD.epoch()) {
                 if (direct && sharedTexture != null) {
                     PRESENTER.draw(sharedTexture.getId(), sharedDepth);
+                    composited = true;
                     translucentPending = sharedTranslucent > 0 && sharedTranslucentDepth > 0 && TerrainPresenter.translucentReady()
                             && !Minecraft.useShaderTransparency();
                     // P7/P8: entity and block-entity draws until AFTER_BLOCK_ENTITIES go to the Vulkan entity pass when supported.
@@ -67,7 +70,12 @@ final class VulkanPreview {
             VulkanForge.LOGGER.error("Could not capture solid terrain for Vulkan", error);
             close();
         }
+        EntityDraws.armSky(composited && enabled);
     }
+    /** ViewportEvent.ComputeFogColor: LevelRenderer is about to clear and draw the sky. */
+    static void skyBegin() { if (enabled && direct) EntityDraws.openSky(); }
+    /** AFTER_SKY: captured sky waits for this frame's terrain submit. */
+    static void skyEnd() { EntityDraws.closeSky(); }
 
     /** AFTER_BLOCK_ENTITIES: replay captured entity/block-entity draws in Vulkan and composite them with depth. */
     static void entities() { overlay(EntityDraws.Window.ENTITIES, null); }
@@ -111,7 +119,7 @@ final class VulkanPreview {
                 && uploadedEpoch != 0 && uploadedEpoch == WORLD.epoch() && WORLD.covers(origin);
     }
     static boolean directWorld() { return enabled && direct; }
-    static long[] directWorldStats() { return directWorld() ? NativeMainWindow.worldStats() : new long[24]; }
+    static long[] directWorldStats() { return directWorld() ? NativeMainWindow.worldStats() : new long[25]; }
     static int saveWorldFrame(java.nio.file.Path path) throws java.io.IOException {
         RenderSystem.assertOnRenderThread();
         // A diagnostic read acquires a fresh GL lease; normal terrain rendering never downloads pixels.
@@ -128,7 +136,7 @@ final class VulkanPreview {
     private static void renderShared() {
         if (!NativeMainWindow.worldVisible()) { uploadedEpoch = 0; return; }
         var target = Minecraft.getInstance().getMainRenderTarget();
-        int id = NativeMainWindow.renderWorld(target.viewWidth, target.viewHeight);
+        int id = NativeMainWindow.renderWorld(target.viewWidth, target.viewHeight, EntityDraws.takeSky());
         long[] stats = NativeMainWindow.worldStats();
         if (id == 0) { uploadedEpoch = 0; return; }
         uploadedEpoch = stats[0];

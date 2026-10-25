@@ -57,6 +57,7 @@ final class SharedWorldSmoke {
         require(backend.worldStats()[2] == 0 && backend.renderWorld(270, 150) == 0, "Stale mesh survived reset");
         translucent(backend, send);
         entities(backend);
+        sky(backend);
         backend.closeWorld();
         requireAlpha(backend.renderWorld(180, 100), 180, 100, 255); // Reopen as menu preview, close with a GL read lease open.
         backend.closeWorld();
@@ -177,6 +178,53 @@ final class SharedWorldSmoke {
         System.out.println("ENTITY_SMOKE=OK (entity texture mirror, terrain depth test, entity depth export, both slots)");
         System.out.println("PARTICLE_OVERLAY_SMOKE=OK (second pass per frame, PARTICLE layout, premultiplied blend, cleared reuse, terrain-only depth)");
     }
+    /**
+     * P10 sky inside the terrain submit, under the translucent scene's opaque grey quad ([-.5,.5]^2, depth .6): an opaque POSITION
+     * disc (sky blue via ColorModulator), an additive POSITION_TEX red "sun" on the right and a color-less depth quad (cloud prepass)
+     * at depth .05 that must hide the terrain behind it.
+     */
+    private static void sky(MainWindowBackend backend) {
+        ByteBuffer disc = ByteBuffer.allocate(4 * 12).order(ByteOrder.LITTLE_ENDIAN);
+        for (float[] c : new float[][]{{-1, -1}, {1, -1}, {1, 1}, {-1, 1}}) disc.putFloat(c[0]).putFloat(c[1]).putFloat(.98f);
+        ByteBuffer sun = ByteBuffer.allocate(4 * 20).order(ByteOrder.LITTLE_ENDIAN);
+        for (float[] c : new float[][]{{.6f, -.3f}, {.9f, -.3f}, {.9f, .3f}, {.6f, .3f}}) sun.putFloat(c[0]).putFloat(c[1]).putFloat(.97f).putFloat(.5f).putFloat(.5f);
+        ByteBuffer prepass = ByteBuffer.allocate(4 * 12).order(ByteOrder.LITTLE_ENDIAN);
+        for (float[] c : new float[][]{{-.4f, -.3f}, {-.2f, -.3f}, {-.2f, .3f}, {-.4f, .3f}}) prepass.putFloat(c[0]).putFloat(c[1]).putFloat(-.9f);
+        Object[] packets = {
+                skyPacket(EntityPass.FORMAT_POSITION, 3, EntityPass.DEPTH_TEST, EntityPass.WHITE_TEXTURE, disc.array(), new float[]{.2f, .4f, .8f, 1}, 1),
+                skyPacket(EntityPass.FORMAT_POSITION_TEX, 4, EntityPass.DEPTH_TEST | EntityPass.BLEND_ADD, 1003, sun.array(), new float[]{1, 1, 1, 1}, 2),
+                skyPacket(EntityPass.FORMAT_POSITION, 3, EntityPass.DEPTH_TEST | EntityPass.DEPTH_WRITE | EntityPass.NO_COLOR, EntityPass.WHITE_TEXTURE, prepass.array(), new float[]{1, 0, 1, 1}, 1)};
+        int width = 64, height = 64;
+        for (int frame = 0; frame < 2; frame++) {
+            int texture = backend.renderWorldWithSky(width, height, packets);
+            ByteBuffer pixels = read(texture, width, height);
+            try {
+                int row = height / 2 * width;
+                int[] skyOnly = rgba(pixels, row + (int)(.05f * width)), terrain = rgba(pixels, row + width / 2), lit = rgba(pixels, row + (int)(.875f * width)),
+                        hidden = rgba(pixels, row + (int)(.35f * width));
+                require(near(skyOnly, 51, 102, 204, 255), "Sky disc missing under terrain: " + java.util.Arrays.toString(skyOnly));
+                require(near(terrain, 128, 128, 128, 255), "Terrain must draw over the sky: " + java.util.Arrays.toString(terrain));
+                require(near(lit, 255, 102, 204, 255), "Additive sun wrong: " + java.util.Arrays.toString(lit));
+                require(near(hidden, 51, 102, 204, 255), "Color-less depth prepass must hide terrain and keep sky color: " + java.util.Arrays.toString(hidden));
+            } finally { MemoryUtil.memFree(pixels); }
+            backend.finishWorldFrame();
+        }
+        require(backend.worldStats()[24] >= 6, "Sky packets were not drawn in the terrain submit");
+        System.out.println("SKY_SMOKE=OK (sky under terrain in the terrain submit, POSITION/POSITION_TEX formats, additive blend, color-less depth prepass)");
+    }
+    private static Object[] skyPacket(int format, int variant, int flags, int texture, byte[] vertices, float[] color, float output) {
+        float[] uniforms = new float[EntityPass.UNIFORM_FLOATS];
+        for (int i = 0; i < 4; i++) { uniforms[i * 5] = 1; uniforms[16 + i * 5] = 1; }
+        uniforms[32] = uniforms[37] = uniforms[42] = 1;
+        System.arraycopy(color, 0, uniforms, 44, 4);
+        uniforms[55] = output; uniforms[60] = 1e9f; uniforms[61] = 2e9f; uniforms[63] = variant;
+        int[] header = new int[EntityPass.HEADER];
+        header[EntityPass.H_FORMAT] = format; header[EntityPass.H_VARIANT] = variant; header[EntityPass.H_FLAGS] = flags;
+        header[EntityPass.H_TEXTURE] = texture; header[EntityPass.H_OVERLAY] = texture; header[EntityPass.H_VERTICES] = 4; header[EntityPass.H_MODE] = EntityPass.MODE_QUADS;
+        return new Object[]{header, uniforms, vertices, null};
+    }
+    private static int[] rgba(ByteBuffer pixels, int pixel) { int[] c = new int[4]; for (int i = 0; i < 4; i++) c[i] = Byte.toUnsignedInt(pixels.get(pixel * 4 + i)); return c; }
+    private static boolean near(int[] c, int r, int g, int b, int a) { return Math.abs(c[0] - r) <= 2 && Math.abs(c[1] - g) <= 2 && Math.abs(c[2] - b) <= 2 && Math.abs(c[3] - a) <= 2; }
     /** NEW_ENTITY layout: position, color, uv0, overlay uv1, light uv2, normal + padding (36 bytes). */
     private static void entityQuad(ByteBuffer vertices, float x0, float x1, float z) {
         float[][] corners = {{x0, -.3f}, {x1, -.3f}, {x1, .3f}, {x0, .3f}};

@@ -109,7 +109,13 @@ public final class MainWindowBackend implements AutoCloseable {
         return world;
     }
     public int renderWorld(int width, int height) { return world().render(width, height); }
-    public long[] worldStats() { return world == null ? new long[24] : world.stats(); }
+    /** P10: like renderWorld, drawing the captured sky packets (EntityPass Object[]s) under the terrain. */
+    public int renderWorldWithSky(int width, int height, Object[] sky) {
+        var list = new java.util.ArrayList<Object[]>(sky.length);
+        for (Object packet : sky) list.add((Object[]) packet);
+        return world().render(width, height, list);
+    }
+    public long[] worldStats() { return world == null ? new long[25] : world.stats(); }
     /** P7-P9: packets are EntityPass Object[]s; returns {color, depth} GL textures leased until finishOverlay, or null. */
     public int[] renderOverlay(Object[] packets) {
         if (world == null) return null;
