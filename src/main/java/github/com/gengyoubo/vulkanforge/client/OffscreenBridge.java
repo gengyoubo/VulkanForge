@@ -126,7 +126,7 @@ final class OffscreenBridge implements AutoCloseable {
         recycle(latest.getAndSet(null));
         Process process = child;
         if (process != null) {
-            requestStop(process);
+            IO.execute(() -> requestStop(process));
             IO.execute(() -> {
                 try { if (!process.waitFor(2, TimeUnit.SECONDS)) process.destroyForcibly(); }
                 catch (InterruptedException e) { Thread.currentThread().interrupt(); process.destroyForcibly(); }

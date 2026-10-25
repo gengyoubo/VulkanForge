@@ -11,6 +11,9 @@ import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.event.RegisterKeyMappingsEvent;
 import net.minecraftforge.client.event.ScreenEvent;
 import net.minecraftforge.client.event.RenderGuiEvent;
+import net.minecraftforge.client.event.RenderLevelStageEvent;
+import net.minecraftforge.client.event.RegisterClientReloadListenersEvent;
+import net.minecraft.server.packs.resources.ResourceManagerReloadListener;
 import net.minecraftforge.event.GameShuttingDownEvent;
 import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
@@ -24,12 +27,15 @@ public final class ClientEvents {
             InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_F8, "key.categories.vulkanforge");
     private static final KeyMapping TRIANGLE = new KeyMapping("key.vulkanforge.triangle",
             InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_F9, "key.categories.vulkanforge");
+    private static final KeyMapping INSET = new KeyMapping("key.vulkanforge.inset",
+            InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_F10, "key.categories.vulkanforge");
 
     @SubscribeEvent
     public static void tick(TickEvent.ClientTickEvent event) {
         if (event.phase == TickEvent.Phase.END) {
             while (PREVIEW.consumeClick()) VulkanPreview.toggle();
             while (TRIANGLE.consumeClick()) launchTriangle();
+            while (INSET.consumeClick()) VulkanPreview.toggleInset();
         }
     }
 
@@ -45,6 +51,12 @@ public final class ClientEvents {
     public static void renderScreen(ScreenEvent.Render.Post event) { VulkanPreview.render(event.getGuiGraphics()); }
 
     @SubscribeEvent
+    public static void terrain(RenderLevelStageEvent event) {
+        // This stage carries the view pose; AFTER_LEVEL in 1.20.1 carries a different pose stack.
+        if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_SOLID_BLOCKS) VulkanPreview.terrain(event);
+    }
+
+    @SubscribeEvent
     public static void screenKey(ScreenEvent.KeyPressed.Pre event) {
         if (PREVIEW.matches(event.getKeyCode(), event.getScanCode())) {
             VulkanPreview.toggle();
@@ -52,6 +64,8 @@ public final class ClientEvents {
         } else if (TRIANGLE.matches(event.getKeyCode(), event.getScanCode())) {
             launchTriangle();
             event.setCanceled(true);
+        } else if (INSET.matches(event.getKeyCode(), event.getScanCode())) {
+            VulkanPreview.toggleInset(); event.setCanceled(true);
         }
     }
 
@@ -74,7 +88,12 @@ public final class ClientEvents {
     @Mod.EventBusSubscriber(modid = VulkanForge.MOD_ID, value = Dist.CLIENT, bus = Mod.EventBusSubscriber.Bus.MOD)
     public static final class Lifecycle {
         @SubscribeEvent
-        public static void keys(RegisterKeyMappingsEvent event) { event.register(PREVIEW); event.register(TRIANGLE); }
+        public static void keys(RegisterKeyMappingsEvent event) { event.register(PREVIEW); event.register(TRIANGLE); event.register(INSET); }
+
+        @SubscribeEvent
+        public static void reload(RegisterClientReloadListenersEvent event) {
+            event.registerReloadListener((ResourceManagerReloadListener) resources -> VulkanPreview.invalidateWorld());
+        }
 
         @SubscribeEvent
         public static void setup(FMLClientSetupEvent event) { event.enqueueWork(LabLauncher::probe); }

@@ -19,6 +19,7 @@ final class WorldScene implements AutoCloseable {
     private GpuImage atlas;
     private VkCommandBuffer upload;
     private WorldProtocol.Camera camera;
+    private boolean receivedMesh;
 
     WorldScene(VulkanContext context) { this.context = context; }
 
@@ -63,6 +64,7 @@ final class WorldScene implements AutoCloseable {
         else if (command instanceof WorldProtocol.Atlas image) uploadAtlas(image);
         else if (command instanceof WorldProtocol.Remove remove) { Section old = sections.remove(remove.key()); if (old != null) old.close(); }
         else if (command instanceof WorldProtocol.Mesh mesh) {
+            receivedMesh = true;
             if (sections.size() >= 64 && !sections.containsKey(mesh.key())) throw new IllegalStateException("World section cache limit exceeded");
             Section replacement = mesh.vertices().length == 0 ? null : new Section(mesh.x(), mesh.y(), mesh.z(), mesh.vertices().length / WorldProtocol.STRIDE,
                     new GpuBuffer(context, mesh.vertices(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT));
@@ -73,7 +75,7 @@ final class WorldScene implements AutoCloseable {
         }
     }
 
-    boolean ready() { return camera != null && atlas != null && !sections.isEmpty(); }
+    boolean ready() { return camera != null && atlas != null && receivedMesh; }
     long renderedEpoch() { return ready() ? epoch : 0; }
     float red() { return camera.red(); }
     float green() { return camera.green(); }
@@ -133,7 +135,7 @@ final class WorldScene implements AutoCloseable {
     }
 
     private void clear() {
-        sections.values().forEach(Section::close); sections.clear(); camera = null;
+        sections.values().forEach(Section::close); sections.clear(); camera = null; receivedMesh = false;
         if (atlas != null) { atlas.close(); atlas = null; }
     }
 

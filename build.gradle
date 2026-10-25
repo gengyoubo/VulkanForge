@@ -9,6 +9,12 @@ group = mod_group_id
 base { archivesName = mod_id }
 java.toolchain.languageVersion = JavaLanguageVersion.of(17)
 sourceSets.main.java.srcDir 'bridge-protocol/src/main/java'
+sourceSets {
+    smoke {
+        compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
+        runtimeClasspath += output + compileClasspath
+    }
+}
 
 minecraft {
     mappings channel: 'official', version: minecraft_version
@@ -19,7 +25,12 @@ minecraft {
             property 'forge.logging.console.level', 'info'
             mods { vulkanforge { source sourceSets.main } }
         }
-        client { }
+        client {
+            if (project.hasProperty('worldSmoke')) {
+                property 'vulkanforge.worldSmoke', 'true'
+                mods { vulkanforge { source sourceSets.smoke } }
+            }
+        }
         server { args '--nogui' }
     }
 }

@@ -8,7 +8,7 @@ version="${version}"
 displayName="VulkanForge"
 authors="gengy"
 displayTest="IGNORE_ALL_VERSION"
-description='''Experimental Vulkan 1.4 renderer for Forge 1.20.1. Includes GPU detection, a rotating Vulkan offscreen preview inside the game window (F8) and a standalone swapchain test (F9). Preview uses CPU readback and OpenGL upload; world rendering is still vanilla.'''
+description='''Experimental Vulkan 1.4 renderer for Forge 1.20.1. F8 enables nearby solid terrain with baked block models, block atlas and depth testing. F10 switches full view/inset, F9 opens the standalone test. Vulkan color uses CPU readback and OpenGL presentation; vanilla still renders its passes for depth and unsupported layers.'''
 
 [[dependencies.vulkanforge]]
 modId="forge"

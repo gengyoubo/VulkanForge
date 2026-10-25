@@ -45,3 +45,9 @@ tasks.register('smokeBridge', JavaExec) {
     mainClass = 'dev.vulkanforge.lab.BridgeSmokeTest'
     args tasks.named('fatJar', Jar).get().archiveFile.get().asFile.absolutePath
 }
+tasks.register('smokeWorld', JavaExec) {
+    dependsOn 'fatJar', 'testClasses'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.vulkanforge.lab.WorldSmokeTest'
+    args tasks.named('fatJar', Jar).get().archiveFile.get().asFile.absolutePath
+}

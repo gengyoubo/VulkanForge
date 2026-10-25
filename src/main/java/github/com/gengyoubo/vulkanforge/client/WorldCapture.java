@@ -39,6 +39,9 @@ final class WorldCapture {
     long epoch() { return epoch; }
     int sections() { return sent.size(); }
     void invalidate() { level = null; }
+    void leave(OffscreenBridge bridge) {
+        if (epoch != 0) { epoch = 0; level = null; sent.clear(); atlasSent = false; bridge.reset(0); }
+    }
 
     void update(RenderLevelStageEvent event, OffscreenBridge bridge) {
         Minecraft mc = Minecraft.getInstance();

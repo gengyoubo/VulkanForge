@@ -1,5 +1,6 @@
 {
-  "key.vulkanforge.preview": "切换游戏窗口中的 Vulkan 预览",
+  "key.vulkanforge.preview": "开关 Vulkan 不透明地形 / 主菜单预览",
+  "key.vulkanforge.inset": "切换 Vulkan 地形全屏 / 小窗对照",
   "key.vulkanforge.triangle": "打开独立 Vulkan 三角形窗口",
   "key.categories.vulkanforge": "VulkanForge",
   "vulkanforge.preview": "Vulkan 窗口内预览",
@@ -8,6 +9,8 @@
   "vulkanforge.preview.failed": "Vulkan 启动失败，请查看桥接报告",
   "vulkanforge.preview.stopped": "Vulkan 预览已停止",
   "vulkanforge.preview.transport": "读回预览 | F8 开关",
+  "vulkanforge.world.status": "Vulkan 地形 | %s 分区 | 第 %s 帧",
+  "vulkanforge.world.controls": "F8 开关 | F10 小窗对照",
   "vulkanforge.launching": "正在启动 Vulkan 测试窗口，报告保存在 logs/vulkanforge。",
   "vulkanforge.busy": "已有 Vulkan 测试窗口正在运行。"
 }

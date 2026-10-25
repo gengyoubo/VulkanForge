@@ -134,7 +134,7 @@ final class OffscreenRenderer implements AutoCloseable {
                     .imageView(view).imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
                     .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
             color.clearValue().color().float32(0, 0.025f).float32(1, 0.04f).float32(2, 0.075f).float32(3, 1);
-            if (terrain) color.clearValue().color().float32(0, world.red()).float32(1, world.green()).float32(2, world.blue());
+            if (terrain) color.clearValue().color().float32(0, world.red()).float32(1, world.green()).float32(2, world.blue()).float32(3, 0);
             VkRenderingInfo rendering = VkRenderingInfo.calloc(stack).sType$Default().layerCount(1).pColorAttachments(color)
                     .renderArea(r -> r.offset(o -> o.set(0, 0)).extent(e -> e.set(width, height)));
             if (terrain) {
