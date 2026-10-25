@@ -54,6 +54,7 @@ public final class ClientEvents {
     public static void terrain(RenderLevelStageEvent event) {
         // This stage carries the view pose; AFTER_LEVEL in 1.20.1 carries a different pose stack.
         if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_SKY) VulkanPreview.skyEnd();
+        else if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_LEVEL) VulkanPreview.handBegin();
         else if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_CUTOUT_BLOCKS) VulkanPreview.terrain(event);
         else if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_BLOCK_ENTITIES) VulkanPreview.entities();
         else if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_TRANSLUCENT_BLOCKS) VulkanPreview.translucent();

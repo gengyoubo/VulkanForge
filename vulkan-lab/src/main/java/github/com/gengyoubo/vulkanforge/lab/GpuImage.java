@@ -27,9 +27,12 @@ final class GpuImage implements AutoCloseable {
                     .memoryTypeIndex(GpuBuffer.memoryType(context, stack, requirements.memoryTypeBits(), VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
             check(vkAllocateMemory(context.device, allocation, null, handle), "vkAllocateMemory(world image)"); memory = handle.get(0);
             check(vkBindImageMemory(context.device, image, memory, 0), "vkBindImageMemory(world)");
-            var viewInfo = VkImageViewCreateInfo.calloc(stack).sType$Default().image(image).viewType(VK_IMAGE_VIEW_TYPE_2D).format(format)
-                    .subresourceRange(r -> r.aspectMask(aspect).levelCount(1).layerCount(1));
-            check(vkCreateImageView(context.device, viewInfo, null, handle), "vkCreateImageView(world)"); view = handle.get(0);
+            if ((usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+                    | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) != 0) {
+                var viewInfo = VkImageViewCreateInfo.calloc(stack).sType$Default().image(image).viewType(VK_IMAGE_VIEW_TYPE_2D).format(format)
+                        .subresourceRange(r -> r.aspectMask(aspect).levelCount(1).layerCount(1));
+                check(vkCreateImageView(context.device, viewInfo, null, handle), "vkCreateImageView(world)"); view = handle.get(0);
+            }
         } catch (Throwable error) { close(); throw error; }
     }
 

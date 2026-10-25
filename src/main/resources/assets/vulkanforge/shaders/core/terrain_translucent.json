@@ -1,4 +1,5 @@
 {
+  "blend": {"func":"add", "srcrgb":"one", "dstrgb":"1-srcalpha", "srcalpha":"one", "dstalpha":"1-srcalpha"},
   "vertex": "vulkanforge:terrain_composite",
   "fragment": "vulkanforge:terrain_translucent",
   "attributes": ["Position", "UV0"],

@@ -24,7 +24,7 @@ public final class NativeMainWindow {
     private static Object backend;
     private static boolean revealed;
     private static Method present, beginFrame, setVsync, frames, generations, capture, close, earlyAcquires, lateAcquires;
-    private static Method renderWorld, renderWorldWithSky, worldStats, finishWorldFrame, closeWorld, renderOverlay, finishOverlay, entityTexture;
+    private static Method renderWorld, renderWorldWithSky, worldStats, finishWorldFrame, closeWorld, renderOverlay, finishOverlay, entityTexture, entityTexturePatch, gui, guiPasses;
     private static Consumer<Object[]> worldCommands;
 
     private NativeMainWindow() { }
@@ -53,8 +53,10 @@ public final class NativeMainWindow {
             renderWorld = type.getMethod("renderWorld", int.class, int.class); worldStats = type.getMethod("worldStats");
             renderWorldWithSky = type.getMethod("renderWorldWithSky", int.class, int.class, Object[].class);
             finishWorldFrame = type.getMethod("finishWorldFrame"); closeWorld = type.getMethod("closeWorld");
-            renderOverlay = type.getMethod("renderOverlay", Object[].class); finishOverlay = type.getMethod("finishOverlay");
+            renderOverlay = type.getMethod("renderOverlay", Object[].class, boolean.class); finishOverlay = type.getMethod("finishOverlay");
+            gui = type.getMethod("gui", Object[].class); guiPasses = type.getMethod("guiPasses");
             entityTexture = type.getMethod("entityTexture", Object[].class);
+            entityTexturePatch = type.getMethod("entityTexturePatch", Object[].class);
             Function<long[], Consumer<int[]>> terrainImporter = GlInterop::importTerrain;
             @SuppressWarnings("unchecked") Consumer<Object[]> commands = (Consumer<Object[]>) type.getMethod("worldCommands", Function.class).invoke(backend, terrainImporter);
             worldCommands = commands;
@@ -115,6 +117,9 @@ public final class NativeMainWindow {
     }
     public static void swapBuffers(long window) {
         if (!active() || window != mainWindow) { GLFW.glfwSwapBuffers(window); return; }
+        // P11: a hand/GUI window still open (e.g. F1 hides the GUI, so no GUI event closed HAND) is composited before present.
+        VulkanPreview.beforeSwap();
+        call(gui, (Object) GuiDraws.take());
         call(finishWorldFrame);
         Minecraft mc = Minecraft.getInstance();
         var target = mc.getMainRenderTarget();
@@ -130,6 +135,7 @@ public final class NativeMainWindow {
         }
     }
 
+    static long guiPasses() { return active() ? ((Number) call(guiPasses)).longValue() : 0; }
     public static long presentedFrames() { return active() ? ((Number) call(frames)).longValue() : 0; }
     static boolean sendWorld(dev.vulkanforge.bridge.WorldProtocol.Command command) {
         if (!active()) return false;
@@ -144,8 +150,9 @@ public final class NativeMainWindow {
     static boolean worldVisible() { return active() && GLFW.glfwGetWindowAttrib(mainWindow, GLFW.GLFW_ICONIFIED) == 0; }
     static long[] worldStats() { return active() ? (long[])call(worldStats) : new long[25]; }
     /** P7-P9: {color, depth} GL textures of one Vulkan overlay pass, or null; call finishOverlay() right after compositing. */
-    static int[] renderOverlay(Object[] packets) { return active() ? (int[]) call(renderOverlay, (Object) packets) : null; }
+    static int[] renderOverlay(Object[] packets, boolean clearDepth) { return active() ? (int[]) call(renderOverlay, (Object) packets, clearDepth) : null; }
     static void finishOverlay() { if (active()) call(finishOverlay); }
+    static boolean entityTexturePatch(Object[] patch) { return active() && (Boolean) call(entityTexturePatch, (Object) patch); }
     static boolean entityTexture(Object[] texture) { return active() && (Boolean) call(entityTexture, (Object) texture); }
     static void closeWorld() { if (active()) call(closeWorld); }
     public static long acquiresBeforeInput() { return active() ? ((Number) call(earlyAcquires)).longValue() : 0; }
@@ -172,7 +179,7 @@ public final class NativeMainWindow {
         catch (Throwable error) { LOGGER.error("Could not close Vulkan main-window resources", cause(error)); }
         finally {
             backend = null; present = beginFrame = setVsync = frames = generations = capture = close = earlyAcquires = lateAcquires = null;
-            renderWorld = renderWorldWithSky = worldStats = finishWorldFrame = closeWorld = renderOverlay = finishOverlay = entityTexture = null; worldCommands = null;
+            renderWorld = renderWorldWithSky = worldStats = finishWorldFrame = closeWorld = renderOverlay = finishOverlay = entityTexture = entityTexturePatch = gui = guiPasses = null; worldCommands = null;
             try { if (loader != null) loader.close(); } catch (Exception error) { LOGGER.warn("Could not close backend loader", error); }
             loader = null;
         }

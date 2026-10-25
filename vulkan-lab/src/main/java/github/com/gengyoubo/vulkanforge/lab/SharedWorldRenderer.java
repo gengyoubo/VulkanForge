@@ -47,7 +47,7 @@ final class SharedWorldRenderer implements AutoCloseable {
     private long pool, triangleLayout, trianglePipeline, frames, terrainFrames, sectionDraws;
     private final long started = System.nanoTime();
     /** Overlay passes allowed per frame; each owns a command buffer, fence and EntityPass ring set per slot. */
-    static final int MAX_OVERLAYS = 4;
+    static final int MAX_OVERLAYS = 16; // world windows plus order-preserving hand/HUD/screen splits (P11)
     private int width, height, generations, reading = -1, overlayReading = -1;
     private EntityPass entities;
     private long overlayPasses, skyDraws;
@@ -244,39 +244,54 @@ final class SharedWorldRenderer implements AutoCloseable {
      * P7-P9: replays one capture window's draws over a copy of this frame's terrain depth. Must follow render() in the same frame;
      * returns {color, depth} GL textures leased until finishOverlay()/endRead(), or null when no terrain frame is open.
      */
-    int[] renderOverlay(java.util.List<Object[]> packets) {
+    int[] renderOverlay(java.util.List<Object[]> packets) { return renderOverlay(packets, false); }
+    /**
+     * {@code clearDepth}: start from depth 1.0 instead of this frame's terrain depth - the hand and the GUI, which vanilla draws
+     * after RenderSystem.clear(GL_DEPTH_BUFFER_BIT).
+     */
+    int[] renderOverlay(java.util.List<Object[]> packets, boolean clearDepth) {
         if (reading < 0) return null;
         finishOverlay();
         int index = reading;
         Slot slot = slots[index];
-        if (!slot.sceneFresh || slot.overlays >= MAX_OVERLAYS || world.lightMapView() == 0) return null;
+        if ((!clearDepth && !slot.sceneFresh) || slot.overlays >= MAX_OVERLAYS || world.lightMapView() == 0) return null;
         int pass = slot.overlays++;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkCommandBuffer command = slot.overlayCommands[pass];
             check(vkResetCommandBuffer(command, 0), "reset overlay command");
             check(vkBeginCommandBuffer(command, VkCommandBufferBeginInfo.calloc(stack).sType$Default().flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)), "begin overlay command");
-            var acquire = VkImageMemoryBarrier2.calloc(3, stack);
-            // The terrain submit's copy into sceneDepth (and any earlier overlay's read of it) precede this submission on the queue.
-            if (slot.sceneReadable) layoutBarrier(acquire.get(0), slot.sceneDepth.image, VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, true);
-            else layoutBarrier(acquire.get(0), slot.sceneDepth.image, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, true);
-            slot.sceneReadable = true;
-            acquireBarrier(acquire.get(1), slot.overlayUsed, slot.overlayDepth, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, true);
-            acquireBarrier(acquire.get(2), slot.overlayUsed, slot.overlayColor, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, false);
-            vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(acquire));
-            var copy = VkImageCopy.calloc(1, stack).srcSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).layerCount(1))
-                    .dstSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).layerCount(1)).extent(e -> e.set(width, height, 1));
-            vkCmdCopyImage(command, slot.sceneDepth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.overlayDepth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy);
-            var toTest = VkImageMemoryBarrier2.calloc(1, stack);
-            layoutBarrier(toTest.get(0), slot.overlayDepth.image, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, DEPTH_STAGES, DEPTH_ACCESS,
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, true);
-            vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(toTest));
+            if (clearDepth) {
+                // Hand/GUI: vanilla cleared depth before drawing them; the attachment is cleared below instead of copied.
+                var acquire = VkImageMemoryBarrier2.calloc(2, stack);
+                acquireBarrier(acquire.get(0), slot.overlayUsed, slot.overlayDepth, DEPTH_STAGES, DEPTH_ACCESS, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, true);
+                acquireBarrier(acquire.get(1), slot.overlayUsed, slot.overlayColor, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, false);
+                vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(acquire));
+            } else {
+                var acquire = VkImageMemoryBarrier2.calloc(3, stack);
+                // The terrain submit's copy into sceneDepth (and any earlier overlay's read of it) precede this submission on the queue.
+                if (slot.sceneReadable) layoutBarrier(acquire.get(0), slot.sceneDepth.image, VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, true);
+                else layoutBarrier(acquire.get(0), slot.sceneDepth.image, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, true);
+                slot.sceneReadable = true;
+                acquireBarrier(acquire.get(1), slot.overlayUsed, slot.overlayDepth, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, true);
+                acquireBarrier(acquire.get(2), slot.overlayUsed, slot.overlayColor, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, false);
+                vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(acquire));
+                var copy = VkImageCopy.calloc(1, stack).srcSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).layerCount(1))
+                        .dstSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).layerCount(1)).extent(e -> e.set(width, height, 1));
+                vkCmdCopyImage(command, slot.sceneDepth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.overlayDepth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy);
+                var toTest = VkImageMemoryBarrier2.calloc(1, stack);
+                layoutBarrier(toTest.get(0), slot.overlayDepth.image, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, DEPTH_STAGES, DEPTH_ACCESS,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, true);
+                vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(toTest));
+            }
             var color = VkRenderingAttachmentInfo.calloc(1, stack).sType$Default().imageView(slot.overlayColor.view())
                     .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL).loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
             color.clearValue().color().float32(0, 0).float32(1, 0).float32(2, 0).float32(3, 0);
             var depth = VkRenderingAttachmentInfo.calloc(stack).sType$Default().imageView(slot.overlayDepth.view())
-                    .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL).loadOp(VK_ATTACHMENT_LOAD_OP_LOAD).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+                    .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL).loadOp(clearDepth ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD)
+                    .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+            depth.clearValue().depthStencil().depth(1);
             vkCmdBeginRendering(command, VkRenderingInfo.calloc(stack).sType$Default().layerCount(1).pColorAttachments(color).pDepthAttachment(depth)
                     .renderArea(r -> r.offset(o -> o.set(0, 0)).extent(e -> e.set(width, height))));
             vkCmdSetViewport(command, 0, VkViewport.calloc(1, stack).width(width).height(height).minDepth(0).maxDepth(1));
@@ -296,7 +311,8 @@ final class SharedWorldRenderer implements AutoCloseable {
             if (slot.overlayUsed) {
                 var waits = VkSemaphoreSubmitInfo.calloc(2, stack);
                 waits.get(0).sType$Default().semaphore(slot.overlayColor.complete).stageMask(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
-                waits.get(1).sType$Default().semaphore(slot.overlayDepth.complete).stageMask(VK_PIPELINE_STAGE_2_COPY_BIT);
+                // First depth use is the copy, or the clear/depth tests for a clearDepth pass.
+                waits.get(1).sType$Default().semaphore(slot.overlayDepth.complete).stageMask(VK_PIPELINE_STAGE_2_COPY_BIT | DEPTH_STAGES);
                 submit.pWaitSemaphoreInfos(waits);
             }
             check(vkResetFences(context.device, slot.overlayFences[pass]), "reset overlay fence");
@@ -311,6 +327,7 @@ final class SharedWorldRenderer implements AutoCloseable {
         if (overlayReading >= 0) { int index = overlayReading; overlayReading = -1; slots[index].overlayColor.endReadGL(); slots[index].overlayDepth.endReadGL(); }
     }
     void entityTexture(int id, int width, int height, int flags, byte[] rgba) { entities.texture(id, width, height, flags, rgba); }
+    void entityTexturePatch(int id, int x, int y, int width, int height, byte[] rgba) { entities.texturePatch(id, x, y, width, height, rgba); }
     boolean hasEntityTexture(int id) { return entities.hasTexture(id); }
 
     /** First use per frame: from the GL owner (GENERAL) or, on a fresh image, from UNDEFINED. */

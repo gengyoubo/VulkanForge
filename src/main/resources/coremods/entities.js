@@ -6,7 +6,7 @@ function initializeCoreMod() {
     var VarInsnNode = Java.type('org.objectweb.asm.tree.VarInsnNode');
     var InsnNode = Java.type('org.objectweb.asm.tree.InsnNode');
     var ASMAPI = Java.type('net.minecraftforge.coremod.api.ASMAPI');
-    return { 'vulkanforge_entities': {
+    var transformers = { 'vulkanforge_entities': {
         'target': { 'type': 'CLASS', 'name': 'net.minecraft.client.renderer.RenderType' },
         'transformer': function(node) {
             var count = 0;
@@ -82,5 +82,68 @@ function initializeCoreMod() {
             ASMAPI.log('INFO', 'VulkanForge ASM installed sky/cloud capture: immediate=' + immediate + ', uploads=' + uploads + ', draws=' + draws);
             return node;
         }
-    }};
+    },
+    // P11: the only other direct BufferUploader callers drawn inside the hand/GUI windows: GuiGraphics blits and
+    // ScreenEffectRenderer's fire/water/in-wall overlays. Missing them would let GL draws jump ahead of captured ones.
+    'vulkanforge_font_upload': {
+        'target': { 'type': 'CLASS', 'name': 'net.minecraft.client.gui.font.FontTexture' },
+        'transformer': function(node) {
+            var count = 0;
+            for (var m = 0; m < node.methods.size(); m++) {
+                var method = node.methods.get(m), array = method.instructions.toArray();
+                for (var i = 0; i < array.length; i++) {
+                    var insn = array[i];
+                    if (insn instanceof MethodInsnNode && insn.owner === 'com/mojang/blaze3d/font/SheetGlyphInfo' && insn.desc === '(II)V') {
+                        method.instructions.set(insn, new MethodInsnNode(Opcodes.INVOKESTATIC, 'github/com/gengyoubo/vulkanforge/client/FontUploads', 'upload',
+                            '(Lcom/mojang/blaze3d/font/SheetGlyphInfo;II)V', false)); count++;
+                    }
+                }
+            }
+            if (count !== 1) throw new Error('VulkanForge font expected one glyph upload, found ' + count);
+            ASMAPI.log('INFO', 'VulkanForge ASM installed incremental font mirror');
+            return node;
+        }
+    },
+    'vulkanforge_gui_boundary': {
+        'target': { 'type': 'CLASS', 'name': 'net.minecraft.client.renderer.GameRenderer' },
+        'transformer': function(node) {
+            var count = 0;
+            for (var m = 0; m < node.methods.size(); m++) {
+                var method = node.methods.get(m);
+                if (method.desc !== '(FJZ)V') continue; // render(), never renderLevel()'s hand depth clear.
+                var array = method.instructions.toArray();
+                for (var i = 0; i < array.length; i++) {
+                    var insn = array[i];
+                    if (insn instanceof MethodInsnNode && insn.owner === 'com/mojang/blaze3d/systems/RenderSystem' && insn.desc === '(IZ)V') {
+                        method.instructions.set(insn, new MethodInsnNode(Opcodes.INVOKESTATIC, 'github/com/gengyoubo/vulkanforge/client/GuiDraws', 'clear', '(IZ)V', false)); count++;
+                    }
+                }
+            }
+            if (count !== 2) throw new Error('VulkanForge GUI boundary expected two depth clears, found ' + count);
+            ASMAPI.log('INFO', 'VulkanForge ASM installed swapchain GUI boundary');
+            return node;
+        }
+    },
+    'vulkanforge_gui_graphics': { 'target': { 'type': 'CLASS', 'name': 'net.minecraft.client.gui.GuiGraphics' }, 'transformer': function(node) { return redirectUploads(node, 2); } },
+    'vulkanforge_screen_effects': { 'target': { 'type': 'CLASS', 'name': 'net.minecraft.client.renderer.ScreenEffectRenderer' }, 'transformer': function(node) { return redirectUploads(node, 3); } }
+    };
+    function redirectUploads(node, expected) {
+        var count = 0;
+        for (var m = 0; m < node.methods.size(); m++) {
+            var insns = node.methods.get(m).instructions;
+            var array = insns.toArray();
+            for (var i = 0; i < array.length; i++) {
+                var insn = array[i];
+                if (!(insn instanceof MethodInsnNode) || insn.getOpcode() !== Opcodes.INVOKESTATIC) continue;
+                if (insn.owner !== 'com/mojang/blaze3d/vertex/BufferUploader' || insn.desc !== '(Lcom/mojang/blaze3d/vertex/BufferBuilder$RenderedBuffer;)V') continue;
+                insns.set(insn, new MethodInsnNode(Opcodes.INVOKESTATIC, 'github/com/gengyoubo/vulkanforge/client/EntityDraws', 'drawImmediate',
+                    '(Lcom/mojang/blaze3d/vertex/BufferBuilder$RenderedBuffer;)V', false));
+                count++;
+            }
+        }
+        if (count !== expected) throw new Error('VulkanForge GUI ASM expected ' + expected + ' BufferUploader calls in ' + node.name + ', found ' + count);
+        ASMAPI.log('INFO', 'VulkanForge ASM installed GUI capture in ' + node.name);
+        return node;
+    }
+    return transformers;
 }

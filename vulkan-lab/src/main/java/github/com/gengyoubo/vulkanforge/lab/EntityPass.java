@@ -19,17 +19,20 @@ final class EntityPass implements AutoCloseable {
     static final int FORMAT_ENTITY = 0, FORMAT_TEXT = 1, FORMAT_PARTICLE = 2;
     /** P10: POSITION, POSITION_COLOR, POSITION_TEX, POSITION_TEX_COLOR, POSITION_TEX_COLOR_NORMAL (sky, sun/moon, stars, clouds). */
     static final int FORMAT_POSITION = 3, FORMAT_POSITION_COLOR = 4, FORMAT_POSITION_TEX = 5, FORMAT_POSITION_TEX_COLOR = 6, FORMAT_CLOUDS = 7;
+    /** P11: POSITION_COLOR_TEX (GuiGraphics colored blits, screen-effect overlays). */
+    static final int FORMAT_POSITION_COLOR_TEX = 8;
     /** Texture id of the built-in 1x1 white image used by untextured shaders. */
     static final int WHITE_TEXTURE = 0;
     static final int MODE_QUADS = 0, MODE_TRIANGLES = 1;
     /** BLEND: premultiplied "over"; BLEND_ADD: GL (SRC_ALPHA, ONE) additive; NO_COLOR: color writes off (cloud depth prepass). */
-    static final int BLEND = 1, DEPTH_TEST = 2, DEPTH_WRITE = 4, CULL = 8, BLEND_ADD = 16, NO_COLOR = 32;
+    static final int BLEND = 1, DEPTH_TEST = 2, DEPTH_WRITE = 4, CULL = 8, BLEND_ADD = 16, NO_COLOR = 32,
+            BLEND_INVERT = 64, BLEND_MULTIPLY = 128, DEPTH_LESS = 256;
     static final int TEXTURE_LINEAR = 1, TEXTURE_CLAMP = 2;
     static final int UNIFORM_FLOATS = 64;
     private static final int UNIFORM_STRIDE = 256; // == the largest allowed minUniformBufferOffsetAlignment
-    private static final int[] STRIDES = {36, 28, 28, 12, 16, 20, 24, 28};
+    private static final int[] STRIDES = {36, 28, 28, 12, 16, 20, 24, 28, 24};
     private static final String[] VERTEX_SHADERS = {"/shaders/entity.vert", "/shaders/text.vert", "/shaders/particle.vert", "/shaders/simple_pos.vert",
-            "/shaders/simple_color.vert", "/shaders/simple_tex.vert", "/shaders/simple_tex_color.vert", "/shaders/simple_tex_color.vert"};
+            "/shaders/simple_color.vert", "/shaders/simple_tex.vert", "/shaders/simple_tex_color.vert", "/shaders/simple_tex_color.vert", "/shaders/simple_tex_color.vert"};
     private record Texture(GpuImage image, int flags) implements AutoCloseable { @Override public void close() { image.close(); } }
     private static final class SlotResources {
         GpuBuffer vertices, indices, uniforms;
@@ -37,6 +40,8 @@ final class EntityPass implements AutoCloseable {
         int poolSets;
     }
     private final VulkanContext context;
+    private final int colorFormat;
+    private final boolean direct;
     private final Consumer<Runnable> retire;
     private final Map<Integer, Texture> textures = new HashMap<>();
     private final Map<Integer, Long> pipelines = new HashMap<>();
@@ -48,7 +53,11 @@ final class EntityPass implements AutoCloseable {
     private long draws, vertices, textureUploads, missingTextures;
 
     EntityPass(VulkanContext context, int slotCount, Consumer<Runnable> retire) {
-        this.context = context; this.retire = retire;
+        this(context, slotCount, retire, VK_FORMAT_R8G8B8A8_UNORM, false);
+    }
+
+    EntityPass(VulkanContext context, int slotCount, Consumer<Runnable> retire, int colorFormat, boolean direct) {
+        this.context = context; this.retire = retire; this.colorFormat = colorFormat; this.direct = direct;
         slots = new SlotResources[slotCount];
         for (int i = 0; i < slotCount; i++) slots[i] = new SlotResources();
         try (MemoryStack stack = MemoryStack.stackPush()) {
@@ -89,7 +98,20 @@ final class EntityPass implements AutoCloseable {
     /** Synchronous upload into a fresh image; never touches an image an in-flight frame may sample. */
     void texture(int id, int width, int height, int flags, byte[] rgba) {
         if (width < 1 || height < 1 || (long) width * height * 4 != rgba.length) throw new IllegalArgumentException("Invalid entity texture " + id);
-        GpuImage image = new GpuImage(context, width, height, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+        uploadTexture(id, width, height, flags, rgba, null, 0, 0, width, height);
+    }
+
+    /** Copy-on-write patch: old pixels stay GPU-resident, only the changed rectangle crosses the upload buffer. */
+    void texturePatch(int id, int x, int y, int width, int height, byte[] rgba) {
+        Texture source = textures.get(id);
+        if (source == null) throw new IllegalStateException("Missing texture for patch " + id);
+        if (x < 0 || y < 0 || width < 1 || height < 1 || x + width > source.image.width || y + height > source.image.height
+                || (long) width * height * 4 != rgba.length) throw new IllegalArgumentException("Invalid texture patch");
+        uploadTexture(id, source.image.width, source.image.height, source.flags, rgba, source, x, y, width, height);
+    }
+
+    private void uploadTexture(int id, int width, int height, int flags, byte[] rgba, Texture source, int x, int y, int patchWidth, int patchHeight) {
+        GpuImage image = new GpuImage(context, width, height, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
         try (GpuBuffer staging = new GpuBuffer(context, rgba, VK_BUFFER_USAGE_TRANSFER_SRC_BIT); MemoryStack stack = MemoryStack.stackPush()) {
             check(vkResetCommandBuffer(upload, 0), "reset entity texture upload");
             check(vkBeginCommandBuffer(upload, VkCommandBufferBeginInfo.calloc(stack).sType$Default().flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)), "begin entity texture upload");
@@ -100,8 +122,27 @@ final class EntityPass implements AutoCloseable {
                     .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
             var dependency = VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barrier);
             vkCmdPipelineBarrier2(upload, dependency);
+            if (source != null) {
+                var old = VkImageMemoryBarrier2.calloc(1, stack).sType$Default()
+                        .srcStageMask(VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT).srcAccessMask(VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)
+                        .dstStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).dstAccessMask(VK_ACCESS_2_TRANSFER_READ_BIT)
+                        .oldLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+                        .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).image(source.image.image)
+                        .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
+                vkCmdPipelineBarrier2(upload, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(old));
+                var copy = VkImageCopy.calloc(1, stack).srcSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1))
+                        .dstSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1)).extent(e -> e.set(width, height, 1));
+                vkCmdCopyImage(upload, source.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy);
+                old.srcStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).srcAccessMask(VK_ACCESS_2_TRANSFER_READ_BIT)
+                        .dstStageMask(VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT).dstAccessMask(VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)
+                        .oldLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                vkCmdPipelineBarrier2(upload, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(old));
+                barrier.srcStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).srcAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
+                        .oldLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                vkCmdPipelineBarrier2(upload, dependency); // Copy destination -> patch destination write hazard.
+            }
             vkCmdCopyBufferToImage(upload, staging.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VkBufferImageCopy.calloc(1, stack)
-                    .imageSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1)).imageExtent(e -> e.set(width, height, 1)));
+                    .imageSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1)).imageOffset(o -> o.set(x, y, 0)).imageExtent(e -> e.set(patchWidth, patchHeight, 1)));
             barrier.srcStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).srcAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
                     .dstStageMask(VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT).dstAccessMask(VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)
                     .oldLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -122,6 +163,7 @@ final class EntityPass implements AutoCloseable {
         SlotResources resources = slots[slot];
         int vertexBytes = 0, indexBytes = 0, maxQuadIndices = 0;
         for (Object[] packet : packets) {
+            if (packet[0] == null) continue; // GUI depth clear
             int[] header = (int[]) packet[0];
             vertexBytes += ((byte[]) packet[2]).length;
             if (packet[3] != null) indexBytes += (((byte[]) packet[3]).length + 3) & ~3;
@@ -148,9 +190,24 @@ final class EntityPass implements AutoCloseable {
         long bound = 0;
         for (int i = 0; i < packets.size(); i++) {
             Object[] packet = packets.get(i);
+            if (packet[0] == null) {
+                var clear = VkClearAttachment.calloc(1, stack).aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT);
+                clear.clearValue().depthStencil().set(1, 0);
+                int[] rect = (int[]) packet[1];
+                var area = VkClearRect.calloc(1, stack).baseArrayLayer(0).layerCount(1);
+                area.rect().offset().set(rect[0], rect[1]); area.rect().extent().set(rect[2], rect[3]);
+                vkCmdClearAttachments(command, clear, area);
+                continue;
+            }
+            if (direct && packet.length > 4) {
+                int[] rect = (int[]) packet[4];
+                var scissor = VkRect2D.calloc(1, stack);
+                scissor.offset().set(rect[0], rect[1]); scissor.extent().set(rect[2], rect[3]);
+                vkCmdSetScissor(command, 0, scissor);
+            }
             int[] header = (int[]) packet[0];
             Texture texture = textures.get(header[H_TEXTURE]);
-            if (texture == null || lightView == 0) { missingTextures++; continue; }
+            if (texture == null || (!direct && lightView == 0)) { missingTextures++; continue; }
             Texture overlay = textures.getOrDefault(header[H_OVERLAY], texture);
             long pipeline = pipeline(header[H_FORMAT], header[H_FLAGS]);
             if (pipeline != bound) { vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline); bound = pipeline; }
@@ -163,7 +220,7 @@ final class EntityPass implements AutoCloseable {
                 var images = VkDescriptorImageInfo.calloc(3, stack);
                 images.get(0).sampler(samplers[texture.flags()]).imageView(texture.image().view).imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                 images.get(1).sampler(samplers[0]).imageView(overlay.image().view).imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-                images.get(2).sampler(lightSampler).imageView(lightView).imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                images.get(2).sampler(direct ? samplers[0] : lightSampler).imageView(direct ? textures.get(WHITE_TEXTURE).image().view : lightView).imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                 var writes = VkWriteDescriptorSet.calloc(3, stack);
                 for (int b = 0; b < 3; b++) writes.get(b).sType$Default().dstSet(set).dstBinding(b).descriptorCount(1)
                         .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(VkDescriptorImageInfo.create(images.address(b), 1));
@@ -171,6 +228,7 @@ final class EntityPass implements AutoCloseable {
                 textureSets.put(key, set);
             }
             uniformData.position(i * UNIFORM_STRIDE / 4); uniformData.put((float[]) packet[1], 0, UNIFORM_FLOATS);
+            if (direct) uniformData.put(i * UNIFORM_STRIDE / 4 + 55, 3);
             dynamic.put(0, i * UNIFORM_STRIDE);
             vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, stack.longs(set, uniformSet), dynamic);
             byte[] vertexBytesOfDraw = (byte[]) packet[2];
@@ -225,7 +283,7 @@ final class EntityPass implements AutoCloseable {
     }
 
     private long pipeline(int format, int flags) {
-        int key = format | flags << 3;
+        int key = format | flags << 4;
         Long existing = pipelines.get(key);
         if (existing != null) return existing;
         long vert = 0, frag = 0;
@@ -243,9 +301,13 @@ final class EntityPass implements AutoCloseable {
                 // Position always first; POSITION_TEX* put UV0 at 12 and Color after it, POSITION_COLOR has Color at 12.
                 if (format == FORMAT_POSITION_COLOR) attributes.get(1).location(1).binding(0).format(VK_FORMAT_R8G8B8A8_UNORM).offset(12);
                 if (format == FORMAT_POSITION_TEX) attributes.get(1).location(2).binding(0).format(VK_FORMAT_R32G32_SFLOAT).offset(12);
-                if (format >= FORMAT_POSITION_TEX_COLOR) {
+                if (format == FORMAT_POSITION_TEX_COLOR || format == FORMAT_CLOUDS) {
                     attributes.get(1).location(2).binding(0).format(VK_FORMAT_R32G32_SFLOAT).offset(12);
                     attributes.get(2).location(1).binding(0).format(VK_FORMAT_R8G8B8A8_UNORM).offset(20);
+                }
+                if (format == FORMAT_POSITION_COLOR_TEX) {
+                    attributes.get(1).location(1).binding(0).format(VK_FORMAT_R8G8B8A8_UNORM).offset(12);
+                    attributes.get(2).location(2).binding(0).format(VK_FORMAT_R32G32_SFLOAT).offset(16);
                 }
             } else {
                 // PARTICLE orders UV0 before Color: Position, UV0, Color, UV2.
@@ -270,11 +332,20 @@ final class EntityPass implements AutoCloseable {
             if ((flags & BLEND) != 0) attachment.blendEnable(true).colorBlendOp(VK_BLEND_OP_ADD).alphaBlendOp(VK_BLEND_OP_ADD)
                     .srcColorBlendFactor(VK_BLEND_FACTOR_ONE).dstColorBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
                     .srcAlphaBlendFactor(VK_BLEND_FACTOR_ONE).dstAlphaBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
+            if (direct) {
+                if ((flags & (BLEND | BLEND_ADD)) != 0) attachment.srcColorBlendFactor(VK_BLEND_FACTOR_SRC_ALPHA);
+                if ((flags & BLEND_INVERT) != 0) attachment.blendEnable(true).colorBlendOp(VK_BLEND_OP_ADD).alphaBlendOp(VK_BLEND_OP_ADD)
+                        .srcColorBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR).dstColorBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR)
+                        .srcAlphaBlendFactor(VK_BLEND_FACTOR_ONE).dstAlphaBlendFactor(VK_BLEND_FACTOR_ZERO);
+                if ((flags & BLEND_MULTIPLY) != 0) attachment.blendEnable(true).colorBlendOp(VK_BLEND_OP_ADD).alphaBlendOp(VK_BLEND_OP_ADD)
+                        .srcColorBlendFactor(VK_BLEND_FACTOR_ZERO).dstColorBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR)
+                        .srcAlphaBlendFactor(VK_BLEND_FACTOR_ONE).dstAlphaBlendFactor(VK_BLEND_FACTOR_ZERO);
+            }
             // Vanilla front faces are CCW on screen; the shaders' y flip keeps them CCW in Vulkan framebuffer space.
             var raster = VkPipelineRasterizationStateCreateInfo.calloc(stack).sType$Default().polygonMode(VK_POLYGON_MODE_FILL)
                     .cullMode((flags & CULL) != 0 ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE).frontFace(VK_FRONT_FACE_COUNTER_CLOCKWISE).lineWidth(1);
             var info = VkGraphicsPipelineCreateInfo.calloc(1, stack).sType$Default()
-                    .pNext(VkPipelineRenderingCreateInfo.calloc(stack).sType$Default().pColorAttachmentFormats(stack.ints(VK_FORMAT_R8G8B8A8_UNORM))
+                    .pNext(VkPipelineRenderingCreateInfo.calloc(stack).sType$Default().pColorAttachmentFormats(stack.ints(colorFormat))
                             .depthAttachmentFormat(VK_FORMAT_D32_SFLOAT).address())
                     .pStages(stages).pVertexInputState(input)
                     .pInputAssemblyState(VkPipelineInputAssemblyStateCreateInfo.calloc(stack).sType$Default().topology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST))
@@ -282,7 +353,7 @@ final class EntityPass implements AutoCloseable {
                     .pRasterizationState(raster)
                     .pMultisampleState(VkPipelineMultisampleStateCreateInfo.calloc(stack).sType$Default().rasterizationSamples(VK_SAMPLE_COUNT_1_BIT))
                     .pDepthStencilState(VkPipelineDepthStencilStateCreateInfo.calloc(stack).sType$Default().depthTestEnable((flags & DEPTH_TEST) != 0)
-                            .depthWriteEnable((flags & DEPTH_WRITE) != 0).depthCompareOp(VK_COMPARE_OP_LESS_OR_EQUAL))
+                            .depthWriteEnable((flags & DEPTH_WRITE) != 0).depthCompareOp((flags & DEPTH_LESS) != 0 ? VK_COMPARE_OP_LESS : VK_COMPARE_OP_LESS_OR_EQUAL))
                     .pColorBlendState(VkPipelineColorBlendStateCreateInfo.calloc(stack).sType$Default().pAttachments(attachment))
                     .pDynamicState(VkPipelineDynamicStateCreateInfo.calloc(stack).sType$Default().pDynamicStates(stack.ints(VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR)))
                     .layout(layout).basePipelineIndex(-1);

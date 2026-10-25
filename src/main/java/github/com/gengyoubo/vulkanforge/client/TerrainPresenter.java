@@ -1,5 +1,6 @@
 package github.com.gengyoubo.vulkanforge.client;
 
+import com.mojang.blaze3d.platform.GlStateManager;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.*;
 import net.minecraft.client.renderer.GameRenderer;
@@ -27,8 +28,9 @@ final class TerrainPresenter implements AutoCloseable {
     }
     void draw(int texture, int depthTexture) { draw(texture, depthTexture, false); }
     /** Premultiplied color; GL depth test rejects pixels whose nearest translucent surface is behind entities. */
-    void drawTranslucent(int texture, int depthTexture) { draw(texture, depthTexture, true); }
-    private void draw(int texture, int depthTexture, boolean translucent) {
+    void drawTranslucent(int texture, int depthTexture) { draw(texture, depthTexture, true, true); }
+    private void draw(int texture, int depthTexture, boolean translucent) { draw(texture, depthTexture, translucent, true); }
+    private void draw(int texture, int depthTexture, boolean translucent, boolean depthTest) {
         if (quad == null) {
             builder.begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.POSITION_TEX);
             builder.vertex(-1, -1, 0).uv(0, 1).endVertex();
@@ -38,6 +40,7 @@ final class TerrainPresenter implements AutoCloseable {
             quad = new VertexBuffer(VertexBuffer.Usage.STATIC);
             quad.bind(); quad.upload(builder.end()); VertexBuffer.unbind();
         }
+        Object blendCache = ShaderBlendState.save();
         boolean depth = glIsEnabled(GL_DEPTH_TEST), cull = glIsEnabled(GL_CULL_FACE), blend = glIsEnabled(GL_BLEND);
         boolean writeDepth = glGetBoolean(GL_DEPTH_WRITEMASK);
         int sampler = RenderSystem.getShaderTexture(0), active = glGetInteger(GL_ACTIVE_TEXTURE);
@@ -47,10 +50,16 @@ final class TerrainPresenter implements AutoCloseable {
         int srcRGB = glGetInteger(GL_BLEND_SRC_RGB), dstRGB = glGetInteger(GL_BLEND_DST_RGB);
         int srcAlpha = glGetInteger(GL_BLEND_SRC_ALPHA), dstAlpha = glGetInteger(GL_BLEND_DST_ALPHA);
         float[] color = RenderSystem.getShaderColor().clone();
+        // A GUI split can composite while a scissored list, text highlight (logic op) or partial color mask is active.
+        boolean scissor = glIsEnabled(GL_SCISSOR_TEST), logicOp = glIsEnabled(GL_COLOR_LOGIC_OP), offset = glIsEnabled(GL_POLYGON_OFFSET_FILL);
+        byte[] mask = new byte[4];
+        try (var stack = org.lwjgl.system.MemoryStack.stackPush()) { var bytes = stack.malloc(4); glGetBooleanv(GL_COLOR_WRITEMASK, bytes); bytes.get(mask); }
         try {
-            if (transferDepth) { RenderSystem.enableDepthTest(); RenderSystem.depthFunc(GL_LEQUAL); }
+            GlStateManager._disableScissorTest(); GlStateManager._disableColorLogicOp(); GlStateManager._disablePolygonOffset();
+            GlStateManager._colorMask(true, true, true, true);
+            if (transferDepth && depthTest) { RenderSystem.enableDepthTest(); RenderSystem.depthFunc(GL_LEQUAL); }
             else RenderSystem.disableDepthTest();
-            RenderSystem.depthMask(transferDepth); RenderSystem.disableCull();
+            RenderSystem.depthMask(transferDepth && depthTest); RenderSystem.disableCull();
             RenderSystem.enableBlend();
             if (translucent) RenderSystem.blendFuncSeparate(com.mojang.blaze3d.platform.GlStateManager.SourceFactor.ONE, com.mojang.blaze3d.platform.GlStateManager.DestFactor.ONE_MINUS_SRC_ALPHA,
                     com.mojang.blaze3d.platform.GlStateManager.SourceFactor.ONE, com.mojang.blaze3d.platform.GlStateManager.DestFactor.ONE_MINUS_SRC_ALPHA);
@@ -66,8 +75,13 @@ final class TerrainPresenter implements AutoCloseable {
             if (depth) RenderSystem.enableDepthTest(); else RenderSystem.disableDepthTest();
             if (cull) RenderSystem.enableCull(); else RenderSystem.disableCull();
             if (blend) RenderSystem.enableBlend(); else RenderSystem.disableBlend();
-            com.mojang.blaze3d.platform.GlStateManager._blendFuncSeparate(srcRGB, dstRGB, srcAlpha, dstAlpha);
+            GlStateManager._blendFuncSeparate(srcRGB, dstRGB, srcAlpha, dstAlpha);
             RenderSystem.depthMask(writeDepth); RenderSystem.activeTexture(active);
+            if (scissor) GlStateManager._enableScissorTest();
+            if (logicOp) GlStateManager._enableColorLogicOp();
+            if (offset) GlStateManager._enablePolygonOffset();
+            GlStateManager._colorMask(mask[0] != 0, mask[1] != 0, mask[2] != 0, mask[3] != 0);
+            ShaderBlendState.restore(blendCache);
         }
     }
 

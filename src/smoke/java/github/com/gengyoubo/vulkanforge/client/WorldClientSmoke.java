@@ -26,12 +26,18 @@ public final class WorldClientSmoke {
     private static int stage, ticks, firstHash;
     private static long firstEpoch;
     private static double dayBrightness, nightBrightness;
-    private static long lightBaseline;
+    private static long lightBaseline, glyphBaseline;
     private static int originalWidth, originalHeight, swapchainBaseline;
-    private static long minimizedFrames;
+    private static long minimizedFrames, screenBaseline;
     private static long bridgeLaunches;
     private static final long START = System.nanoTime();
     private static Path report;
+
+    @SubscribeEvent public static void glyphs(net.minecraftforge.client.event.ScreenEvent.Render.Post event) {
+        if (Boolean.getBoolean("vulkanforge.worldSmoke") && stage == 40 && ticks > 10) {
+            event.getGuiGraphics().drawString(Minecraft.getInstance().font, "P11 ¶¯Ì¬×ÖÐÎ ¦¸ §¨ ¤¢ h", 8, 8, -1);
+        }
+    }
 
     @SubscribeEvent public static void tick(TickEvent.ClientTickEvent event) {
         if (!Boolean.getBoolean("vulkanforge.worldSmoke") || event.phase != TickEvent.Phase.END || stage == 99) return;
@@ -90,6 +96,8 @@ public final class WorldClientSmoke {
                     level.setBlock(new BlockPos(4, 65, 4), Blocks.TORCH.defaultBlockState(), 3);
                     level.setWeatherParameters(0, 6000, true, false);
                     var player = server.getPlayerList().getPlayer(uuid);
+                    // P11: a held item and a hotbar icon.
+                    player.setItemInHand(net.minecraft.world.InteractionHand.MAIN_HAND, new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.DIAMOND_SWORD));
                     player.teleportTo(level, 0.5, 68.0, 9.0, 180, 18);
                     player.getAbilities().flying = true; player.onUpdateAbilities();
                 });
@@ -138,6 +146,11 @@ public final class WorldClientSmoke {
                     require(shaders.getOrDefault("position_tex_color_normal", 0L) > 0, "Clouds not captured: " + shaders);
                     log("PASS P10 sky and clouds: sky draws=" + skyWindow[0] + " in " + skyWindow[1] + " terrain submits (Vulkan sky draws=" + stats[24]
                             + "), clouds=" + shaders.get("position_tex_color_normal"));
+                    long[] hand = EntityDraws.stats(EntityDraws.Window.HAND), hud = GuiDraws.stats();
+                    require(hand[0] > 0 && hand[1] > 0, "Held item / arm was not replayed by Vulkan: " + java.util.Arrays.toString(hand));
+                    require(hud[0] > 0 && hud[1] > 0 && NativeMainWindow.guiPasses() > 0, "HUD was not replayed by Vulkan: " + java.util.Arrays.toString(hud) + " reasons=" + GuiDraws.fallbackReasons());
+                    log("PASS P11 hand and HUD: hand draws=" + hand[0] + " composites=" + hand[1] + ", GUI draws=" + hud[0] + " swapchain passes=" + NativeMainWindow.guiPasses()
+                            + ", order-preserving splits=" + EntityDraws.stats()[5]);
                     log("INFO captured shaders: " + shaders);
                     log("INFO GL fallback shaders: " + EntityDraws.fallbackShaders());
                     var clear = mc.getSingleplayerServer();
@@ -153,6 +166,26 @@ public final class WorldClientSmoke {
                 log("PASS cutout model capture, atlas patches=" + VulkanPreview.atlasPatches() + ", lightmap updates=" + VulkanPreview.lightUpdates());
                 var server = mc.getSingleplayerServer(); var uuid = mc.player.getUUID();
                 server.execute(() -> { var player = server.getPlayerList().getPlayer(uuid); player.teleportTo(server.overworld(), 0.5, 68, 9, 130, 18); });
+                if (NativeMainWindow.active()) {
+                    // P11: a screen over the world.
+                    screenBaseline = GuiDraws.stats()[0]; glyphBaseline = EntityTextures.stats()[5];
+                    mc.setScreen(new net.minecraft.client.gui.screens.inventory.InventoryScreen(mc.player));
+                    stage = 40;
+                } else stage = 4;
+                ticks = 0;
+            } else if (stage == 40 && ++ticks > 40) {
+                long[] screen = GuiDraws.stats();
+                require(screen[0] > screenBaseline && screen[1] > 0, "Inventory screen was not replayed by Vulkan: " + java.util.Arrays.toString(screen));
+                require(EntityTextures.stats()[5] > glyphBaseline, "New font glyphs did not produce an incremental texture patch");
+                log("PASS P11 incremental glyph mirror, patches=" + EntityTextures.stats()[5]);
+                log("PASS P11 inventory screen: draws=" + screen[0] + " direct frames=" + screen[1] + ", splits=" + EntityDraws.stats()[5]
+                        + ", GL fallback shaders=" + EntityDraws.fallbackShaders() + ", states=" + EntityDraws.fallbackStates());
+                Files.deleteIfExists(report.resolve("inventory-swapchain.png"));
+                NativeMainWindow.captureNext(report.resolve("inventory-swapchain.png"));
+                stage = 41; ticks = 0;
+            } else if (stage == 41 && ++ticks > 5) {
+                verifyCapture(report.resolve("inventory-swapchain.png"), mc.getWindow().getWidth(), mc.getWindow().getHeight());
+                mc.setScreen(null);
                 stage = 4; ticks = 0;
             } else if (stage == 4 && ++ticks > 60) {
                 require(VulkanPreview.saveWorldFrame(report.resolve("camera.png")) != firstHash, "Camera rotation did not change Vulkan frame");

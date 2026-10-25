@@ -20,10 +20,14 @@ final class CaptureBuffer implements AutoCloseable {
         storage = new GpuBuffer(context, new byte[size], VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     }
     void record(VkCommandBuffer command, long image, int width, int height, MemoryStack stack) {
+        record(command, image, width, height, stack, false);
+    }
+    void record(VkCommandBuffer command, long image, int width, int height, MemoryStack stack, boolean gui) {
         var barrier = VkImageMemoryBarrier2.calloc(1, stack).sType$Default()
-                .srcStageMask(VK_PIPELINE_STAGE_2_BLIT_BIT).srcAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
+                .srcStageMask(gui ? VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_2_BLIT_BIT)
+                .srcAccessMask(gui ? VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT : VK_ACCESS_2_TRANSFER_WRITE_BIT)
                 .dstStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).dstAccessMask(VK_ACCESS_2_TRANSFER_READ_BIT)
-                .oldLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+                .oldLayout(gui ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
                 .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
                 .image(image).subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
         vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barrier));

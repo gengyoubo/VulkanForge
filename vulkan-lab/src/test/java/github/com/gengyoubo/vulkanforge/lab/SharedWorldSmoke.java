@@ -58,6 +58,7 @@ final class SharedWorldSmoke {
         translucent(backend, send);
         entities(backend);
         sky(backend);
+        gui(backend);
         backend.closeWorld();
         requireAlpha(backend.renderWorld(180, 100), 180, 100, 255); // Reopen as menu preview, close with a GL read lease open.
         backend.closeWorld();
@@ -211,6 +212,38 @@ final class SharedWorldSmoke {
         }
         require(backend.worldStats()[24] >= 6, "Sky packets were not drawn in the terrain submit");
         System.out.println("SKY_SMOKE=OK (sky under terrain in the terrain submit, POSITION/POSITION_TEX formats, additive blend, color-less depth prepass)");
+    }
+    /**
+     * P11 hand/GUI overlays: start from cleared depth, so an entity quad behind the terrain quad (depth .7 > .6) is visible and its
+     * own depth is exported; plus a POSITION_COLOR_TEX quad. Six such passes in one frame (order-preserving GUI splits).
+     */
+    private static void gui(MainWindowBackend backend) {
+        ByteBuffer entity = ByteBuffer.allocate(4 * 36).order(ByteOrder.LITTLE_ENDIAN);
+        entityQuad(entity, .1f, .4f, .4f);
+        Object[] hand = skyPacket(EntityPass.FORMAT_ENTITY, 1, EntityPass.DEPTH_TEST | EntityPass.DEPTH_WRITE | EntityPass.CULL, 1001, entity.array(), new float[]{1, 1, 1, 1}, 1);
+        float[] light = (float[]) hand[1]; light[50] = light[54] = 1; // +z light, as in entities()
+        ((int[]) hand[0])[EntityPass.H_OVERLAY] = 1002;
+        ByteBuffer blit = ByteBuffer.allocate(4 * 24).order(ByteOrder.LITTLE_ENDIAN);
+        for (float[] c : new float[][]{{.6f, -.3f}, {.9f, -.3f}, {.9f, .3f}, {.6f, .3f}}) blit.putFloat(c[0]).putFloat(c[1]).putFloat(0).putInt(-1).putFloat(.5f).putFloat(.5f);
+        Object[] colorTex = skyPacket(EntityPass.FORMAT_POSITION_COLOR_TEX, 6, EntityPass.DEPTH_TEST, 1003, blit.array(), new float[]{1, 1, 1, 1}, 1);
+        int width = 64, height = 64;
+        require(backend.renderWorld(width, height) > 0, "Terrain frame for GUI overlays failed");
+        for (int pass = 0; pass < 6; pass++) {
+            int[] textures = backend.renderOverlay(new Object[]{hand, colorTex}, true);
+            require(textures != null, "Cleared-depth overlay pass " + pass + " was refused");
+            ByteBuffer pixels = read(textures[0], width, height);
+            try {
+                int row = height / 2 * width;
+                int[] behind = rgba(pixels, row + (int)(.625f * width)), red = rgba(pixels, row + (int)(.875f * width));
+                require(near(behind, 0, 255, 0, 255), "Cleared depth must not hide the entity behind terrain: " + java.util.Arrays.toString(behind));
+                require(near(red, 255, 0, 0, 255), "POSITION_COLOR_TEX quad wrong: " + java.util.Arrays.toString(red));
+            } finally { MemoryUtil.memFree(pixels); }
+            require(Math.abs(depth(textures[1], width, height, .625f) - .7f) < 1e-5f && Math.abs(depth(textures[1], width, height, .05f) - 1f) < 1e-5f,
+                    "Cleared-depth overlay must export only its own depth");
+            backend.finishOverlay();
+        }
+        backend.finishWorldFrame();
+        System.out.println("GUI_OVERLAY_SMOKE=OK (cleared-depth overlays, six passes in one frame, POSITION_COLOR_TEX)");
     }
     private static Object[] skyPacket(int format, int variant, int flags, int texture, byte[] vertices, float[] color, float output) {
         float[] uniforms = new float[EntityPass.UNIFORM_FLOATS];

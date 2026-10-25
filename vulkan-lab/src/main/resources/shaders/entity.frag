@@ -15,7 +15,10 @@ layout(location = 0) out vec4 outColor;
 void main() {
     int variant = int(draw.fog.w + 0.5);
     vec4 color = texture(Sampler0, texCoord0);
-    if (variant <= 1) {
+    if (variant == 7) {
+        color = vec4(color.r) * vertexColor * draw.colorModulator * lightMapColor;
+        if (color.a < 0.1) discard;
+    } else if (variant <= 1) {
         if (variant == 0 && color.a < 0.1) discard;
         color *= vertexColor * draw.colorModulator;
         color.rgb = mix(overlayColor.rgb, color.rgb, overlayColor.a);
@@ -34,6 +37,7 @@ void main() {
     }
     // light1.w: 0 premultiplied "over" (blend ONE, ONE_MINUS_SRC_ALPHA), 1 opaque (covers GL completely),
     // 2 additive (GL SRC_ALPHA, ONE: adds rgb * a and leaves coverage untouched).
-    if (draw.light1.w > 1.5) outColor = vec4(color.rgb * color.a, 0.0);
+    if (draw.light1.w > 2.5) outColor = color; // Direct swapchain GUI uses vanilla straight RGBA.
+    else if (draw.light1.w > 1.5) outColor = vec4(color.rgb * color.a, 0.0);
     else outColor = draw.light1.w > 0.5 ? vec4(color.rgb, 1.0) : vec4(color.rgb * color.a, color.a);
 }

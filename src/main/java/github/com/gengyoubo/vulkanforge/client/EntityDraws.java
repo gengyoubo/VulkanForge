@@ -21,15 +21,23 @@ import static org.lwjgl.opengl.GL14.*;
  * <ul><li>SKY: ViewportEvent.ComputeFogColor to AFTER_SKY - renderSky (P10); drawn under terrain in the next terrain submit;</li>
  * <li>ENTITIES: Vulkan terrain composite (AFTER_CUTOUT_BLOCKS) to AFTER_BLOCK_ENTITIES - entities and block entities (P7/P8);</li>
  * <li>PARTICLES: AFTER_TRIPWIRE_BLOCKS to AFTER_PARTICLES - ParticleEngine.render (P9);</li>
- * <li>WEATHER: AFTER_PARTICLES to AFTER_WEATHER - clouds (P10) and rain/snow (P9).</li></ul>
- * The last three are replayed as overlay passes and composited with depth when they close. Anything else - other shaders,
- * formats, blend/depth states or not-yet-mirrored textures - is drawn by GL exactly as before. Packets match the backend's EntityPass.
+ * <li>WEATHER: AFTER_PARTICLES to AFTER_WEATHER - clouds (P10) and rain/snow (P9);</li>
+ * <li>HAND: AFTER_LEVEL to GameRenderer's GUI depth clear (or swap) - held items, arms, screen effects (P11).</li>
+ * GUI capture is handled separately by GuiDraws and replayed directly into the swapchain (P11).</ul>
+ * World windows are replayed as overlay passes over this frame's terrain depth and composited with depth when they close.
+ * HAND starts from cleared depth (vanilla clears it before them) and are order-sensitive: a draw that must stay on GL
+ * first flushes everything captured before it, so GL and Vulkan draws keep vanilla's painter's order. Anything else - other
+ * shaders, formats, blend/depth states or not-yet-mirrored textures - is drawn by GL exactly as before.
+ * Packets match the backend's EntityPass.
  */
 public final class EntityDraws {
     // EntityPass header indices / constants (the lab classes live in an isolated class loader).
     private static final int H_FORMAT = 0, H_VARIANT = 1, H_FLAGS = 2, H_TEXTURE = 3, H_OVERLAY = 4, H_VERTICES = 5, H_MODE = 6, H_INDICES = 7, H_INDEX_SIZE = 8, HEADER = 9;
     private static final int FORMAT_ENTITY = 0, FORMAT_TEXT = 1, FORMAT_PARTICLE = 2, FORMAT_POSITION = 3, FORMAT_POSITION_COLOR = 4,
-            FORMAT_POSITION_TEX = 5, FORMAT_POSITION_TEX_COLOR = 6, FORMAT_CLOUDS = 7, MODE_QUADS = 0, MODE_TRIANGLES = 1, WHITE_TEXTURE = 0;
+            FORMAT_POSITION_TEX = 5, FORMAT_POSITION_TEX_COLOR = 6, FORMAT_CLOUDS = 7, FORMAT_POSITION_COLOR_TEX = 8,
+            MODE_QUADS = 0, MODE_TRIANGLES = 1, WHITE_TEXTURE = 0;
+    /** Overlay passes per frame; the backend allows 16 (SharedWorldRenderer.MAX_OVERLAYS), one is kept spare. */
+    private static final int MAX_PASSES = 15;
     private static final int BLEND = 1, DEPTH_TEST = 2, DEPTH_WRITE = 4, CULL = 8, BLEND_ADD = 16, NO_COLOR = 32;
     /** fragment variant (see entity.frag), EntityPass format, required VertexFormat, and which vanilla inputs the shader uses. */
     private record Spec(int variant, int format, VertexFormat vertexFormat, boolean lightmap, boolean fog, boolean textured) { }
@@ -50,8 +58,27 @@ public final class EntityDraws {
             Map.entry("position_color", new Spec(4, FORMAT_POSITION_COLOR, DefaultVertexFormat.POSITION_COLOR, false, false, false)),
             Map.entry("position_tex", new Spec(4, FORMAT_POSITION_TEX, DefaultVertexFormat.POSITION_TEX, false, false, true)),
             Map.entry("position_tex_color", new Spec(6, FORMAT_POSITION_TEX_COLOR, DefaultVertexFormat.POSITION_TEX_COLOR, false, false, true)),
-            Map.entry("position_tex_color_normal", new Spec(2, FORMAT_CLOUDS, DefaultVertexFormat.POSITION_TEX_COLOR_NORMAL, false, true, true)));
-    enum Window { SKY, ENTITIES, PARTICLES, WEATHER }
+            Map.entry("position_tex_color_normal", new Spec(2, FORMAT_CLOUDS, DefaultVertexFormat.POSITION_TEX_COLOR_NORMAL, false, true, true)),
+            // P11 GUI: fills/gradients/overlays (rendertype_gui*), colored blits and screen effects (position_color_tex), name tags.
+            Map.entry("rendertype_gui", new Spec(4, FORMAT_POSITION_COLOR, DefaultVertexFormat.POSITION_COLOR, false, false, false)),
+            Map.entry("rendertype_gui_overlay", new Spec(4, FORMAT_POSITION_COLOR, DefaultVertexFormat.POSITION_COLOR, false, false, false)),
+            Map.entry("rendertype_gui_ghost_recipe_overlay", new Spec(4, FORMAT_POSITION_COLOR, DefaultVertexFormat.POSITION_COLOR, false, false, false)),
+            Map.entry("position_color_tex", new Spec(6, FORMAT_POSITION_COLOR_TEX, DefaultVertexFormat.POSITION_COLOR_TEX, false, false, true)),
+            Map.entry("rendertype_text_intensity", new Spec(7, FORMAT_TEXT, DefaultVertexFormat.POSITION_COLOR_TEX_LIGHTMAP, true, true, true)),
+            Map.entry("rendertype_text_intensity_see_through", new Spec(7, FORMAT_TEXT, DefaultVertexFormat.POSITION_COLOR_TEX_LIGHTMAP, false, false, true)),
+            Map.entry("rendertype_text_see_through", new Spec(2, FORMAT_TEXT, DefaultVertexFormat.POSITION_COLOR_TEX_LIGHTMAP, false, false, true)));
+    enum Window {
+        SKY, ENTITIES, PARTICLES, WEATHER, HAND;
+        /** Starts from cleared depth and must keep painter's order with GL draws (splits on fallback). */
+        boolean ordered() { return ordinal() >= HAND.ordinal(); }
+    }
+    private static TerrainPresenter presenter;
+    /** Test hook (smoke source set only): sees each overlay's {color, depth} GL textures right before they are composited. */
+    static java.util.function.BiConsumer<Window, int[]> overlayProbe;
+    /** Test hook: right after an overlay was composited. */
+    static java.util.function.Consumer<Window> overlayProbeAfter;
+    private static int passes;
+    private static long splits;
     private static Window open;
     private static boolean frameActive, skyArmed, disabled;
     private static int lightmap;
@@ -67,13 +94,16 @@ public final class EntityDraws {
     public static void draw(RenderType type, BufferBuilder.RenderedBuffer rendered) { drawImmediate(rendered); }
     /** Tesselator.end() and LevelRenderer's direct uploads - and every such draw outside a capture window. */
     public static void drawImmediate(BufferBuilder.RenderedBuffer rendered) {
-        if (open == null || !RenderSystem.isOnRenderThread() || !capture(rendered)) BufferUploader.drawWithShader(rendered);
+        if (GuiDraws.active() && RenderSystem.isOnRenderThread()) { GuiDraws.draw(rendered); return; }
+        if (open != null && RenderSystem.isOnRenderThread() && capture(rendered)) return;
+        split();
+        BufferUploader.drawWithShader(rendered);
     }
     /** SkyBuffers: a static VertexBuffer drawn with its own matrices. False when GL must draw it. */
     static boolean drawMesh(SkyBuffers.Mesh mesh, Matrix4f modelView, Matrix4f projection, ShaderInstance shader) {
         if (open == null || !RenderSystem.isOnRenderThread()) return false;
         Object[] packet = packet(shader, mesh.format(), mesh.mode(), mesh.indices() == null, modelView, projection);
-        if (packet == null) return false;
+        if (packet == null) { split(); return false; }
         add(packet, mesh.mode(), mesh.vertexCount(), mesh.vertices(), mesh.indices(), mesh.indexCount(), mesh.indexSize(), shader);
         return true;
     }
@@ -87,9 +117,26 @@ public final class EntityDraws {
     /** Sky packets for this frame's terrain submit (empty when none were captured). */
     static Object[] takeSky() { Object[] result = sky.toArray(); sky.clear(); if (result.length > 0) windowComposites[Window.SKY.ordinal()]++; return result; }
     /** After this frame's Vulkan terrain composite; {@code lightmapTexture} is the lightmap WorldCapture mirrors. Opens ENTITIES. */
-    static void beginFrame(int lightmapTexture) {
-        packets.clear(); lightmap = lightmapTexture; frameActive = !disabled;
+    static void beginFrame(int lightmapTexture, TerrainPresenter compositor) {
+        packets.clear(); lightmap = lightmapTexture; frameActive = !disabled; presenter = compositor; passes = 0;
         open(Window.ENTITIES);
+    }
+    /** P11: opens an order-sensitive window, flushing whichever one is still open (e.g. HAND when the GUI starts). */
+    static void openOrdered(Window window) {
+        if (open != null && open.ordered()) flush(open, presenter);
+        if (open == null) open(window);
+    }
+    /** Flushes {@code window} if it is the open one (RenderGuiEvent.Post, ScreenEvent.Render.Post, swap). */
+    static void closeOrdered(Window window) { if (open == window) flush(window, presenter); }
+    static Window openWindow() { return open; }
+    /** GL is about to draw something it must draw itself: keep painter's order by compositing what was captured before it. */
+    private static void split() {
+        if (open == null || !open.ordered() || packets.isEmpty() || !RenderSystem.isOnRenderThread()) return;
+        Window window = open;
+        flush(window, presenter);
+        splits++;
+        // Out of passes: the rest of this frame's window stays on GL, still in order.
+        if (passes < MAX_PASSES) open = window;
     }
     /** Overlay windows only open in frames whose terrain went through Vulkan (the overlay pass needs this frame's terrain depth). */
     static void open(Window window) { packets.clear(); open = frameActive ? window : null; }
@@ -98,18 +145,23 @@ public final class EntityDraws {
         if (open != window) return;
         open = null;
         if (packets.isEmpty()) return;
-        int[] textures = NativeMainWindow.renderOverlay(packets.toArray());
+        int[] textures = passes < MAX_PASSES ? NativeMainWindow.renderOverlay(packets.toArray(), window.ordered()) : null;
         packets.clear();
         if (textures == null) return;
-        try { presenter.drawTranslucent(textures[0], textures[1]); }
+        passes++;
+        if (overlayProbe != null) overlayProbe.accept(window, textures);
+        try {
+            presenter.drawTranslucent(textures[0], textures[1]);
+        }
         finally { NativeMainWindow.finishOverlay(); }
+        if (overlayProbeAfter != null) overlayProbeAfter.accept(window);
         composites++; windowComposites[window.ordinal()]++;
     }
     static void cancel() { open = null; frameActive = false; packets.clear(); }
     static void disable() { cancel(); armSky(false); disabled = true; }
     /** Preview restart: allow capture again. */
     static void reset() { cancel(); armSky(false); disabled = false; }
-    static long[] stats() { return new long[]{captured, unsupported, stateFallbacks, textureFallbacks, composites}; }
+    static long[] stats() { return new long[]{captured, unsupported, stateFallbacks, textureFallbacks, composites, splits}; }
     /** {draws captured, passes (overlay composites, or terrain submits carrying sky)} for one window. */
     static long[] stats(Window window) { return new long[]{windowDraws[window.ordinal()], windowComposites[window.ordinal()]}; }
     static Map<String, Long> capturedShaders() { return Collections.unmodifiableMap(capturedShaders); }
@@ -129,6 +181,20 @@ public final class EntityDraws {
         return true;
     }
 
+    static Object[] guiPacket(BufferBuilder.RenderedBuffer rendered) {
+        var state = rendered.drawState();
+        if (state.indexOnly()) return null;
+        var shader = RenderSystem.getShader();
+        Object[] result = packet(shader, state.format(), state.mode(), state.sequentialIndex(), RenderSystem.getModelViewMatrix(), RenderSystem.getProjectionMatrix());
+        if (result == null || state.mode() == VertexFormat.Mode.TRIANGLE_FAN) return null;
+        int[] header = (int[]) result[0];
+        header[H_VERTICES] = state.vertexCount(); header[H_MODE] = state.mode() == VertexFormat.Mode.QUADS ? MODE_QUADS : MODE_TRIANGLES;
+        header[H_INDICES] = state.indexCount(); header[H_INDEX_SIZE] = state.indexType().bytes;
+        result[2] = copy(rendered.vertexBuffer()); result[3] = state.sequentialIndex() ? null : copy(rendered.indexBuffer());
+        captured++; capturedShaders.merge(shader.getName(), 1L, Long::sum);
+        return result;
+    }
+
     private static void reject(ShaderInstance shader) {
         unsupported++;
         if (shader != null) fallbackShaders.merge(shader.getName(), 1L, Long::sum);
@@ -136,15 +202,20 @@ public final class EntityDraws {
 
     /** Header + uniforms for a supported draw in the current GL/RenderSystem state, or null (counted) when GL must draw it. */
     private static Object[] packet(ShaderInstance shader, VertexFormat format, VertexFormat.Mode mode, boolean sequential, Matrix4f modelView, Matrix4f projection) {
+        // Overlay windows can only be replayed while this frame still has passes left; the sky rides the terrain submit.
+        if (!GuiDraws.active() && open != Window.SKY && passes >= MAX_PASSES) return null;
         Spec spec = shader == null ? null : SHADERS.get(shader.getName());
         boolean fan = mode == VertexFormat.Mode.TRIANGLE_FAN;
         if (spec == null || format != spec.vertexFormat() || (fan && !sequential)
                 || (mode != VertexFormat.Mode.QUADS && mode != VertexFormat.Mode.TRIANGLES && !fan)) { reject(shader); return null; }
+        ShaderBlendState.apply(shader); // Match the blend change vanilla performs inside ShaderInstance.apply.
         int flags = glState();
-        if (flags >= 0 && spec.lightmap() && RenderSystem.getShaderTexture(2) != lightmap) flags = -6;
+        if (flags >= 0 && !GuiDraws.active() && spec.lightmap() && RenderSystem.getShaderTexture(2) != lightmap) flags = -6;
         if (flags < 0) {
             stateFallbacks++;
-            fallbackStates.merge(shader.getName() + ":" + STATE_REASONS[-flags], 1L, Long::sum);
+            String reason = STATE_REASONS[-flags];
+            if (flags == -1) reason += "(" + glGetInteger(GL_BLEND_SRC_RGB) + "," + glGetInteger(GL_BLEND_DST_RGB) + "," + glGetInteger(GL_BLEND_SRC_ALPHA) + "," + glGetInteger(GL_BLEND_DST_ALPHA) + ")";
+            fallbackStates.merge(shader.getName() + ":" + reason, 1L, Long::sum);
             return null;
         }
         int texture = spec.textured() ? RenderSystem.getShaderTexture(0) : WHITE_TEXTURE;
@@ -197,6 +268,7 @@ public final class EntityDraws {
     private static int glState() {
         int flags = 0;
         if (glIsEnabled(GL_BLEND)) {
+            if (glGetInteger(org.lwjgl.opengl.GL20.GL_BLEND_EQUATION_RGB) != GL_FUNC_ADD || glGetInteger(org.lwjgl.opengl.GL20.GL_BLEND_EQUATION_ALPHA) != GL_FUNC_ADD) return -1;
             int srcRGB = glGetInteger(GL_BLEND_SRC_RGB), dstRGB = glGetInteger(GL_BLEND_DST_RGB);
             int srcAlpha = glGetInteger(GL_BLEND_SRC_ALPHA), dstAlpha = glGetInteger(GL_BLEND_DST_ALPHA);
             // TRANSLUCENT_TRANSPARENCY and defaultBlendFunc() (SRC_ALPHA, ONE_MINUS_SRC_ALPHA, ONE, ZERO) both become premultiplied
@@ -205,19 +277,22 @@ public final class EntityDraws {
             boolean alphaFactors = (srcAlpha == GL_ONE || srcAlpha == GL_SRC_ALPHA) && (dstAlpha == GL_ONE_MINUS_SRC_ALPHA || dstAlpha == GL_ZERO);
             if (srcRGB == GL_SRC_ALPHA && dstRGB == GL_ONE_MINUS_SRC_ALPHA && alphaFactors) flags |= BLEND;
             else if (srcRGB == GL_SRC_ALPHA && dstRGB == GL_ONE) flags |= BLEND_ADD;
+            else if (GuiDraws.active() && srcRGB == GL_ONE_MINUS_DST_COLOR && dstRGB == GL_ONE_MINUS_SRC_COLOR) flags |= 64;
+            else if (GuiDraws.active() && srcRGB == GL_ZERO && dstRGB == GL_ONE_MINUS_SRC_COLOR) flags |= 128;
             else return -1;
         }
         if (glIsEnabled(GL_DEPTH_TEST)) {
             int func = glGetInteger(GL_DEPTH_FUNC);
             if (func != GL_LEQUAL && func != GL_LESS) return -2;
             flags |= DEPTH_TEST;
+            if (func == GL_LESS) flags |= 256;
         }
         if (glGetBoolean(GL_DEPTH_WRITEMASK)) flags |= DEPTH_WRITE;
         if (glIsEnabled(GL_CULL_FACE)) {
             if (glGetInteger(GL_CULL_FACE_MODE) != GL_BACK || glGetInteger(GL_FRONT_FACE) != GL_CCW) return -3;
             flags |= CULL;
         }
-        if (glIsEnabled(GL_POLYGON_OFFSET_FILL) || glIsEnabled(GL_SCISSOR_TEST) || glIsEnabled(GL_COLOR_LOGIC_OP)) return -4;
+        if (glIsEnabled(GL_POLYGON_OFFSET_FILL) || (!GuiDraws.active() && glIsEnabled(GL_SCISSOR_TEST)) || glIsEnabled(GL_COLOR_LOGIC_OP)) return -4;
         try (var stack = org.lwjgl.system.MemoryStack.stackPush()) {
             var mask = stack.malloc(4); glGetBooleanv(GL_COLOR_WRITEMASK, mask);
             int written = 0;

@@ -61,7 +61,7 @@ final class VulkanPreview {
                     translucentPending = sharedTranslucent > 0 && sharedTranslucentDepth > 0 && TerrainPresenter.translucentReady()
                             && !Minecraft.useShaderTransparency();
                     // P7/P8: entity and block-entity draws until AFTER_BLOCK_ENTITIES go to the Vulkan entity pass when supported.
-                    if (translucentPending) { EntityTextures.poll(); EntityDraws.beginFrame(RenderSystem.getShaderTexture(2)); }
+                    if (translucentPending) { EntityTextures.poll(); EntityDraws.beginFrame(RenderSystem.getShaderTexture(2), PRESENTER); }
                 }
                 else if (texture != null && bridge.status() == OffscreenBridge.Status.RUNNING) PRESENTER.draw(texture);
             }
@@ -71,6 +71,33 @@ final class VulkanPreview {
             close();
         }
         EntityDraws.armSky(composited && enabled);
+    }
+    /** P11, AFTER_LEVEL: GameRenderer next clears depth and draws the held items, arms and screen effects. */
+    static boolean guiEnabled() { return enabled && direct && !inset; }
+    static void handBegin() { ordered(() -> EntityDraws.openOrdered(EntityDraws.Window.HAND)); }
+    /** Before GUI clear or present: composite a still-open hand window into the main target. */
+    static void beforeSwap() {
+        EntityDraws.Window window = EntityDraws.openWindow();
+        if (window == null || !window.ordered()) return;
+        var target = Minecraft.getInstance().getMainRenderTarget();
+        int draw = org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL30.GL_DRAW_FRAMEBUFFER_BINDING);
+        int read = org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL30.GL_READ_FRAMEBUFFER_BINDING);
+        ordered(() -> {
+            target.bindWrite(true);
+            try { EntityDraws.closeOrdered(window); }
+            finally {
+                com.mojang.blaze3d.platform.GlStateManager._glBindFramebuffer(org.lwjgl.opengl.GL30.GL_DRAW_FRAMEBUFFER, draw);
+                com.mojang.blaze3d.platform.GlStateManager._glBindFramebuffer(org.lwjgl.opengl.GL30.GL_READ_FRAMEBUFFER, read);
+            }
+        });
+    }
+    private static void ordered(Runnable action) {
+        if (!enabled || !direct) return;
+        try { action.run(); }
+        catch (Exception error) {
+            VulkanForge.LOGGER.error("Vulkan hand/GUI overlay failed; captured draws return to OpenGL until the preview restarts", error);
+            EntityDraws.disable();
+        }
     }
     /** ViewportEvent.ComputeFogColor: LevelRenderer is about to clear and draw the sky. */
     static void skyBegin() { if (enabled && direct) EntityDraws.openSky(); }
@@ -214,6 +241,7 @@ final class VulkanPreview {
         if (bridge != null) { bridge.close(); bridge = null; }
         if (texture != null) { Minecraft.getInstance().getTextureManager().release(TEXTURE); texture.close(); texture = null; }
         if (sharedTexture != null) { Minecraft.getInstance().getTextureManager().release(TEXTURE); sharedTexture.close(); sharedTexture = null; }
+        GuiDraws.reset();
         EntityDraws.reset();
         if (direct) NativeMainWindow.closeWorld();
         EntityTextures.reset();
