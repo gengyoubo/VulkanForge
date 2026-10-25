@@ -16,13 +16,14 @@ import static org.lwjgl.vulkan.VK13.*;
  */
 final class EntityPass implements AutoCloseable {
     static final int H_FORMAT = 0, H_VARIANT = 1, H_FLAGS = 2, H_TEXTURE = 3, H_OVERLAY = 4, H_VERTICES = 5, H_MODE = 6, H_INDICES = 7, H_INDEX_SIZE = 8, HEADER = 9;
-    static final int FORMAT_ENTITY = 0, FORMAT_TEXT = 1;
+    static final int FORMAT_ENTITY = 0, FORMAT_TEXT = 1, FORMAT_PARTICLE = 2;
     static final int MODE_QUADS = 0, MODE_TRIANGLES = 1;
     static final int BLEND = 1, DEPTH_TEST = 2, DEPTH_WRITE = 4, CULL = 8;
     static final int TEXTURE_LINEAR = 1, TEXTURE_CLAMP = 2;
     static final int UNIFORM_FLOATS = 64;
     private static final int UNIFORM_STRIDE = 256; // == the largest allowed minUniformBufferOffsetAlignment
-    private static final int[] STRIDES = {36, 28};
+    private static final int[] STRIDES = {36, 28, 28};
+    private static final String[] VERTEX_SHADERS = {"/shaders/entity.vert", "/shaders/text.vert", "/shaders/particle.vert"};
     private record Texture(GpuImage image, int flags) implements AutoCloseable { @Override public void close() { image.close(); } }
     private static final class SlotResources {
         GpuBuffer vertices, indices, uniforms;
@@ -216,22 +217,23 @@ final class EntityPass implements AutoCloseable {
     }
 
     private long pipeline(int format, int flags) {
-        int key = format | flags << 1;
+        int key = format | flags << 2;
         Long existing = pipelines.get(key);
         if (existing != null) return existing;
         long vert = 0, frag = 0;
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            vert = ShaderCompiler.module(context, format == FORMAT_TEXT ? "/shaders/text.vert" : "/shaders/entity.vert", shaderc_glsl_vertex_shader);
+            vert = ShaderCompiler.module(context, VERTEX_SHADERS[format], shaderc_glsl_vertex_shader);
             frag = ShaderCompiler.module(context, "/shaders/entity.frag", shaderc_glsl_fragment_shader);
             var stages = VkPipelineShaderStageCreateInfo.calloc(2, stack);
             stages.get(0).sType$Default().stage(VK_SHADER_STAGE_VERTEX_BIT).module(vert).pName(stack.UTF8("main"));
             stages.get(1).sType$Default().stage(VK_SHADER_STAGE_FRAGMENT_BIT).module(frag).pName(stack.UTF8("main"));
             boolean text = format == FORMAT_TEXT;
-            var attributes = VkVertexInputAttributeDescription.calloc(text ? 4 : 6, stack);
+            var attributes = VkVertexInputAttributeDescription.calloc(format == FORMAT_ENTITY ? 6 : 4, stack);
             attributes.get(0).location(0).binding(0).format(VK_FORMAT_R32G32B32_SFLOAT).offset(0);
-            attributes.get(1).location(1).binding(0).format(VK_FORMAT_R8G8B8A8_UNORM).offset(12);
-            attributes.get(2).location(2).binding(0).format(VK_FORMAT_R32G32_SFLOAT).offset(16);
-            if (text) attributes.get(3).location(3).binding(0).format(VK_FORMAT_R16G16_SINT).offset(24);
+            // PARTICLE orders UV0 before Color: Position, UV0, Color, UV2.
+            attributes.get(1).location(1).binding(0).format(VK_FORMAT_R8G8B8A8_UNORM).offset(format == FORMAT_PARTICLE ? 20 : 12);
+            attributes.get(2).location(2).binding(0).format(VK_FORMAT_R32G32_SFLOAT).offset(format == FORMAT_PARTICLE ? 12 : 16);
+            if (text || format == FORMAT_PARTICLE) attributes.get(3).location(3).binding(0).format(VK_FORMAT_R16G16_SINT).offset(24);
             else {
                 attributes.get(3).location(3).binding(0).format(VK_FORMAT_R16G16_SINT).offset(24);
                 attributes.get(4).location(4).binding(0).format(VK_FORMAT_R16G16_SINT).offset(28);

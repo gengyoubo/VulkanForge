@@ -58,7 +58,7 @@ final class VulkanPreview {
                     translucentPending = sharedTranslucent > 0 && sharedTranslucentDepth > 0 && TerrainPresenter.translucentReady()
                             && !Minecraft.useShaderTransparency();
                     // P7/P8: entity and block-entity draws until AFTER_BLOCK_ENTITIES go to the Vulkan entity pass when supported.
-                    if (translucentPending) { EntityTextures.poll(); EntityDraws.open(RenderSystem.getShaderTexture(2)); }
+                    if (translucentPending) { EntityTextures.poll(); EntityDraws.beginFrame(RenderSystem.getShaderTexture(2)); }
                 }
                 else if (texture != null && bridge.status() == OffscreenBridge.Status.RUNNING) PRESENTER.draw(texture);
             }
@@ -70,11 +70,17 @@ final class VulkanPreview {
     }
 
     /** AFTER_BLOCK_ENTITIES: replay captured entity/block-entity draws in Vulkan and composite them with depth. */
-    static void entities() {
-        try { EntityDraws.flush(PRESENTER); }
+    static void entities() { overlay(EntityDraws.Window.ENTITIES, null); }
+    /** AFTER_TRIPWIRE_BLOCKS: the next thing vanilla draws is ParticleEngine.render (P9). */
+    static void particlesBegin() { EntityDraws.open(EntityDraws.Window.PARTICLES); }
+    /** AFTER_PARTICLES: composite particles, then capture rain/snow until AFTER_WEATHER. */
+    static void particlesEnd() { overlay(EntityDraws.Window.PARTICLES, EntityDraws.Window.WEATHER); }
+    static void weather() { overlay(EntityDraws.Window.WEATHER, null); }
+    private static void overlay(EntityDraws.Window window, EntityDraws.Window next) {
+        try { EntityDraws.flush(window, PRESENTER); if (next != null) EntityDraws.open(next); }
         catch (Exception error) {
-            // Entities fall back to OpenGL; terrain stays on Vulkan.
-            VulkanForge.LOGGER.error("Vulkan entity pass failed; entities return to OpenGL until the preview restarts", error);
+            // Captured draws fall back to OpenGL; terrain stays on Vulkan.
+            VulkanForge.LOGGER.error("Vulkan overlay pass failed; entities, particles and weather return to OpenGL until the preview restarts", error);
             EntityDraws.disable();
         }
     }

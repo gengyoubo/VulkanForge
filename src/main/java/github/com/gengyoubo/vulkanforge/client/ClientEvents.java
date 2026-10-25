@@ -56,6 +56,9 @@ public final class ClientEvents {
         if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_CUTOUT_BLOCKS) VulkanPreview.terrain(event);
         else if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_BLOCK_ENTITIES) VulkanPreview.entities();
         else if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_TRANSLUCENT_BLOCKS) VulkanPreview.translucent();
+        else if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_TRIPWIRE_BLOCKS) VulkanPreview.particlesBegin();
+        else if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_PARTICLES) VulkanPreview.particlesEnd();
+        else if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_WEATHER) VulkanPreview.weather();
     }
 
     @SubscribeEvent

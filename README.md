@@ -9,7 +9,7 @@ Minecraft **1.20.1 / Forge 47.4.28 / Java 17** 客户端 Vulkan 渲染实验。
 - 游戏主窗口预览：同进程 Vulkan 绘制旋转三角形 → 导出共享 GPU 图像 → 原有 GL 上下文采样 → 主菜单 / HUD 显示。
 - 世界不透明和镂空方块：采集原版烘焙模型、贴图 UV、染色、环境遮蔽与光照坐标 → 分区顶点缓冲 → Vulkan 图集/光照图采样、相机变换、alpha 丢弃、D32 深度测试 → 在原版 cutout 阶段之后合成。
 
-**这是混合渲染原型。主窗口的最终呈现已交给 Vulkan；Windows 主窗口路径中的 WorldScene 已接入同一个 Vulkan 后端，solid、cutout、cutoutMipped 地形通过共享 GPU 纹理合成，正常地形帧不经过 CPU 像素读回或 FrameProtocol。** Vulkan 覆盖范围内的半透明方块与水也由 Vulkan 绘制（P6 第一步），常见实体、方块实体和告示牌文字由 Vulkan 实体通道回放（P7/P8）；天空、范围外地形、Fabulous 模式下的半透明层、不支持的实体着色器、粒子、天气、手持物和 HUD 仍在隐藏的 OpenGL 上下文中绘制，然后统一由主窗口 Swapchain 呈现。关闭主窗口 Vulkan 路径时保留旧的子进程读回预览作为兼容路径。
+**这是混合渲染原型。主窗口的最终呈现已交给 Vulkan；Windows 主窗口路径中的 WorldScene 已接入同一个 Vulkan 后端，solid、cutout、cutoutMipped 地形通过共享 GPU 纹理合成，正常地形帧不经过 CPU 像素读回或 FrameProtocol。** Vulkan 覆盖范围内的半透明方块与水也由 Vulkan 绘制（P6 第一步），常见实体、方块实体和告示牌文字（P7/P8），以及粒子和雨雪（P9）由 Vulkan 叠加层通道回放；天空、云、范围外地形、Fabulous 模式下的半透明层、不支持的着色器、手持物和 HUD 仍在隐藏的 OpenGL 上下文中绘制，然后统一由主窗口 Swapchain 呈现。关闭主窗口 Vulkan 路径时保留旧的子进程读回预览作为兼容路径。
 
 ## 构建和启动
 
@@ -92,7 +92,7 @@ IntelliJ IDEA：导入根目录的 `build.gradle`，将 **Gradle JVM** 和 **Pro
 # Windows 主窗口：呈现/故障恢复，以及同进程 45 个非空 Section 的像素、双缓冲、相机、缩放、删除、重置与关闭后重开
 .\gradlew.bat :vulkan-lab:smokePresent
 
-# 完整 Forge 检查：ASM 钩子、Vulkan 主窗口、世界、水池与染色玻璃（P6 半透明）、箱子/告示牌/牛（P7/P8 实体通道）、重载、昼夜光照、缩放、最小化恢复、全屏往返、切换世界，然后退出
+# 完整 Forge 检查：ASM 钩子、Vulkan 主窗口、世界、水池与染色玻璃（P6 半透明）、箱子/告示牌/牛（P7/P8 实体通道）、营火/火把粒子与降雨（P9）、重载、昼夜光照、缩放、最小化恢复、全屏往返、切换世界，然后退出
 # 退出超过 30 秒或主窗口报告缺少 FINAL_PRESENTED_FRAMES / VALIDATION_ERRORS=0 时判定失败；检查期间会短暂全屏，请保持游戏窗口在前台
 # 测试源集不会被打入模组 JAR；会在 run/saves 留下测试世界和日志中的 PNG
 .\gradlew.bat -PworldSmoke runClient
@@ -141,15 +141,30 @@ Fabulous 图形模式会把半透明层画进独立目标供透明后处理链�
 
 `EntityPass` 的 Vulkan 着色器移植自原版 `rendertype_entity_*` / `rendertype_text`：双光源漫反射、覆盖层与光照图 texelFetch、四种片元分支和线性/柱形雾。每次绘制的矩阵、颜色调制、光照方向和雾参数放在 256 字节的动态 uniform 中。顶点、索引和 uniform 使用每槽位环形缓冲，四边形使用与原版相同顺序的共享索引缓冲；管线按格式与混合/深度/剔除状态缓存。
 
-地形提交时把不透明深度复制到每槽位私有的 Vulkan 深度图。`AFTER_BLOCK_ENTITIES` 时第二次提交：把它复制进共享实体深度，在其上回放实体，然后以预乘 alpha 清屏后的颜色和深度交给 GL。GL 侧用与半透明相同的合成着色器，写入 `gl_FragDepth` 并与 GL 深度测试，因此 GL 回退的实体和范围外地形仍能正确遮挡。实体图像有独立的 fence 和信号量往返；没有实体的帧不提交。与半透明一样，Fabulous 模式不启用。
+地形提交时把不透明深度复制到每槽位私有的 Vulkan 深度图。`AFTER_BLOCK_ENTITIES` 时第二次提交：把它复制进共享叠加层深度，在其上回放实体，然后把以预乘 alpha 清屏后的颜色和深度交给 GL。GL 侧用与半透明相同的合成着色器，写入 `gl_FragDepth` 并与 GL 深度测试，因此 GL 回退的实体和范围外地形仍能正确遮挡。没有捕获到绘制的窗口不提交。与半透明一样，Fabulous 模式不启用。
 
 尚未完成：附魔光效（`glint`）、实体阴影、发光轮廓、末影/蜘蛛眼（加法混合）、`translucentCullBlockSheet` 中的物品实体（这些在 `AFTER_BLOCK_ENTITIES` 之后才刷新）、破坏裂纹以及模组自定义着色器。
 
-## 后续阶段（P9–P11）
+## 粒子与天气（P9）
 
-三个阶段都复用 P7/P8 的“捕获 → 镜像贴图 → Vulkan 回放 → 带深度合成”框架，主要工作是增加捕获点和着色器移植：
+粒子和雨雪不经过 `RenderType.end`，而是 `Tesselator.end()` → `BufferUploader.drawWithShader`。`coremods/entities.js` 也改写这一处调用（同样按 owner/描述符匹配），使捕获框架有两个入口。每帧最多三个捕获窗口：
 
-- **P9 粒子与天气**：`ParticleEngine.render` 与 `renderSnowAndRain` 不经过 `RenderType.end`，而是 `Tesselator` + `BufferUploader.drawWithShader`。需要在这两处安装捕获，移植 `particle` 与 `rendertype_weather`/`position_tex_color` 着色器，并在 `AFTER_PARTICLES` / `AFTER_WEATHER` 合成。
+| 窗口 | 打开 | 关闭并合成 | 内容 |
+| --- | --- | --- | --- |
+| ENTITIES | Vulkan 地形合成后（`AFTER_CUTOUT_BLOCKS`） | `AFTER_BLOCK_ENTITIES` | 实体、方块实体（P7/P8） |
+| PARTICLES | `AFTER_TRIPWIRE_BLOCKS` | `AFTER_PARTICLES` | `ParticleEngine.render`，包括物品拾取等经 `RenderType` 的粒子 |
+| WEATHER | `AFTER_PARTICLES` | `AFTER_WEATHER` | 雨和雪（云使用 `VertexBuffer`，不会被捕获，仍由 GL 先绘制） |
+
+窗口之外的 `Tesselator` 用户（GUI、天空等）照常由 GL 绘制。粒子与雨雪都使用原版 `particle` 着色器和 `PARTICLE` 顶点格式（位置、UV、颜色、光照）；Vulkan 端新增 `particle.vert`，片元沿用实体着色器“染色后 0.1 丢弃”的分支，并保留原版雾距离（不含视图旋转）。粒子图集、方块图集和雨雪贴图通过同一个贴图镜像同步；雨雪 UV 超出 [0,1] 时，按 GL 的 WRAP 参数选择重复采样器。
+
+三个窗口共用每槽位的一对共享叠加层图像。GL 合成后立即 `finishOverlay()` 发出完成信号量，下一个窗口的 Vulkan 提交等待它后清屏复用，因此每个窗口都是独立的“等待 → 绘制 → 信号 → GL 租用”往返。每个窗口重新从当帧地形深度开始，每个“槽位 × 窗口”有独立的命令缓冲、fence、顶点/索引/uniform 环形缓冲和描述符池，同一帧内的多次提交互不覆盖。
+
+粒子在 Vulkan 中只与地形深度测试，水、实体等 GL 深度由合成时的深度测试处理：位于水面后的粒子会被剔除，与原版先画水再画粒子的行为一致。尚未覆盖：使用自定义着色器或 `CUSTOM` 渲染类型自行绘制的模组粒子、云（P10）。
+
+## 后续阶段（P10–P11）
+
+两个阶段都复用“捕获 → 镜像贴图 → Vulkan 回放 → 带深度合成”框架，主要工作是增加捕获点和着色器移植：
+
 - **P10 天空与云**：天空使用 `VertexBuffer.drawWithShader`（`position`、`position_tex`、`position_color` 着色器），云使用 `rendertype_clouds`。需要镜像静态 `VertexBuffer` 网格（天空、星星、云在重建时上传一次），在地形之前绘制到同一个 Vulkan 场景目标中；这样地形清屏不再需要原版天空。
 - **P11 手持物与 GUI**：手持物经 `RenderType.end`（可直接扩展 P8 捕获窗口）。GUI 由 `GuiGraphics` 产生，包括 `position_color`、`position_tex`、文字和物品图标。由于最终呈现已在 Vulkan 交换链，GUI 适合在 blit 之后直接画进交换链图像，不再经过 GL 合成。字体字形页需要随动态上传增量镜像。
 

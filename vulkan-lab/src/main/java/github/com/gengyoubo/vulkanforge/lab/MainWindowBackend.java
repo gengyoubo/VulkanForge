@@ -110,13 +110,15 @@ public final class MainWindowBackend implements AutoCloseable {
     }
     public int renderWorld(int width, int height) { return world().render(width, height); }
     public long[] worldStats() { return world == null ? new long[24] : world.stats(); }
-    /** P7/P8: packets are EntityPass Object[]s; returns {color, depth} GL textures leased until finishWorldFrame, or null. */
-    public int[] renderEntities(Object[] packets) {
+    /** P7-P9: packets are EntityPass Object[]s; returns {color, depth} GL textures leased until finishOverlay, or null. */
+    public int[] renderOverlay(Object[] packets) {
         if (world == null) return null;
         var list = new java.util.ArrayList<Object[]>(packets.length);
         for (Object packet : packets) list.add((Object[]) packet);
-        return world.renderEntities(list);
+        return world.renderOverlay(list);
     }
+    /** Called by GL right after compositing the overlay returned by renderOverlay. */
+    public void finishOverlay() { if (world != null) world.finishOverlay(); }
     /** {Integer glId, Integer width, Integer height, Integer flags, byte[] rgba}; false when no world renderer exists. */
     public boolean entityTexture(Object[] texture) {
         if (world == null) return false;

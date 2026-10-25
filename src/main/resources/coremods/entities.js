@@ -30,5 +30,28 @@ function initializeCoreMod() {
             ASMAPI.log('INFO', 'VulkanForge ASM installed RenderType entity capture');
             return node;
         }
+    },
+    // P9: Tesselator.end() is BufferUploader.drawWithShader(builder.end()); particles and rain/snow flush through it.
+    'vulkanforge_tesselator': {
+        'target': { 'type': 'CLASS', 'name': 'com.mojang.blaze3d.vertex.Tesselator' },
+        'transformer': function(node) {
+            var count = 0;
+            for (var m = 0; m < node.methods.size(); m++) {
+                var method = node.methods.get(m);
+                if (method.desc !== '()V' || (method.access & Opcodes.ACC_STATIC) !== 0) continue;
+                var insns = method.instructions.toArray();
+                for (var i = 0; i < insns.length; i++) {
+                    var insn = insns[i];
+                    if (!(insn instanceof MethodInsnNode) || insn.getOpcode() !== Opcodes.INVOKESTATIC) continue;
+                    if (insn.owner !== 'com/mojang/blaze3d/vertex/BufferUploader' || insn.desc !== '(Lcom/mojang/blaze3d/vertex/BufferBuilder$RenderedBuffer;)V') continue;
+                    method.instructions.set(insn, new MethodInsnNode(Opcodes.INVOKESTATIC, 'github/com/gengyoubo/vulkanforge/client/EntityDraws', 'drawImmediate',
+                        '(Lcom/mojang/blaze3d/vertex/BufferBuilder$RenderedBuffer;)V', false));
+                    count++;
+                }
+            }
+            if (count !== 1) throw new Error('VulkanForge Tesselator ASM expected one upload in end(), found ' + count);
+            ASMAPI.log('INFO', 'VulkanForge ASM installed Tesselator particle/weather capture');
+            return node;
+        }
     }};
 }

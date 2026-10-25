@@ -123,10 +123,21 @@ final class SharedWorldSmoke {
         header[EntityPass.H_FLAGS] = EntityPass.DEPTH_TEST | EntityPass.DEPTH_WRITE | EntityPass.CULL;
         header[EntityPass.H_TEXTURE] = 1001; header[EntityPass.H_OVERLAY] = 1002; header[EntityPass.H_VERTICES] = 12; header[EntityPass.H_MODE] = EntityPass.MODE_QUADS;
         Object[] packets = {new Object[]{header, uniforms, vertices.array(), null}};
+        // P9: a translucent red particle quad over the left entity (depth .4), drawn by a second overlay pass of the same frame.
+        backend.entityTexture(new Object[]{1003, 1, 1, 0, new byte[]{(byte)255, 0, 0, (byte)255}});
+        ByteBuffer particle = ByteBuffer.allocate(4 * 28).order(ByteOrder.LITTLE_ENDIAN);
+        float[][] corners = {{-.4f, -.3f}, {-.1f, -.3f}, {-.1f, .3f}, {-.4f, .3f}};
+        for (float[] c : corners) particle.putFloat(c[0]).putFloat(c[1]).putFloat(-.2f).putFloat(.5f).putFloat(.5f).putInt(0x80ffffff).putShort((short)240).putShort((short)240);
+        float[] particleUniforms = uniforms.clone(); particleUniforms[55] = 0; particleUniforms[63] = 2; // blended, discard-after variant
+        int[] particleHeader = header.clone();
+        particleHeader[EntityPass.H_FORMAT] = EntityPass.FORMAT_PARTICLE; particleHeader[EntityPass.H_VARIANT] = 2; particleHeader[EntityPass.H_TEXTURE] = 1003;
+        particleHeader[EntityPass.H_OVERLAY] = 1003; particleHeader[EntityPass.H_VERTICES] = 4;
+        particleHeader[EntityPass.H_FLAGS] = EntityPass.BLEND | EntityPass.DEPTH_TEST | EntityPass.DEPTH_WRITE;
+        Object[] particles = {new Object[]{particleHeader, particleUniforms, particle.array(), null}};
         int width = 64, height = 64;
         for (int frame = 0; frame < 3; frame++) {
             require(backend.renderWorld(width, height) > 0, "Terrain frame for entities failed");
-            int[] textures = backend.renderEntities(packets);
+            int[] textures = backend.renderOverlay(packets);
             require(textures != null && textures[0] > 0 && textures[1] > 0, "Entity pass did not produce shared textures");
             ByteBuffer pixels = read(textures[0], width, height);
             try {
@@ -145,11 +156,26 @@ final class SharedWorldSmoke {
                 require(Math.abs(depths.get(row + (int)(.35f * width)) - .5f) < 1e-5f && Math.abs(depths.get(row + (int)(.625f * width)) - .6f) < 1e-5f
                         && Math.abs(depths.get(row + (int)(.875f * width)) - .7f) < 1e-5f, "Entity depth is not terrain depth plus entity writes");
             } finally { glBindTexture(GL_TEXTURE_2D, bound); MemoryUtil.memFree(depths); }
+            backend.finishOverlay();
+            int[] second = backend.renderOverlay(particles);
+            require(second != null && second[0] == textures[0], "Second overlay pass did not reuse the shared images");
+            ByteBuffer overlay = read(second[0], width, height);
+            try {
+                int row = height / 2 * width, front = (row + (int)(.35f * width)) * 4, beside = (row + (int)(.875f * width)) * 4;
+                // Premultiplied red at alpha ~.5 over a cleared target; the entity pixels of the first pass must be gone.
+                require(Math.abs(Byte.toUnsignedInt(overlay.get(front)) - 128) <= 2 && overlay.get(front + 1) == 0 && Math.abs(Byte.toUnsignedInt(overlay.get(front + 3)) - 128) <= 2,
+                        "Particle overlay wrong: r=" + Byte.toUnsignedInt(overlay.get(front)) + " g=" + Byte.toUnsignedInt(overlay.get(front + 1)) + " a=" + Byte.toUnsignedInt(overlay.get(front + 3)));
+                require(Byte.toUnsignedInt(overlay.get(beside + 3)) == 0, "Second overlay was not cleared: frame=" + frame);
+            } finally { MemoryUtil.memFree(overlay); }
+            require(Math.abs(depth(second[1], width, height, .35f) - .4f) < 1e-5f && Math.abs(depth(second[1], width, height, .875f) - 1f) < 1e-5f,
+                    "Second overlay must start from terrain depth, not the first overlay's depth");
+            backend.finishOverlay();
             backend.finishWorldFrame();
         }
         long[] stats = backend.worldStats();
-        require(stats[18] >= 3 && stats[19] >= 3 && stats[21] >= 2 && stats[23] == 0, "Entity statistics wrong: " + java.util.Arrays.toString(stats));
+        require(stats[18] >= 6 && stats[19] >= 6 && stats[21] >= 3 && stats[23] == 0, "Overlay statistics wrong: " + java.util.Arrays.toString(stats));
         System.out.println("ENTITY_SMOKE=OK (entity texture mirror, terrain depth test, entity depth export, both slots)");
+        System.out.println("PARTICLE_OVERLAY_SMOKE=OK (second pass per frame, PARTICLE layout, premultiplied blend, cleared reuse, terrain-only depth)");
     }
     /** NEW_ENTITY layout: position, color, uv0, overlay uv1, light uv2, normal + padding (36 bytes). */
     private static void entityQuad(ByteBuffer vertices, float x0, float x1, float z) {
@@ -162,6 +188,14 @@ final class SharedWorldSmoke {
         for (float[] c : corners) vertices.putFloat(c[0]).putFloat(c[1]).putFloat(z).putInt(abgr)
                 .putFloat(.5f).putFloat(.5f).putShort((short)240).putShort((short)240);
         return vertices;
+    }
+    private static float depth(int texture, int width, int height, float x) {
+        java.nio.FloatBuffer depths = MemoryUtil.memAllocFloat(width * height);
+        int bound = glGetInteger(GL_TEXTURE_BINDING_2D);
+        try {
+            glBindTexture(GL_TEXTURE_2D, texture); glGetTexImage(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, GL_FLOAT, depths);
+            return depths.get(height / 2 * width + (int)(x * width));
+        } finally { glBindTexture(GL_TEXTURE_2D, bound); MemoryUtil.memFree(depths); }
     }
     private static float depth(int texture, int width, int height) {
         java.nio.FloatBuffer depths = MemoryUtil.memAllocFloat(width * height);

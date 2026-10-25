@@ -22,13 +22,16 @@ final class SharedWorldRenderer implements AutoCloseable {
         long fence;
         boolean used, pending;
         long serial;
-        // P7/P8: entity color/depth have their own submit, fence and semaphore cycle; sceneDepth is a Vulkan-only copy of
-        // this frame's opaque terrain depth, filled by the terrain submit and consumed by the entity submit.
-        SharedPresentImage entityColor, entityDepth;
+        // P7-P9 overlay passes (entities, particles, weather): one color/depth pair reused by every pass of a frame. GL releases
+        // it right after each composite, so each pass is its own Vulkan wait -> render -> signal -> GL lease cycle.
+        // sceneDepth is a Vulkan-only copy of this frame's opaque terrain depth, filled by the terrain submit.
+        SharedPresentImage overlayColor, overlayDepth;
         GpuImage sceneDepth;
-        VkCommandBuffer entityCommand;
-        long entityFence;
-        boolean entityUsed, entityPending, sceneFresh;
+        final VkCommandBuffer[] overlayCommands = new VkCommandBuffer[MAX_OVERLAYS];
+        final long[] overlayFences = new long[MAX_OVERLAYS];
+        final boolean[] overlayPending = new boolean[MAX_OVERLAYS];
+        boolean overlayUsed, sceneFresh, sceneReadable;
+        int overlays;
     }
     private final VulkanContext context;
     private final Function<long[], Consumer<int[]>> importer;
@@ -43,9 +46,11 @@ final class SharedWorldRenderer implements AutoCloseable {
     private long completedFrames;
     private long pool, triangleLayout, trianglePipeline, frames, terrainFrames, sectionDraws;
     private final long started = System.nanoTime();
-    private int width, height, generations, reading = -1, entityReading = -1;
+    /** Overlay passes allowed per frame; each owns a command buffer, fence and EntityPass ring set per slot. */
+    static final int MAX_OVERLAYS = 4;
+    private int width, height, generations, reading = -1, overlayReading = -1;
     private EntityPass entities;
-    private long entityFrames;
+    private long overlayPasses;
     private int depthTexture, translucentTexture, translucentDepthTexture;
     private long translucentSectionDraws;
     private static final long DEPTH_STAGES = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
@@ -60,7 +65,7 @@ final class SharedWorldRenderer implements AutoCloseable {
                 if (completedFrames >= frames) resource.run(); else retired.addLast(new Retired(frames, resource));
             };
             world.retireUsing(retire);
-            entities = new EntityPass(context, SLOT_COUNT, retire);
+            entities = new EntityPass(context, SLOT_COUNT * MAX_OVERLAYS, retire);
             timers = new GpuTimers(context, SLOT_COUNT, log, "TERRAIN", "TERRAIN_RELEASE", "TRIANGLE", "CULLING", "TRANSLUCENT");
             var familyCount = stack.ints(0);
             vkGetPhysicalDeviceQueueFamilyProperties(context.physical, familyCount, null);
@@ -72,16 +77,18 @@ final class SharedWorldRenderer implements AutoCloseable {
             var handle = stack.mallocLong(1);
             check(vkCreateCommandPool(context.device, VkCommandPoolCreateInfo.calloc(stack).sType$Default().queueFamilyIndex(context.queueFamily)
                     .flags(VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT), null, handle), "shared world pool"); pool = handle.get(0);
-            var pointers = stack.mallocPointer(SLOT_COUNT * 2);
+            var pointers = stack.mallocPointer(SLOT_COUNT * (1 + MAX_OVERLAYS));
             check(vkAllocateCommandBuffers(context.device, VkCommandBufferAllocateInfo.calloc(stack).sType$Default().commandPool(pool)
-                    .level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(SLOT_COUNT * 2), pointers), "shared world commands");
+                    .level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(SLOT_COUNT * (1 + MAX_OVERLAYS)), pointers), "shared world commands");
             for (int i = 0; i < SLOT_COUNT; i++) {
                 slots[i].command = new VkCommandBuffer(pointers.get(i), context.device);
-                slots[i].entityCommand = new VkCommandBuffer(pointers.get(SLOT_COUNT + i), context.device);
                 check(vkCreateFence(context.device, VkFenceCreateInfo.calloc(stack).sType$Default().flags(VK_FENCE_CREATE_SIGNALED_BIT), null, handle), "shared world fence");
                 slots[i].fence = handle.get(0);
-                check(vkCreateFence(context.device, VkFenceCreateInfo.calloc(stack).sType$Default().flags(VK_FENCE_CREATE_SIGNALED_BIT), null, handle), "shared entity fence");
-                slots[i].entityFence = handle.get(0);
+                for (int k = 0; k < MAX_OVERLAYS; k++) {
+                    slots[i].overlayCommands[k] = new VkCommandBuffer(pointers.get(SLOT_COUNT + i * MAX_OVERLAYS + k), context.device);
+                    check(vkCreateFence(context.device, VkFenceCreateInfo.calloc(stack).sType$Default().flags(VK_FENCE_CREATE_SIGNALED_BIT), null, handle), "shared overlay fence");
+                    slots[i].overlayFences[k] = handle.get(0);
+                }
             }
             var push = VkPushConstantRange.calloc(1, stack).stageFlags(VK_SHADER_STAGE_VERTEX_BIT).size(8);
             check(vkCreatePipelineLayout(context.device, VkPipelineLayoutCreateInfo.calloc(stack).sType$Default().pPushConstantRanges(push), null, handle), "shared triangle layout");
@@ -170,7 +177,7 @@ final class SharedWorldRenderer implements AutoCloseable {
                 vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(scene));
                 vkCmdCopyImage(command, slot.depth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.sceneDepth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy);
             }
-            slot.sceneFresh = terrain;
+            slot.sceneFresh = terrain; slot.sceneReadable = false; slot.overlays = 0;
             var toTest = VkImageMemoryBarrier2.calloc(1, stack);
             layoutBarrier(toTest.get(0), slot.translucentDepth, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, DEPTH_STAGES, DEPTH_ACCESS,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, true);
@@ -225,65 +232,74 @@ final class SharedWorldRenderer implements AutoCloseable {
     }
 
     /**
-     * P7/P8: replays this frame's captured entity draws over a copy of its terrain depth. Must follow render() in the same frame,
-     * before endRead(); returns {color, depth} GL textures leased until endRead(), or null when no terrain frame is open.
+     * P7-P9: replays one capture window's draws over a copy of this frame's terrain depth. Must follow render() in the same frame;
+     * returns {color, depth} GL textures leased until finishOverlay()/endRead(), or null when no terrain frame is open.
      */
-    int[] renderEntities(java.util.List<Object[]> packets) {
-        if (reading < 0 || entityReading >= 0) return null;
+    int[] renderOverlay(java.util.List<Object[]> packets) {
+        if (reading < 0) return null;
+        finishOverlay();
         int index = reading;
         Slot slot = slots[index];
-        if (!slot.sceneFresh || world.lightMapView() == 0) return null;
+        if (!slot.sceneFresh || slot.overlays >= MAX_OVERLAYS || world.lightMapView() == 0) return null;
+        int pass = slot.overlays++;
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkCommandBuffer command = slot.entityCommand;
-            check(vkResetCommandBuffer(command, 0), "reset entity command");
-            check(vkBeginCommandBuffer(command, VkCommandBufferBeginInfo.calloc(stack).sType$Default().flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)), "begin entity command");
+            VkCommandBuffer command = slot.overlayCommands[pass];
+            check(vkResetCommandBuffer(command, 0), "reset overlay command");
+            check(vkBeginCommandBuffer(command, VkCommandBufferBeginInfo.calloc(stack).sType$Default().flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)), "begin overlay command");
             var acquire = VkImageMemoryBarrier2.calloc(3, stack);
-            // The terrain submit's copy into sceneDepth precedes this submission on the same queue.
-            layoutBarrier(acquire.get(0), slot.sceneDepth.image, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+            // The terrain submit's copy into sceneDepth (and any earlier overlay's read of it) precede this submission on the queue.
+            if (slot.sceneReadable) layoutBarrier(acquire.get(0), slot.sceneDepth.image, VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, true);
+            else layoutBarrier(acquire.get(0), slot.sceneDepth.image, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, true);
-            acquireBarrier(acquire.get(1), slot.entityUsed, slot.entityDepth, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, true);
-            acquireBarrier(acquire.get(2), slot.entityUsed, slot.entityColor, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, false);
+            slot.sceneReadable = true;
+            acquireBarrier(acquire.get(1), slot.overlayUsed, slot.overlayDepth, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, true);
+            acquireBarrier(acquire.get(2), slot.overlayUsed, slot.overlayColor, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, false);
             vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(acquire));
             var copy = VkImageCopy.calloc(1, stack).srcSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).layerCount(1))
                     .dstSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).layerCount(1)).extent(e -> e.set(width, height, 1));
-            vkCmdCopyImage(command, slot.sceneDepth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.entityDepth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy);
+            vkCmdCopyImage(command, slot.sceneDepth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.overlayDepth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy);
             var toTest = VkImageMemoryBarrier2.calloc(1, stack);
-            layoutBarrier(toTest.get(0), slot.entityDepth.image, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, DEPTH_STAGES, DEPTH_ACCESS,
+            layoutBarrier(toTest.get(0), slot.overlayDepth.image, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, DEPTH_STAGES, DEPTH_ACCESS,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, true);
             vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(toTest));
-            var color = VkRenderingAttachmentInfo.calloc(1, stack).sType$Default().imageView(slot.entityColor.view())
+            var color = VkRenderingAttachmentInfo.calloc(1, stack).sType$Default().imageView(slot.overlayColor.view())
                     .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL).loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
             color.clearValue().color().float32(0, 0).float32(1, 0).float32(2, 0).float32(3, 0);
-            var depth = VkRenderingAttachmentInfo.calloc(stack).sType$Default().imageView(slot.entityDepth.view())
+            var depth = VkRenderingAttachmentInfo.calloc(stack).sType$Default().imageView(slot.overlayDepth.view())
                     .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL).loadOp(VK_ATTACHMENT_LOAD_OP_LOAD).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
             vkCmdBeginRendering(command, VkRenderingInfo.calloc(stack).sType$Default().layerCount(1).pColorAttachments(color).pDepthAttachment(depth)
                     .renderArea(r -> r.offset(o -> o.set(0, 0)).extent(e -> e.set(width, height))));
             vkCmdSetViewport(command, 0, VkViewport.calloc(1, stack).width(width).height(height).minDepth(0).maxDepth(1));
             vkCmdSetScissor(command, 0, VkRect2D.calloc(1, stack).offset(o -> o.set(0, 0)).extent(e -> e.set(width, height)));
-            entities.record(command, stack, index, packets, world.lightMapView(), world.lightSampler());
+            entities.record(command, stack, index * MAX_OVERLAYS + pass, packets, world.lightMapView(), world.lightSampler());
             vkCmdEndRendering(command);
             var release = VkImageMemoryBarrier2.calloc(2, stack);
-            releaseBarrier(release.get(0), slot.entityColor, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, false);
-            releaseBarrier(release.get(1), slot.entityDepth, DEPTH_STAGES, DEPTH_ACCESS, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, true);
+            releaseBarrier(release.get(0), slot.overlayColor, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, false);
+            releaseBarrier(release.get(1), slot.overlayDepth, DEPTH_STAGES, DEPTH_ACCESS, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, true);
             vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(release));
-            check(vkEndCommandBuffer(command), "end entity command");
+            check(vkEndCommandBuffer(command), "end overlay command");
             var signals = VkSemaphoreSubmitInfo.calloc(2, stack);
-            signals.get(0).sType$Default().semaphore(slot.entityColor.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
-            signals.get(1).sType$Default().semaphore(slot.entityDepth.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+            signals.get(0).sType$Default().semaphore(slot.overlayColor.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+            signals.get(1).sType$Default().semaphore(slot.overlayDepth.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             var submit = VkSubmitInfo2.calloc(1, stack).sType$Default()
                     .pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1, stack).sType$Default().commandBuffer(command)).pSignalSemaphoreInfos(signals);
-            if (slot.entityUsed) {
+            if (slot.overlayUsed) {
                 var waits = VkSemaphoreSubmitInfo.calloc(2, stack);
-                waits.get(0).sType$Default().semaphore(slot.entityColor.complete).stageMask(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
-                waits.get(1).sType$Default().semaphore(slot.entityDepth.complete).stageMask(VK_PIPELINE_STAGE_2_COPY_BIT);
+                waits.get(0).sType$Default().semaphore(slot.overlayColor.complete).stageMask(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
+                waits.get(1).sType$Default().semaphore(slot.overlayDepth.complete).stageMask(VK_PIPELINE_STAGE_2_COPY_BIT);
                 submit.pWaitSemaphoreInfos(waits);
             }
-            check(vkResetFences(context.device, slot.entityFence), "reset entity fence");
-            check(vkQueueSubmit2(context.queue, submit, slot.entityFence), "submit entities");
-            slot.entityUsed = slot.entityPending = true; slot.sceneFresh = false; entityFrames++;
-            entityReading = index;
-            return new int[]{slot.entityColor.beginReadGL(), slot.entityDepth.beginReadGL()};
+            check(vkResetFences(context.device, slot.overlayFences[pass]), "reset overlay fence");
+            check(vkQueueSubmit2(context.queue, submit, slot.overlayFences[pass]), "submit overlay");
+            slot.overlayUsed = slot.overlayPending[pass] = true; overlayPasses++;
+            overlayReading = index;
+            return new int[]{slot.overlayColor.beginReadGL(), slot.overlayDepth.beginReadGL()};
         }
+    }
+    /** GL has issued its composite of the current overlay: release it so the next pass of this frame can reuse the images. */
+    void finishOverlay() {
+        if (overlayReading >= 0) { int index = overlayReading; overlayReading = -1; slots[index].overlayColor.endReadGL(); slots[index].overlayDepth.endReadGL(); }
     }
     void entityTexture(int id, int width, int height, int flags, byte[] rgba) { entities.texture(id, width, height, flags, rgba); }
     boolean hasEntityTexture(int id) { return entities.hasTexture(id); }
@@ -315,11 +331,13 @@ final class SharedWorldRenderer implements AutoCloseable {
 
     void endRead() {
         if (reading >= 0) { int index = reading; reading = -1; slots[index].sceneFresh = false; for (SharedPresentImage image : slots[index].images()) image.endReadGL(); }
-        if (entityReading >= 0) { int index = entityReading; entityReading = -1; slots[index].entityColor.endReadGL(); slots[index].entityDepth.endReadGL(); }
+        finishOverlay();
     }
     private void waitSlot(int index) {
         Slot slot = slots[index];
-        if (slot.entityPending) { check(vkWaitForFences(context.device, slot.entityFence, true, 5_000_000_000L), "wait shared entity slot"); slot.entityPending = false; }
+        for (int k = 0; k < MAX_OVERLAYS; k++) if (slot.overlayPending[k]) {
+            check(vkWaitForFences(context.device, slot.overlayFences[k], true, 5_000_000_000L), "wait shared overlay slot"); slot.overlayPending[k] = false;
+        }
         if (!slot.pending) return;
         check(vkWaitForFences(context.device, slot.fence, true, 5_000_000_000L), "wait shared world slot");
         slot.pending = false; timers.collect(index);
@@ -336,8 +354,8 @@ final class SharedWorldRenderer implements AutoCloseable {
             slot.depth = new SharedPresentImage(context, width, height, importer, true);
             slot.translucentColor = new SharedPresentImage(context, width, height, importer);
             slot.translucentDepth = new SharedPresentImage(context, width, height, importer, true);
-            slot.entityColor = new SharedPresentImage(context, width, height, importer);
-            slot.entityDepth = new SharedPresentImage(context, width, height, importer, true);
+            slot.overlayColor = new SharedPresentImage(context, width, height, importer);
+            slot.overlayDepth = new SharedPresentImage(context, width, height, importer, true);
             slot.sceneDepth = new GpuImage(context, width, height, VK_FORMAT_D32_SFLOAT,
                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
         }
@@ -348,7 +366,7 @@ final class SharedWorldRenderer implements AutoCloseable {
         long[] entity = entities == null ? new long[5] : entities.stats();
         return new long[]{world.renderedEpoch(), frames, world.trackedSections(), world.peakSections(), width, height, terrainFrames, sectionDraws, ProcessHandle.current().pid(), depthTexture,
                 culling[0], culling[1], culling[2], translucentTexture, translucentDepthTexture, world.translucentSections(), translucentSectionDraws, world.translucentSorts(),
-                entityFrames, entity[0], entity[1], entity[2], entity[3], entity[4]};
+                overlayPasses, entity[0], entity[1], entity[2], entity[3], entity[4]};
     }
     private void destroyTargets() {
         for (Slot slot : slots) {
@@ -356,10 +374,10 @@ final class SharedWorldRenderer implements AutoCloseable {
             if (slot.depth != null) { slot.depth.close(); slot.depth = null; }
             if (slot.translucentColor != null) { slot.translucentColor.close(); slot.translucentColor = null; }
             if (slot.translucentDepth != null) { slot.translucentDepth.close(); slot.translucentDepth = null; }
-            if (slot.entityColor != null) { slot.entityColor.close(); slot.entityColor = null; }
-            if (slot.entityDepth != null) { slot.entityDepth.close(); slot.entityDepth = null; }
+            if (slot.overlayColor != null) { slot.overlayColor.close(); slot.overlayColor = null; }
+            if (slot.overlayDepth != null) { slot.overlayDepth.close(); slot.overlayDepth = null; }
             if (slot.sceneDepth != null) { slot.sceneDepth.close(); slot.sceneDepth = null; }
-            slot.used = slot.entityUsed = slot.sceneFresh = false;
+            slot.used = slot.overlayUsed = slot.sceneFresh = slot.sceneReadable = false;
         }
     }
     @Override public void close() {
@@ -369,7 +387,7 @@ final class SharedWorldRenderer implements AutoCloseable {
         log.accept("WORLD_RGBA_READBACK_BYTES=0");
         if (entities != null) {
             long[] entity = entities.stats();
-            log.accept("WORLD_ENTITIES frames=" + entityFrames + " draws=" + entity[0] + " vertices=" + entity[1] + " textures=" + entity[2] + " uploads=" + entity[3] + " missingTextures=" + entity[4]);
+            log.accept("WORLD_OVERLAYS passes=" + overlayPasses + " draws=" + entity[0] + " vertices=" + entity[1] + " textures=" + entity[2] + " uploads=" + entity[3] + " missingTextures=" + entity[4]);
             entities.close(); entities = null;
         }
         if (timers != null) { timers.report(log); timers.close(); timers = null; }
@@ -380,7 +398,7 @@ final class SharedWorldRenderer implements AutoCloseable {
         if (pool != 0) { vkDestroyCommandPool(context.device, pool, null); pool = 0; }
         for (Slot slot : slots) {
             if (slot.fence != 0) { vkDestroyFence(context.device, slot.fence, null); slot.fence = 0; }
-            if (slot.entityFence != 0) { vkDestroyFence(context.device, slot.entityFence, null); slot.entityFence = 0; }
+            for (int k = 0; k < MAX_OVERLAYS; k++) if (slot.overlayFences[k] != 0) { vkDestroyFence(context.device, slot.overlayFences[k], null); slot.overlayFences[k] = 0; }
         }
     }
 }

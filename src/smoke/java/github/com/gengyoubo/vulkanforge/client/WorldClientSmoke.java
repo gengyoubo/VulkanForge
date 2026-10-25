@@ -84,6 +84,10 @@ public final class WorldClientSmoke {
                     level.setBlock(new BlockPos(2, 65, 7), Blocks.OAK_SIGN.defaultBlockState(), 3);
                     var cow = net.minecraft.world.entity.EntityType.COW.spawn(level, new BlockPos(-3, 65, 6), net.minecraft.world.entity.MobSpawnType.COMMAND);
                     if (cow != null) { cow.setNoAi(true); cow.setYRot(30); }
+                    // P9: a lit campfire and a torch keep emitting particles; rain is switched off again after the P9 check.
+                    level.setBlock(new BlockPos(1, 65, 5), Blocks.CAMPFIRE.defaultBlockState(), 3);
+                    level.setBlock(new BlockPos(4, 65, 4), Blocks.TORCH.defaultBlockState(), 3);
+                    level.setWeatherParameters(0, 6000, true, false);
                     var player = server.getPlayerList().getPlayer(uuid);
                     player.teleportTo(level, 0.5, 68.0, 9.0, 180, 18);
                     player.getAbilities().flying = true; player.onUpdateAbilities();
@@ -120,7 +124,15 @@ public final class WorldClientSmoke {
                     require(stats[18] > 0 && stats[19] > 0 && stats[23] == 0, "Vulkan entity pass did not draw, or drew with missing textures: " + java.util.Arrays.toString(stats));
                     log("PASS P7/P8 entity pass: captured=" + entities[0] + ", GL fallback unsupported=" + entities[1] + " state=" + entities[2] + " texture=" + entities[3]
                             + ", composites=" + entities[4] + ", Vulkan draws=" + stats[19] + ", mirrored textures=" + mirrors[1] + "/" + mirrors[0]);
+                    log("INFO GL fallback states: " + EntityDraws.fallbackStates());
+                    long[] particles = EntityDraws.stats(EntityDraws.Window.PARTICLES), weather = EntityDraws.stats(EntityDraws.Window.WEATHER);
+                    require(particles[0] > 0 && particles[1] > 0, "Particles were not replayed by Vulkan: " + java.util.Arrays.toString(particles));
+                    require(weather[0] > 0 && weather[1] > 0, "Rain was not replayed by Vulkan: " + java.util.Arrays.toString(weather));
+                    log("PASS P9 particles and weather: particle draws=" + particles[0] + " composites=" + particles[1] + ", rain/snow draws=" + weather[0]
+                            + " composites=" + weather[1] + ", overlay passes=" + stats[18]);
                     log("INFO GL fallback shaders: " + EntityDraws.fallbackShaders());
+                    var clear = mc.getSingleplayerServer();
+                    clear.execute(() -> clear.overworld().setWeatherParameters(6000, 0, false, false));
                 }
                 firstHash = VulkanPreview.saveWorldFrame(report.resolve("before.png"));
                 if (NativeMainWindow.active()) NativeMainWindow.captureNext(report.resolve("main-swapchain.png"));
