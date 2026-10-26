@@ -398,8 +398,8 @@ final class VulkanPreview {
             graphics.blit(TEXTURE, x, y, width, height, 0, 0, frameWidth, frameHeight, frameWidth, frameHeight);
         }
         Component label = switch (status) {
-            case STARTING -> Component.translatable("vulkanforge.preview.starting");
-            case RUNNING -> Component.translatable("vulkanforge.preview.running", uploaded);
+            case STARTING -> Component.translatable("vulkanforge.preview.starting", VulkanForgeConfig.startup().vulkanVersion().label);
+            case RUNNING -> Component.translatable("vulkanforge.preview.running", VulkanForgeConfig.startup().vulkanVersion().label, uploaded);
             case FAILED -> Component.translatable("vulkanforge.preview.failed");
             case STOPPED -> Component.translatable("vulkanforge.preview.stopped");
         };

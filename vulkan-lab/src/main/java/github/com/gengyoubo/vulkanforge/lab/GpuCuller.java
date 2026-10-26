@@ -25,7 +25,9 @@ final class GpuCuller implements AutoCloseable {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             var handle = stack.mallocLong(1);
             var bindings = VkDescriptorSetLayoutBinding.calloc(3, stack);
-            for (int i = 0; i < 3; i++) bindings.get(i).binding(i).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT | (i == 0 ? VK_SHADER_STAGE_VERTEX_BIT : 0));
+            int meshStages = context.meshShaderNV ? NVMeshShader.VK_SHADER_STAGE_TASK_BIT_NV | NVMeshShader.VK_SHADER_STAGE_MESH_BIT_NV : 0;
+            for (int i = 0; i < 3; i++) bindings.get(i).binding(i).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(1)
+                    .stageFlags(VK_SHADER_STAGE_COMPUTE_BIT | (i == 0 ? VK_SHADER_STAGE_VERTEX_BIT | meshStages : i == 2 ? meshStages : 0));
             check(vkCreateDescriptorSetLayout(context.device, VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(bindings), null, handle), "cull descriptor layout");
             descriptorLayout = handle.get(0);
             check(vkCreateDescriptorPool(context.device, VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(slots)
@@ -53,6 +55,7 @@ final class GpuCuller implements AutoCloseable {
         } catch (Throwable error) { close(); throw error; }
     }
     boolean compact() { return compact; }
+    int slots() { return sets.length; }
     long descriptorLayout() { return descriptorLayout; }
     long descriptorSet(int slot) { return sets[slot]; }
     ByteBuffer input(int slot) { return inputs[slot].mapped; }
@@ -75,6 +78,19 @@ final class GpuCuller implements AutoCloseable {
                 .dstStageMask(VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_HOST_BIT).dstAccessMask(VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_HOST_READ_BIT);
         vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pMemoryBarriers(barrier));
     }
+    /** Mesh path: the task shader culls and counts, so only the visible counter is reset here. Must be outside rendering. */
+    void recordMesh(VkCommandBuffer command, int slot, int count, MemoryStack stack) {
+        if (count > CAPACITY) throw new IllegalArgumentException("Too many sections for GPU culling");
+        counts[slot] = count;
+        if (count == 0) return;
+        vkCmdFillBuffer(command, drawCounts[slot].buffer, 0, 4, 0);
+        var reset = VkBufferMemoryBarrier2.calloc(1, stack).sType$Default().srcStageMask(VK_PIPELINE_STAGE_2_CLEAR_BIT).srcAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
+                .dstStageMask(KHRSynchronization2.VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_NV | VK_PIPELINE_STAGE_2_HOST_BIT)
+                .dstAccessMask(VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_HOST_READ_BIT)
+                .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).buffer(drawCounts[slot].buffer).size(4);
+        vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pBufferMemoryBarriers(reset));
+    }
+    int count(int slot) { return counts[slot]; }
     void drawAll(VkCommandBuffer command, int slot) {
         if (counts[slot] != 0) org.lwjgl.vulkan.VK12.vkCmdDrawIndirectCount(command, outputs[slot].buffer, 0, drawCounts[slot].buffer, 0, counts[slot], 16);
     }

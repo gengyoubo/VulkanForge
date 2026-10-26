@@ -1,0 +1,37 @@
+#version 460
+#extension GL_NV_mesh_shader : require
+// Emits one MESHLET_TRIANGLES slice of a section's triangle list straight from the opaque arena (28-byte WorldProtocol vertices).
+#define SECTIONS 32u
+#define MESHLET_TRIANGLES 84u
+layout(local_size_x=32) in;
+layout(triangles, max_vertices=252, max_primitives=84) out;
+struct Bounds { vec4 minimum; vec4 maximum; uvec4 draw; vec4 origin; };
+layout(std430, set=1, binding=0) readonly buffer Sections { Bounds sections[]; };
+layout(std430, set=2, binding=0) readonly buffer Vertices { uint words[]; };
+layout(binding = 1) uniform sampler2D lightMap;
+layout(push_constant) uniform View { mat4 viewProjection; uint count; } view;
+taskNV in Task { uint first[SECTIONS]; uint section[SECTIONS]; } task;
+layout(location = 0) out vec4 vertexColor[];
+layout(location = 1) out vec2 uv[];
+void main() {
+    uint meshlet = gl_WorkGroupID.x, slot = 0u;
+    // Empty sections share their successor's start, so the last start <= meshlet is the owning non-empty section.
+    for (uint i = 1u; i < SECTIONS; i++) if (task.first[i] <= meshlet) slot = i;
+    Bounds bounds = sections[task.section[slot]];
+    uint firstTriangle = (meshlet - task.first[slot]) * MESHLET_TRIANGLES;
+    uint triangles = min(MESHLET_TRIANGLES, bounds.draw.x / 3u - firstTriangle), vertices = triangles * 3u;
+    for (uint v = gl_LocalInvocationID.x; v < vertices; v += 32u) {
+        uint word = (bounds.draw.y + firstTriangle * 3u + v) * 7u;
+        vec3 position = uintBitsToFloat(uvec3(words[word], words[word + 1u], words[word + 2u]));
+        vec4 clip = view.viewProjection * vec4(position + bounds.origin.xyz, 1.0);
+        clip.y = -clip.y;
+        clip.z = (clip.z + clip.w) * 0.5;
+        gl_MeshVerticesNV[v].gl_Position = clip;
+        uint light = words[word + 6u];
+        vec2 lightUV = clamp(vec2(light & 0xffffu, light >> 16u) / 256.0, vec2(0.5 / 16.0), vec2(15.5 / 16.0));
+        vertexColor[v] = unpackUnorm4x8(words[word + 3u]) * textureLod(lightMap, lightUV, 0.0);
+        uv[v] = uintBitsToFloat(uvec2(words[word + 4u], words[word + 5u]));
+        gl_PrimitiveIndicesNV[v] = v;
+    }
+    if (gl_LocalInvocationID.x == 0u) gl_PrimitiveCountNV = triangles;
+}

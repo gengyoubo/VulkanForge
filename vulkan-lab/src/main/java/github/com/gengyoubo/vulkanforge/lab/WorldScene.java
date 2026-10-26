@@ -68,6 +68,9 @@ final class WorldScene implements AutoCloseable {
     private GpuImage atlas, lightMap;
     private MeshArena arena;
     private long drivenLayout, drivenPipeline, indirectBatches;
+    /** VK_NV_mesh_shader terrain: task shader culls sections, mesh shader reads the arena as a storage buffer (set 2, one per frame slot). */
+    private long meshLayout, meshPipeline, arenaLayout, arenaPool, meshBatches;
+    private long[] arenaSets = new long[0], arenaBound = new long[0];
     private long atlasPatches, lightUpdates;
     private WorldProtocol.Camera camera;
     private boolean receivedMesh;
@@ -82,7 +85,8 @@ final class WorldScene implements AutoCloseable {
             var handle = stack.mallocLong(1);
             var binding = VkDescriptorSetLayoutBinding.calloc(2, stack);
             binding.get(0).binding(0).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1).stageFlags(VK_SHADER_STAGE_FRAGMENT_BIT);
-            binding.get(1).binding(1).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1).stageFlags(VK_SHADER_STAGE_VERTEX_BIT);
+            binding.get(1).binding(1).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1)
+                    .stageFlags(VK_SHADER_STAGE_VERTEX_BIT | (context.meshShaderNV ? NVMeshShader.VK_SHADER_STAGE_MESH_BIT_NV : 0));
             check(vkCreateDescriptorSetLayout(context.device, VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(binding), null, handle), "world descriptor layout");
             descriptorLayout = handle.get(0);
             var sizes = VkDescriptorPoolSize.calloc(1, stack).type(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(2);
@@ -104,8 +108,10 @@ final class WorldScene implements AutoCloseable {
         }
     }
 
+    private long cullerLayout;
     void enableGpuDriven(GpuCuller culler) {
         if (!culler.compact()) return;
+        cullerLayout = culler.descriptorLayout();
         arena = new MeshArena(context, action -> retirement.accept(action));
         try (MemoryStack stack = MemoryStack.stackPush()) {
             var handle = stack.mallocLong(1);
@@ -115,8 +121,45 @@ final class WorldScene implements AutoCloseable {
             drivenLayout = handle.get(0);
             drivenPipeline = GraphicsPipeline.create(context, drivenLayout, VK_FORMAT_R8G8B8A8_UNORM, "/shaders/world_driven.vert", true, stack);
         }
+        if (context.meshShaderNV) {
+            try { enableMeshShader(culler.slots()); }
+            catch (RuntimeException error) { destroyMeshShader(); log.accept("MESH_SHADER_NV_FALLBACK=" + error.getMessage()); }
+        }
     }
-    long indirectBatches() { return indirectBatches; }
+
+    private void enableMeshShader(int slots) {
+        int stages = NVMeshShader.VK_SHADER_STAGE_TASK_BIT_NV | NVMeshShader.VK_SHADER_STAGE_MESH_BIT_NV;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            var handle = stack.mallocLong(1);
+            var binding = VkDescriptorSetLayoutBinding.calloc(1, stack).binding(0).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(1)
+                    .stageFlags(NVMeshShader.VK_SHADER_STAGE_MESH_BIT_NV);
+            check(vkCreateDescriptorSetLayout(context.device, VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(binding), null, handle), "mesh arena layout");
+            arenaLayout = handle.get(0);
+            check(vkCreateDescriptorPool(context.device, VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(slots)
+                    .pPoolSizes(VkDescriptorPoolSize.calloc(1, stack).type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(slots)), null, handle), "mesh arena pool");
+            arenaPool = handle.get(0);
+            arenaSets = new long[slots]; arenaBound = new long[slots];
+            for (int i = 0; i < slots; i++) {
+                check(vkAllocateDescriptorSets(context.device, VkDescriptorSetAllocateInfo.calloc(stack).sType$Default().descriptorPool(arenaPool)
+                        .pSetLayouts(stack.longs(arenaLayout)), handle), "mesh arena set");
+                arenaSets[i] = handle.get(0);
+            }
+            check(vkCreatePipelineLayout(context.device, VkPipelineLayoutCreateInfo.calloc(stack).sType$Default()
+                    .pSetLayouts(stack.longs(descriptorLayout, cullerLayout, arenaLayout))
+                    .pPushConstantRanges(VkPushConstantRange.calloc(1, stack).stageFlags(stages).size(80)), null, handle), "mesh world layout");
+            meshLayout = handle.get(0);
+            meshPipeline = GraphicsPipeline.createMesh(context, meshLayout, VK_FORMAT_R8G8B8A8_UNORM, "/shaders/world_mesh.task", "/shaders/world_mesh.mesh", stack);
+        }
+    }
+    boolean meshShaderActive() { return meshPipeline != 0; }
+    private void destroyMeshShader() {
+        if (meshPipeline != 0) { vkDestroyPipeline(context.device, meshPipeline, null); meshPipeline = 0; }
+        if (meshLayout != 0) { vkDestroyPipelineLayout(context.device, meshLayout, null); meshLayout = 0; }
+        if (arenaPool != 0) { vkDestroyDescriptorPool(context.device, arenaPool, null); arenaPool = 0; }
+        if (arenaLayout != 0) { vkDestroyDescriptorSetLayout(context.device, arenaLayout, null); arenaLayout = 0; }
+    }
+    /** GPU-driven terrain batches: indirect-count draws or NV mesh task launches. */
+    long indirectBatches() { return indirectBatches + meshBatches; }
     long[] arenaStats() { return arena == null ? new long[3] : arena.stats(); }
 
     void apply(WorldProtocol.Command command) {
@@ -250,10 +293,27 @@ final class WorldScene implements AutoCloseable {
             input.putInt(section.vertices()).putInt(section.allocation() == null ? 0 : section.allocation().firstVertex).putInt(0).putInt(0);
             for (int axis = 0; axis < 3; axis++) input.putFloat((float) offset[axis]); input.putFloat(0);
         }
-        culler.record(command, slot, camera.matrix(), sections.size(), stack);
+        if (meshPipeline != 0) culler.recordMesh(command, slot, sections.size(), stack);
+        else culler.record(command, slot, camera.matrix(), sections.size(), stack);
     }
     void draw(VkCommandBuffer command, MemoryStack stack) { draw(command, stack, null, 0); }
     void draw(VkCommandBuffer command, MemoryStack stack, GpuCuller culler, int slot) {
+        if (meshPipeline != 0 && arena != null && culler != null) {
+            int count = culler.count(slot);
+            if (arena.buffer() == 0 || count == 0) return;
+            // This slot's previous submission has completed, so its arena set can follow a grown arena buffer.
+            if (arenaBound[slot] != arena.buffer()) {
+                vkUpdateDescriptorSets(context.device, VkWriteDescriptorSet.calloc(1, stack).sType$Default().dstSet(arenaSets[slot]).dstBinding(0).descriptorCount(1)
+                        .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).pBufferInfo(VkDescriptorBufferInfo.calloc(1, stack).buffer(arena.buffer()).range(VK_WHOLE_SIZE)), null);
+                arenaBound[slot] = arena.buffer();
+            }
+            vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipeline);
+            vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, meshLayout, 0, stack.longs(descriptorSet, culler.descriptorSet(slot), arenaSets[slot]), null);
+            var push = stack.calloc(80); push.asFloatBuffer().put(camera.matrix()); push.putInt(64, count);
+            vkCmdPushConstants(command, meshLayout, NVMeshShader.VK_SHADER_STAGE_TASK_BIT_NV | NVMeshShader.VK_SHADER_STAGE_MESH_BIT_NV, 0, push);
+            NVMeshShader.vkCmdDrawMeshTasksNV(command, (count + 31) / 32, 0); meshBatches++;
+            return;
+        }
         if (arena != null && culler != null && culler.compact()) {
             if (arena.buffer() == 0) return;
             vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, drivenPipeline);
@@ -334,7 +394,8 @@ final class WorldScene implements AutoCloseable {
 
     @Override public void close() {
         vkDeviceWaitIdle(context.device); clear();
-        if (arena != null) { log.accept("MESH_ARENA=" + java.util.Arrays.toString(arena.stats()) + " indirectBatches=" + indirectBatches); arena.close(); arena = null; }
+        if (arena != null) { log.accept("MESH_ARENA=" + java.util.Arrays.toString(arena.stats()) + " indirectBatches=" + indirectBatches + " meshTaskBatches=" + meshBatches); arena.close(); arena = null; }
+        destroyMeshShader();
         if (drivenPipeline != 0) { vkDestroyPipeline(context.device, drivenPipeline, null); drivenPipeline = 0; }
         if (drivenLayout != 0) { vkDestroyPipelineLayout(context.device, drivenLayout, null); drivenLayout = 0; }
         if (pipeline != 0) { vkDestroyPipeline(context.device, pipeline, null); pipeline = 0; }

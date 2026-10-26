@@ -21,15 +21,27 @@ final class GraphicsPipeline {
 
     /** translucent: premultiplied-alpha blending (ONE, ONE_MINUS_SRC_ALPHA) for back-to-front sorted terrain. */
     static long create(VulkanContext context, long layout, int format, String vertexShader, String fragmentShader, boolean world, boolean translucent, MemoryStack stack) {
-        long vert = 0, frag = 0;
+        return create(context, layout, format, vertexShader, null, fragmentShader, world, translucent, stack);
+    }
+
+    /** Opaque world state with VK_NV_mesh_shader task + mesh stages in place of vertex input and the vertex shader. */
+    static long createMesh(VulkanContext context, long layout, int format, String taskShader, String meshShader, MemoryStack stack) {
+        return create(context, layout, format, taskShader, meshShader, "/shaders/world.frag", true, false, stack);
+    }
+
+    private static long create(VulkanContext context, long layout, int format, String firstShader, String meshShader, String fragmentShader, boolean world, boolean translucent, MemoryStack stack) {
+        long vert = 0, mesh = 0, frag = 0;
+        boolean meshPipeline = meshShader != null;
         try {
-            vert = ShaderCompiler.module(context, vertexShader, shaderc_glsl_vertex_shader);
+            vert = ShaderCompiler.module(context, firstShader, meshPipeline ? shaderc_glsl_task_shader : shaderc_glsl_vertex_shader);
+            if (meshPipeline) mesh = ShaderCompiler.module(context, meshShader, shaderc_glsl_mesh_shader);
             frag = ShaderCompiler.module(context, fragmentShader, shaderc_glsl_fragment_shader);
-            VkPipelineShaderStageCreateInfo.Buffer stages = VkPipelineShaderStageCreateInfo.calloc(2, stack);
-            stages.get(0).sType$Default().stage(VK_SHADER_STAGE_VERTEX_BIT).module(vert).pName(stack.UTF8("main"));
-            stages.get(1).sType$Default().stage(VK_SHADER_STAGE_FRAGMENT_BIT).module(frag).pName(stack.UTF8("main"));
+            VkPipelineShaderStageCreateInfo.Buffer stages = VkPipelineShaderStageCreateInfo.calloc(meshPipeline ? 3 : 2, stack);
+            stages.get(0).sType$Default().stage(meshPipeline ? NVMeshShader.VK_SHADER_STAGE_TASK_BIT_NV : VK_SHADER_STAGE_VERTEX_BIT).module(vert).pName(stack.UTF8("main"));
+            if (meshPipeline) stages.get(1).sType$Default().stage(NVMeshShader.VK_SHADER_STAGE_MESH_BIT_NV).module(mesh).pName(stack.UTF8("main"));
+            stages.get(meshPipeline ? 2 : 1).sType$Default().stage(VK_SHADER_STAGE_FRAGMENT_BIT).module(frag).pName(stack.UTF8("main"));
             VkPipelineVertexInputStateCreateInfo vertexInput = VkPipelineVertexInputStateCreateInfo.calloc(stack).sType$Default();
-            if (world) {
+            if (world && !meshPipeline) {
                 vertexInput.pVertexBindingDescriptions(VkVertexInputBindingDescription.calloc(1, stack).binding(0).stride(dev.vulkanforge.bridge.WorldProtocol.STRIDE).inputRate(VK_VERTEX_INPUT_RATE_VERTEX));
                 VkVertexInputAttributeDescription.Buffer attributes = VkVertexInputAttributeDescription.calloc(4, stack);
                 attributes.get(0).location(0).binding(0).format(VK_FORMAT_R32G32B32_SFLOAT).offset(0);
@@ -58,8 +70,8 @@ final class GraphicsPipeline {
             VkPipelineRenderingCreateInfo rendering = VkPipelineRenderingCreateInfo.calloc(stack).sType$Default().pColorAttachmentFormats(stack.ints(format));
             if (world) rendering.depthAttachmentFormat(VK_FORMAT_D32_SFLOAT);
             VkGraphicsPipelineCreateInfo.Buffer info = VkGraphicsPipelineCreateInfo.calloc(1, stack)
-                    .sType$Default().pNext(rendering.address()).pStages(stages).pVertexInputState(vertexInput)
-                    .pInputAssemblyState(assembly).pViewportState(viewport).pRasterizationState(raster).pMultisampleState(multisample)
+                    .sType$Default().pNext(rendering.address()).pStages(stages).pVertexInputState(meshPipeline ? null : vertexInput)
+                    .pInputAssemblyState(meshPipeline ? null : assembly).pViewportState(viewport).pRasterizationState(raster).pMultisampleState(multisample)
                     .pColorBlendState(blend).pDynamicState(dynamic).layout(layout).renderPass(NULL).basePipelineIndex(-1);
             if (world) info.pDepthStencilState(VkPipelineDepthStencilStateCreateInfo.calloc(stack).sType$Default()
                     .depthTestEnable(true).depthWriteEnable(true).depthCompareOp(VK_COMPARE_OP_LESS_OR_EQUAL));
@@ -68,6 +80,7 @@ final class GraphicsPipeline {
             return handle.get(0);
         } finally {
             if (frag != 0) vkDestroyShaderModule(context.device, frag, null);
+            if (mesh != 0) vkDestroyShaderModule(context.device, mesh, null);
             if (vert != 0) vkDestroyShaderModule(context.device, vert, null);
         }
     }

@@ -12,7 +12,9 @@ public final class WorldSmokeTest {
     public static void main(String[] args) throws Exception {
         Path report = Path.of("build/reports/world-smoke.txt"); Files.createDirectories(report.getParent());
         String executable = System.getProperty("os.name").startsWith("Windows") ? "java.exe" : "java";
-        Process process = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", executable).toString(), "-jar", args[0], "--bridge")
+        String api = System.getProperty("vulkanforge.vulkanVersion", "1.4");
+        Process process = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", executable).toString(),
+                "-Dvulkanforge.vulkanVersion=" + api, "-jar", args[0], "--bridge")
                 .redirectError(report.toFile()).start();
         ScheduledExecutorService watchdog = Executors.newSingleThreadScheduledExecutor();
         watchdog.schedule(process::destroyForcibly, 30, TimeUnit.SECONDS);
@@ -62,6 +64,7 @@ public final class WorldSmokeTest {
             require(process.waitFor(5, TimeUnit.SECONDS) && process.exitValue() == 0, "World process did not exit cleanly");
             String log = Files.readString(report);
             require(log.contains("STATUS=OK") && log.contains("VALIDATION_ERRORS=0"), log);
+            require(log.contains("INSTANCE_API=" + api + ".0"), "World bridge ignored the requested API version");
             if (log.contains("GPU_TIMESTAMPS=ENABLED")) {
                 requireTiming(log, "TERRAIN"); requireTiming(log, "READBACK_COPY");
             } else require(log.contains("GPU_TIMESTAMPS=UNAVAILABLE"), "Missing timestamp capability report");

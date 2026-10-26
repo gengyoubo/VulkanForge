@@ -71,7 +71,10 @@ final class LabLauncher {
         String executable = System.getProperty("os.name").startsWith("Windows") ? "java.exe" : "java";
         Path javaExecutable = Path.of(System.getProperty("java.home"), "bin", executable);
         var command = new java.util.ArrayList<String>();
-        java.util.Collections.addAll(command, javaExecutable.toString(), "-Dfile.encoding=UTF-8", "-jar", jar.toString());
+        java.util.Collections.addAll(command, javaExecutable.toString(), "-Dfile.encoding=UTF-8",
+                "-Dvulkanforge.vulkanVersion=" + github.com.gengyoubo.vulkanforge.config.VulkanForgeConfig.startup().vulkanVersion().label,
+                "-Dvulkanforge.nvidiaExtensions=" + github.com.gengyoubo.vulkanforge.config.VulkanForgeConfig.startup().nvidiaExtensionNames(),
+                "-jar", jar.toString());
         java.util.Collections.addAll(command, arguments);
         ProcessBuilder builder = new ProcessBuilder(command).directory(FMLPaths.GAMEDIR.get().toFile());
         builder.environment().remove("JAVA_TOOL_OPTIONS");

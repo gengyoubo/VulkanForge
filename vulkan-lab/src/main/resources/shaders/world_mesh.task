@@ -1,0 +1,35 @@
+#version 460
+#extension GL_NV_mesh_shader : require
+// One invocation per section: the cull.comp frustum test, then one mesh workgroup per MESHLET_TRIANGLES slice of each visible section.
+#define SECTIONS 32u
+#define MESHLET_TRIANGLES 84u
+layout(local_size_x=32) in;
+struct Bounds { vec4 minimum; vec4 maximum; uvec4 draw; vec4 origin; };
+layout(std430, set=1, binding=0) readonly buffer Sections { Bounds sections[]; };
+layout(std430, set=1, binding=2) buffer Count { uint visibleCount; };
+layout(push_constant) uniform View { mat4 viewProjection; uint count; } view;
+taskNV out Task { uint first[SECTIONS]; uint section[SECTIONS]; } task;
+shared uint meshlets[SECTIONS];
+void main() {
+    uint local = gl_LocalInvocationID.x, index = gl_WorkGroupID.x * SECTIONS + local, count = 0u;
+    if (index < view.count) {
+        Bounds bounds = sections[index];
+        uint outside = 63u;
+        for (uint corner=0u; corner<8u; corner++) {
+            vec3 position = vec3((corner & 1u) == 0u ? bounds.minimum.x : bounds.maximum.x,
+                                 (corner & 2u) == 0u ? bounds.minimum.y : bounds.maximum.y,
+                                 (corner & 4u) == 0u ? bounds.minimum.z : bounds.maximum.z);
+            vec4 clip = view.viewProjection * vec4(position, 1.0);
+            outside &= (clip.x < -clip.w ? 1u : 0u) | (clip.x > clip.w ? 2u : 0u)
+                     | (clip.y < -clip.w ? 4u : 0u) | (clip.y > clip.w ? 8u : 0u)
+                     | (clip.z < -clip.w ? 16u : 0u) | (clip.z > clip.w ? 32u : 0u);
+        }
+        if (outside == 0u && bounds.draw.x != 0u) { count = (bounds.draw.x / 3u + MESHLET_TRIANGLES - 1u) / MESHLET_TRIANGLES; atomicAdd(visibleCount, 1u); }
+    }
+    meshlets[local] = count;
+    memoryBarrierShared(); barrier();
+    uint first = 0u;
+    for (uint i = 0u; i < local; i++) first += meshlets[i];
+    task.first[local] = first; task.section[local] = index;
+    if (local == SECTIONS - 1u) gl_TaskCountNV = first + count;
+}

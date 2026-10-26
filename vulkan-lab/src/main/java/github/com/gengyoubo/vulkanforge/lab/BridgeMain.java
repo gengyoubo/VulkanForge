@@ -40,7 +40,6 @@ final class BridgeMain {
             int loader = VK.getInstanceVersionSupported();
             System.out.println("BRIDGE_MODE=OFFSCREEN_READBACK");
             System.out.println("LOADER_API=" + VulkanContext.version(loader));
-            if (loader < org.lwjgl.vulkan.VK14.VK_API_VERSION_1_4) throw new IllegalStateException("Vulkan 1.4 loader required");
             context.initialize(0, loader, requireValidation);
             control.start();
             long frames = 0;

@@ -15,7 +15,7 @@ import static org.lwjgl.vulkan.KHRSwapchain.*;
 
 /** Reflective bootstrap API. No Minecraft or parent-LWJGL classes cross this class-loader boundary. */
 public final class MainWindowBackend implements AutoCloseable {
-    private final VulkanContext context = new VulkanContext();
+    private final VulkanContext context;
     private static final int FRAMES_IN_FLIGHT = 2;
     private static final class FrameSlot {
         long fence, acquired;
@@ -48,13 +48,26 @@ public final class MainWindowBackend implements AutoCloseable {
     private final Runnable finishGL;
 
     public MainWindowBackend(String logPath, byte[] uuid, Function<long[], Consumer<int[]>> importer, Runnable finishGL) throws Exception {
+        this(logPath, uuid, importer, finishGL, VulkanContext.requestedApiVersion());
+    }
+
+    public MainWindowBackend(String logPath, byte[] uuid, Function<long[], Consumer<int[]>> importer, Runnable finishGL, int apiVersion) throws Exception {
+        this(logPath, uuid, importer, finishGL, apiVersion, System.getProperty("vulkanforge.nvidiaExtensions", ""));
+    }
+
+    /** nvidiaExtensions: comma-separated VK_NV_* names from the config screen. */
+    public MainWindowBackend(String logPath, byte[] uuid, Function<long[], Consumer<int[]>> importer, Runnable finishGL, int apiVersion, String nvidiaExtensions) throws Exception {
+        context = new VulkanContext(apiVersion, nvidiaExtensions);
         this.importer = importer; this.finishGL = finishGL;
         Configuration.STACK_SIZE.set(1024);
         report = new PrintWriter(Files.newBufferedWriter(Path.of(logPath)));
         try {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 context.initializeInterop(uuid, Boolean.getBoolean("vulkanforge.requireValidation"));
+                log("INSTANCE_API=" + VulkanContext.version(context.apiVersion));
                 log("DEVICE_CAPABILITIES=" + context.capabilities);
+                log("NVIDIA_EXTENSIONS=" + context.nvidia);
+                log("MESH_SHADER_NV_ENABLED=" + context.meshShaderNV);
                 log("PUSH_DESCRIPTOR_AVAILABLE=" + (context.pushDescriptors ? context.pushDescriptorCore ? "VULKAN14_CORE" : "KHR_ALIAS" : "NONE"));
                 log("ENTITY_DESCRIPTOR_MODE=" + (Boolean.getBoolean("vulkanforge.preferPushDescriptors") && context.pushDescriptors ? "PUSH" : "CACHED_SET"));
                 timers = new GpuTimers(context, FRAMES_IN_FLIGHT, this::log, "COPY", "PRESENT_PREPARE", "PRESENT_SCENE");

@@ -8,6 +8,8 @@ import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.CycleButton;
 import net.minecraft.client.gui.components.Tooltip;
 import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.gui.screens.AlertScreen;
+import net.minecraft.client.gui.screens.GenericDirtMessageScreen;
 import net.minecraft.network.chat.Component;
 import net.minecraftforge.client.ConfigScreenHandler;
 import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
@@ -23,6 +25,7 @@ public final class VulkanForgeConfigScreen extends Screen {
     private CycleButton<OpenGLVersion> openGLButton;
     private final List<CycleButton<Boolean>> extensionButtons = new ArrayList<>();
     private int extensionLabelY;
+    private boolean restarting;
 
     public VulkanForgeConfigScreen(Screen parent) {
         super(Component.translatable("vulkanforge.config.title"));
@@ -60,10 +63,15 @@ public final class VulkanForgeConfigScreen extends Screen {
                     .withTooltip(value -> Tooltip.create(Component.literal(extension.extensionName + "\n").append(Component.translatable(key + ".tooltip"))))
                     .create(i % 2 == 0 ? left : right, y + i / 2 * 24, column, 20, Component.translatable(key), (button, value) -> extensions.put(extension, value))));
         }
+        var restart = addRenderableWidget(Button.builder(Component.translatable("vulkanforge.config.restart"), button -> restart())
+                .bounds(left, height - 26, 100, 20).build());
+        restart.active = minecraft.level == null;
+        restart.setTooltip(Tooltip.create(Component.translatable(restart.active
+                ? "vulkanforge.config.restart.tooltip" : "vulkanforge.config.restart.in_world")));
         addRenderableWidget(Button.builder(Component.translatable("gui.done"), button -> { save(); onClose(); })
-                .bounds(left, height - 26, column, 20).build());
+                .bounds(left + 105, height - 26, 100, 20).build());
         addRenderableWidget(Button.builder(Component.translatable("gui.cancel"), button -> onClose())
-                .bounds(right, height - 26, column, 20).build());
+                .bounds(left + 210, height - 26, 100, 20).build());
         refreshActive();
     }
 
@@ -83,6 +91,31 @@ public final class VulkanForgeConfigScreen extends Screen {
         VulkanForgeConfig.OPENGL_VERSION.set(openGLVersion);
         extensions.forEach((extension, value) -> VulkanForgeConfig.NVIDIA_EXTENSIONS.get(extension).set(value));
         VulkanForgeConfig.SPEC.save();
+    }
+
+    private void restart() {
+        if (restarting || minecraft.level != null) return;
+        try { save(); }
+        catch (RuntimeException error) { restartFailed(error, false); return; }
+        restarting = true;
+        minecraft.setScreen(new GenericDirtMessageScreen(Component.translatable("vulkanforge.config.restarting")));
+        java.util.concurrent.CompletableFuture.runAsync(() -> {
+            try {
+                GameRestart.prepare(minecraft.gameDirectory.toPath().resolve("logs/vulkanforge/restart.log"));
+                minecraft.execute(minecraft::stop);
+            } catch (Exception | LinkageError error) {
+                minecraft.execute(() -> restartFailed(error, true));
+            }
+        });
+    }
+
+    private void restartFailed(Throwable error, boolean saved) {
+        restarting = false;
+        // Launcher arguments can contain credentials, so do not log the exception or launch command.
+        github.com.gengyoubo.vulkanforge.VulkanForge.LOGGER.warn("Game restart could not be prepared ({})", error.getClass().getSimpleName());
+        minecraft.setScreen(new AlertScreen(() -> minecraft.setScreen(this),
+                Component.translatable("vulkanforge.config.restart.failed"),
+                Component.translatable(saved ? "vulkanforge.config.restart.manual" : "vulkanforge.config.save.failed")));
     }
 
     @Override public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {

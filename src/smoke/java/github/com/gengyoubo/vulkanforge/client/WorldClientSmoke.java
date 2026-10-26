@@ -59,6 +59,11 @@ public final class WorldClientSmoke {
             if (stage == 0 && mc.screen instanceof TitleScreen) {
                 report = mc.gameDirectory.toPath().resolve("logs/vulkanforge/world-client-smoke");
                 Files.createDirectories(report);
+                var startup = github.com.gengyoubo.vulkanforge.config.VulkanForgeConfig.startup();
+                if (startup.vulkanMainWindow()) {
+                    String windowReport = Files.readString(report.getParent().resolve("main-window-report.txt"));
+                    require(windowReport.contains("INSTANCE_API=" + startup.vulkanVersion().label + ".0"), "Main window ignored the selected Vulkan API version");
+                }
                 Files.writeString(report.resolve("report.txt"), "");
                 Files.deleteIfExists(report.resolve("main-swapchain.png"));
                 Files.deleteIfExists(report.resolve("resized-swapchain.png"));

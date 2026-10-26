@@ -52,7 +52,7 @@ final class GuiPassSmoke {
         if (bindings[4] == 0) throw new AssertionError("Compatible adjacent GUI draws were not batched");
         if (bindings[2]-beforeBindings[2] > 4) throw new AssertionError("Uniform descriptors were rewritten every frame");
         if (backend.pushDescriptorsEnabled() && (bindings[0]-beforeBindings[0] > 4 || bindings[1] == 0 || bindings[2]-beforeBindings[2] > 4))
-            throw new AssertionError("Vulkan 1.4 push descriptors / persistent uniform descriptors not exercised: " + java.util.Arrays.toString(bindings));
+            throw new AssertionError("Push descriptors / persistent uniform descriptors not exercised: " + java.util.Arrays.toString(bindings));
         System.out.println("GUI_BINDING_SMOKE=OK " + java.util.Arrays.toString(bindings));
         System.out.println("GUI_SWAPCHAIN_SMOKE=OK (alpha, scissor, depth, depth clear, incremental texture patch, direct hand, no world renderer)");
     }

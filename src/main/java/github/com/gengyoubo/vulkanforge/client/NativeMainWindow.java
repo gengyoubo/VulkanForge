@@ -54,8 +54,8 @@ public final class NativeMainWindow {
             Class<?> type = Class.forName("github.com.gengyoubo.vulkanforge.lab.MainWindowBackend", true, loader);
             Function<long[], Consumer<int[]>> importer = GlInterop::importImage;
             Runnable finishGL = org.lwjgl.opengl.GL11::glFinish;
-            backend = type.getConstructor(String.class, byte[].class, Function.class, Runnable.class)
-                    .newInstance(logs.resolve("main-window-report.txt").toString(), uuid, importer, finishGL);
+            backend = type.getConstructor(String.class, byte[].class, Function.class, Runnable.class, int.class, String.class)
+                    .newInstance(logs.resolve("main-window-report.txt").toString(), uuid, importer, finishGL, startup.vulkanVersion().apiVersion, startup.nvidiaExtensionNames());
             present = type.getMethod("present", int.class, int.class, int.class, int.class, int.class);
             beginFrame = type.getMethod("beginFrame", int.class, int.class);
             earlyAcquires = type.getMethod("earlyAcquires"); lateAcquires = type.getMethod("lateAcquires");
@@ -68,7 +68,6 @@ public final class NativeMainWindow {
             // Optional until the backend implements it; PostEffects falls back to vanilla post passes on false.
             try { nativePost = type.getMethod("nativePost", Object[].class); } catch (NoSuchMethodException missing) { nativePost = null; }
 
-            nativePost=type.getMethod("nativePost",Object[].class);
             createRenderTarget=type.getMethod("createRenderTarget",int.class,int.class,int.class);
             destroyRenderTarget=type.getMethod("destroyRenderTarget",int.class);
             renderTargetStats=type.getMethod("renderTargetStats");
@@ -203,7 +202,6 @@ public final class NativeMainWindow {
         return (Boolean)call(nativeComposite,framebuffer,viewport[2],viewport[3],kind,(Object)packets);
     }
     static boolean nativePost(Object[] pass) { return active() && nativePost != null && (Boolean) call(nativePost, (Object) pass); }
-    static boolean nativePost(Object[] packet) { return active() && (Boolean) call(nativePost, (Object) packet); }
     static int[] createRenderTarget(int framebuffer, int width, int height) { return active() ? (int[]) call(createRenderTarget, framebuffer, width, height) : null; }
     static void destroyRenderTarget(int framebuffer) { if (active()) call(destroyRenderTarget, framebuffer); }
     static long[] renderTargetStats() { return active() ? (long[]) call(renderTargetStats) : new long[6]; }

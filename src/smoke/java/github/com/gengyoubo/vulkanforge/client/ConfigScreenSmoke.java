@@ -25,8 +25,19 @@ public final class ConfigScreenSmoke {
         if (!Boolean.getBoolean("vulkanforge.configSmoke") || event.phase != TickEvent.Phase.END || stage == 99) return;
         Minecraft mc = Minecraft.getInstance();
         Path report = mc.gameDirectory.toPath().resolve("logs/vulkanforge/config-smoke.txt");
+        Path restartMarker = report.resolveSibling("config-restart-smoke.pending");
         try {
             if (stage == 0 && mc.getOverlay() == null && mc.screen instanceof TitleScreen title) {
+                if (Boolean.getBoolean("vulkanforge.restartClientSmoke") && Files.exists(restartMarker)) {
+                    String[] state = Files.readString(restartMarker).split("\\n");
+                    var expected = VulkanForgeConfig.Backend.valueOf(state[1]);
+                    if (VulkanForgeConfig.startup().backend() != expected) throw new AssertionError("Restart did not apply " + expected);
+                    VulkanForgeConfig.BACKEND.set(VulkanForgeConfig.Backend.valueOf(state[0]));
+                    VulkanForgeConfig.SPEC.save();
+                    Files.delete(restartMarker);
+                    Files.writeString(report, "PASS config factory, widgets, Done saved TOML, Save and restart relaunched Minecraft with " + expected + "\nSTATUS=OK\n");
+                    stage = 99; mc.stop(); return;
+                }
                 original = VulkanForgeConfig.BACKEND.get();
                 var info = ModList.get().getModContainerById(VulkanForge.MOD_ID).orElseThrow().getModInfo();
                 // Same lookup the Mods list uses to enable its "Config" button.
@@ -48,10 +59,22 @@ public final class ConfigScreenSmoke {
                 String toml = Files.readString(FMLPaths.CONFIGDIR.get().resolve("vulkanforge-client.toml"));
                 if (!toml.contains("backend = \"" + VulkanForgeConfig.BACKEND.get().name() + "\"")) throw new AssertionError("TOML not saved:\n" + toml);
                 if (!(mc.screen instanceof TitleScreen)) throw new AssertionError("Done did not return to the parent screen");
+                if (Boolean.getBoolean("vulkanforge.restartClientSmoke")) {
+                    Files.createDirectories(report.getParent());
+                    Files.writeString(restartMarker, original.name() + "\n" + VulkanForgeConfig.BACKEND.get().name());
+                    mc.setScreen(new VulkanForgeConfigScreen(mc.screen));
+                    var restart = mc.screen.children().stream().filter(AbstractWidget.class::isInstance)
+                            .map(AbstractWidget.class::cast).toList().get(expected() - 3);
+                    if (!restart.active) throw new AssertionError("Restart disabled on main menu");
+                    restart.onClick(0, 0);
+                    stage = 3; ticks = 0; return;
+                }
                 VulkanForgeConfig.BACKEND.set(original); VulkanForgeConfig.SPEC.save();
                 Files.createDirectories(report.getParent());
                 Files.writeString(report, "PASS config factory, " + expected() + " widgets, Done saved backend to TOML and returned to parent\nSTATUS=OK\n");
                 stage = 99; mc.stop();
+            } else if (stage == 3 && ++ticks > 600) {
+                throw new AssertionError("Save and restart did not stop the game");
             }
         } catch (Throwable error) {
             VulkanForge.LOGGER.error("Config screen smoke failed at stage " + stage, error);
@@ -59,6 +82,6 @@ public final class ConfigScreenSmoke {
             stage = 99; mc.stop();
         }
     }
-    /** backend + Vulkan/OpenGL versions + NVIDIA extensions + Done + Cancel. */
-    private static int expected() { return 3 + VulkanForgeConfig.NvidiaExtension.values().length + 2; }
+    /** backend + Vulkan/OpenGL versions + NVIDIA extensions + Restart + Done + Cancel. */
+    private static int expected() { return 3 + VulkanForgeConfig.NvidiaExtension.values().length + 3; }
 }

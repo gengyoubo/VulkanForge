@@ -3,26 +3,34 @@ package github.com.gengyoubo.vulkanforge.config;
 import com.electronwill.nightconfig.core.file.CommentedFileConfig;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Collections;
+import java.util.EnumSet;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.StringJoiner;
 import net.minecraftforge.common.ForgeConfigSpec;
 import net.minecraftforge.fml.loading.FMLPaths;
 
 /**
  * Client config (config/vulkanforge-client.toml), edited from the Mods list "Config" button.
  * All values are startup choices: {@link #startup()} snapshots them once, before the game window exists.
- * Implemented today: Vulkan 1.4 (main-window presentation) and OpenGL 4.6 (GPU-driven terrain).
+ * Implemented today: Vulkan 1.3/1.4 (main-window presentation) and OpenGL 4.6 (GPU-driven terrain).
  */
 public final class VulkanForgeConfig {
     public enum Backend { VULKAN, OPENGL }
     //推荐1.3
     public enum VulkanVersion {
-        V1_2("1.2", false), V1_3("1.3", false), V1_4("1.4", true);
+        V1_2(2, false), V1_3(3, true), V1_4(4, true);
         public final String label;
+        /** Packed VkApplicationInfo.apiVersion, passed across the isolated backend boundary as an int. */
+        public final int apiVersion;
         /** False: selectable and saved, but startup falls back to the vanilla OpenGL window. */
         public final boolean implemented;
-        VulkanVersion(String label, boolean implemented) { this.label = label; this.implemented = implemented; }
+        VulkanVersion(int minor, boolean implemented) {
+            this.label = "1." + minor; this.apiVersion = (1 << 22) | (minor << 12); this.implemented = implemented;
+        }
     }
     //推荐4.5
     public enum OpenGLVersion {
@@ -65,7 +73,7 @@ public final class VulkanForgeConfig {
         builder.pop();
 
         builder.push("vulkan");
-        VULKAN_VERSION = builder.comment("Requested Vulkan API version (V1_2 .. V1_4). Only V1_4 is implemented; others keep the vanilla OpenGL window. Only used when backend = VULKAN.")
+        VULKAN_VERSION = builder.comment("Requested Vulkan API version (V1_2 .. V1_4). V1_3 and V1_4 are implemented; V1_2 keeps the vanilla OpenGL window. Only used when backend = VULKAN.")
                 .defineEnum("version", VulkanVersion.V1_4);
         builder.comment("NVIDIA-only device extensions. Ignored on other vendors and when backend = OPENGL.").push("nvidiaExtensions");
         for (NvidiaExtension extension : NvidiaExtension.values()) {
@@ -81,14 +89,24 @@ public final class VulkanForgeConfig {
     }
 
     /** What this launch actually uses; the Mods-list screen only changes the next launch. */
-    public record Startup(Backend backend, VulkanVersion vulkanVersion, OpenGLVersion openGLVersion) {
-        public static final Startup DEFAULTS = new Startup(Backend.VULKAN, VulkanVersion.V1_4, OpenGLVersion.DEFAULT);
+    public record Startup(Backend backend, VulkanVersion vulkanVersion, OpenGLVersion openGLVersion, Set<NvidiaExtension> nvidiaExtensions) {
+        public static final Startup DEFAULTS = new Startup(Backend.VULKAN, VulkanVersion.V1_4, OpenGLVersion.DEFAULT, Set.of());
+        public Startup { nvidiaExtensions = nvidiaExtensions.isEmpty() ? Set.of() : Collections.unmodifiableSet(EnumSet.copyOf(nvidiaExtensions)); }
+        public Startup(Backend backend, VulkanVersion vulkanVersion, OpenGLVersion openGLVersion) { this(backend, vulkanVersion, openGLVersion, Set.of()); }
+        /** Comma-separated VK_NV_* names handed to the isolated backend; the backend still checks vendor, driver list and feature bits. */
+        public String nvidiaExtensionNames() {
+            if (backend != Backend.VULKAN) return "";
+            StringJoiner names = new StringJoiner(",");
+            for (NvidiaExtension extension : nvidiaExtensions) names.add(extension.extensionName);
+            return names.toString();
+        }
         /** Vulkan Surface/Swapchain main window (Windows only, also gated by -Dvulkanforge.directPresent). */
-        public boolean vulkanMainWindow() { return backend == Backend.VULKAN && vulkanVersion == VulkanVersion.V1_4; }
+        public boolean vulkanMainWindow() { return backend == Backend.VULKAN && vulkanVersion.implemented; }
         /** In-context OpenGL 4.6 terrain renderer instead of the Vulkan bridge. */
         public boolean gl46Terrain() { return backend == Backend.OPENGL && openGLVersion == OpenGLVersion.GL_4_6; }
         @Override public String toString() {
-            return backend == Backend.VULKAN ? "VULKAN " + vulkanVersion.label : "OPENGL " + openGLVersion.label;
+            if (backend != Backend.VULKAN) return "OPENGL " + openGLVersion.label;
+            return "VULKAN " + vulkanVersion.label + (nvidiaExtensions.isEmpty() ? "" : " +" + nvidiaExtensionNames());
         }
     }
     private static Startup startup;
@@ -108,17 +126,20 @@ public final class VulkanForgeConfig {
         String[] parts = value.split(":", 2);
         Backend backend = value(parts[0], file.backend());
         String version = parts.length > 1 ? parts[1] : null;
-        return backend == Backend.VULKAN ? new Startup(backend, value(version, file.vulkanVersion()), file.openGLVersion())
-                : new Startup(backend, file.vulkanVersion(), value(version, file.openGLVersion()));
+        return backend == Backend.VULKAN ? new Startup(backend, value(version, file.vulkanVersion()), file.openGLVersion(), file.nvidiaExtensions())
+                : new Startup(backend, file.vulkanVersion(), value(version, file.openGLVersion()), file.nvidiaExtensions());
     }
 
     private static Startup read(Path file) {
         if (!Files.isRegularFile(file)) return Startup.DEFAULTS;
         try (CommentedFileConfig config = CommentedFileConfig.builder(file).sync().build()) {
             config.load();
+            Set<NvidiaExtension> nvidia = EnumSet.noneOf(NvidiaExtension.class);
+            for (NvidiaExtension extension : NvidiaExtension.values())
+                if (Boolean.TRUE.equals(config.get("vulkan.nvidiaExtensions." + extension.key()))) nvidia.add(extension);
             return new Startup(value(config.get("renderer.backend"), Startup.DEFAULTS.backend()),
                     value(config.get("vulkan.version"), Startup.DEFAULTS.vulkanVersion()),
-                    value(config.get("opengl.version"), Startup.DEFAULTS.openGLVersion()));
+                    value(config.get("opengl.version"), Startup.DEFAULTS.openGLVersion()), nvidia);
         } catch (RuntimeException error) {
             return Startup.DEFAULTS;
         }

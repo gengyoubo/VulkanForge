@@ -43,7 +43,7 @@ final class MeshArena implements AutoCloseable {
                 vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pBufferMemoryBarriers(barrier));
                 vkCmdCopyBuffer(command, staging.buffer, destination.buffer, VkBufferCopy.calloc(1, stack).dstOffset((long) start * STRIDE).size(bytes.length));
                 barrier.srcStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).srcAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
-                        .dstStageMask(VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT).dstAccessMask(VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT);
+                        .dstStageMask(readStages()).dstAccessMask(readAccess());
                 vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pBufferMemoryBarriers(barrier));
             }); copies++;
             return new Allocation(start, count);
@@ -56,7 +56,7 @@ final class MeshArena implements AutoCloseable {
             if (nextCapacity - capacity >= needed) break; nextCapacity *= 2;
         } while (true);
         GpuBuffer next = new GpuBuffer(context, nextCapacity * STRIDE,
-                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, false);
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, false);
         GpuBuffer old = buffer; int oldCapacity = capacity;
         if (old != null) {
             long ticket = context.uploads.submit(new byte[0], (command, staging, stack) -> {
@@ -67,13 +67,15 @@ final class MeshArena implements AutoCloseable {
                 vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pBufferMemoryBarriers(barrier));
                 vkCmdCopyBuffer(command, old.buffer, next.buffer, VkBufferCopy.calloc(1, stack).size((long) oldCapacity * STRIDE));
                 barrier.buffer(next.buffer).srcStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).srcAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
-                        .dstStageMask(VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT).dstAccessMask(VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT);
+                        .dstStageMask(readStages()).dstAccessMask(readAccess());
                 vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pBufferMemoryBarriers(barrier));
             });
             context.uploads.retire(ticket, () -> retire.accept(old::close));
         }
         buffer = next; capacity = nextCapacity; free(oldCapacity, nextCapacity - oldCapacity); grows++;
     }
+    private long readStages() { return VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT | (context.meshShaderNV ? KHRSynchronization2.VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_NV : 0); }
+    private long readAccess() { return VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | (context.meshShaderNV ? VK_ACCESS_2_SHADER_STORAGE_READ_BIT : 0); }
     private void free(int start, int length) {
         var before = free.lowerEntry(start);
         if (before != null && before.getKey() + before.getValue() == start) { start = before.getKey(); length += before.getValue(); free.remove(before.getKey()); }

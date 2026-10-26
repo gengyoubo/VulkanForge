@@ -15,9 +15,11 @@ import static org.lwjgl.vulkan.KHRSurface.*;
 import static org.lwjgl.vulkan.KHRSwapchain.*;
 import static org.lwjgl.vulkan.VK10.*;
 import static org.lwjgl.vulkan.VK11.*;
+import static org.lwjgl.vulkan.VK13.VK_API_VERSION_1_3;
 import static org.lwjgl.vulkan.VK14.VK_API_VERSION_1_4;
 
 final class VulkanContext implements AutoCloseable {
+    final int apiVersion;
     VkInstance instance;
     VkPhysicalDevice physical;
     VkDevice device;
@@ -25,6 +27,11 @@ final class VulkanContext implements AutoCloseable {
     DeviceCapabilities capabilities;
     AsyncUploads uploads;
     GpuMemory memory;
+    /** Opt-in VK_NV_* extensions that were requested; {@link #nvidia} holds what the device actually enabled. */
+    final java.util.Set<String> requestedNvidia;
+    NvidiaExtensions nvidia = new NvidiaExtensions();
+    /** Terrain draws through NV task/mesh shaders instead of compute culling + indirect count. */
+    boolean meshShaderNV;
     boolean pushDescriptors, pushDescriptorCore;
     int queueFamily = -1;
     long surface;
@@ -33,6 +40,26 @@ final class VulkanContext implements AutoCloseable {
     private final AtomicInteger validationErrors = new AtomicInteger();
     private boolean interop;
     private byte[] deviceUUID;
+
+    VulkanContext() { this(requestedApiVersion()); }
+
+    VulkanContext(int apiVersion) { this(apiVersion, System.getProperty("vulkanforge.nvidiaExtensions", "")); }
+
+    /** nvidiaExtensions: comma-separated VK_NV_* names selected in the config; blank for none. */
+    VulkanContext(int apiVersion, String nvidiaExtensions) {
+        this.requestedNvidia = NvidiaExtensions.parse(nvidiaExtensions);
+        if (apiVersion != VK_API_VERSION_1_3 && apiVersion != VK_API_VERSION_1_4)
+            throw new IllegalArgumentException("Unsupported Vulkan API version: " + version(apiVersion));
+        this.apiVersion = apiVersion;
+    }
+
+    static int requestedApiVersion() {
+        return switch (System.getProperty("vulkanforge.vulkanVersion", "1.4")) {
+            case "1.3" -> VK_API_VERSION_1_3;
+            case "1.4" -> VK_API_VERSION_1_4;
+            default -> throw new IllegalArgumentException("vulkanforge.vulkanVersion must be 1.3 or 1.4");
+        };
+    }
 
     void initializeInterop(byte[] uuid, boolean requireValidation) {
         interop = true; deviceUUID = uuid;
@@ -53,6 +80,8 @@ final class VulkanContext implements AutoCloseable {
     }
 
     void initialize(long window, int loaderVersion, boolean requireValidation) {
+        if (loaderVersion < apiVersion)
+            throw new IllegalStateException("Vulkan " + version(apiVersion) + " loader required; found " + version(loaderVersion));
         boolean offscreen = window == NULL;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             boolean validation = !Boolean.getBoolean("vulkanforge.disableValidation") && hasLayer(stack, "VK_LAYER_KHRONOS_validation");
@@ -72,7 +101,7 @@ final class VulkanContext implements AutoCloseable {
             VkApplicationInfo app = VkApplicationInfo.calloc(stack).sType$Default()
                     .pApplicationName(stack.UTF8("VulkanForge laboratory"))
                     .applicationVersion(VK_MAKE_VERSION(0, 1, 0)).pEngineName(stack.UTF8("VulkanForge"))
-                    .engineVersion(VK_MAKE_VERSION(0, 1, 0)).apiVersion(Math.min(loaderVersion, VK_API_VERSION_1_4));
+                    .engineVersion(VK_MAKE_VERSION(0, 1, 0)).apiVersion(apiVersion);
             VkInstanceCreateInfo info = VkInstanceCreateInfo.calloc(stack).sType$Default()
                     .pApplicationInfo(app).ppEnabledExtensionNames(extensions);
             VkDebugUtilsMessengerCreateInfoEXT debugInfo = null;
@@ -104,20 +133,23 @@ final class VulkanContext implements AutoCloseable {
 
             VkDeviceQueueCreateInfo.Buffer queueInfo = VkDeviceQueueCreateInfo.calloc(1, stack)
                     .sType$Default().queueFamilyIndex(queueFamily).pQueuePriorities(stack.floats(1.0f));
-            // Features must be queried AND explicitly enabled even with a Vulkan 1.4 baseline.
+            // Dynamic rendering and synchronization2 are core in both supported API versions.
             VkPhysicalDeviceVulkan13Features enabled = VkPhysicalDeviceVulkan13Features.calloc(stack).sType$Default()
                     .dynamicRendering(true).synchronization2(true);
-            capabilities = DeviceCapabilities.query(physical, stack);
             boolean pushExtension = hasDeviceExtension(physical, stack, org.lwjgl.vulkan.KHRPushDescriptor.VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
-            pushDescriptors = (app.apiVersion() >= VK_API_VERSION_1_4 || pushExtension) && capabilities.pushDescriptor() && capabilities.maxPushDescriptors() >= 3 && !Boolean.getBoolean("vulkanforge.disablePushDescriptors");
-            enabled.pNext(VkPhysicalDeviceVulkan14Features.calloc(stack).sType$Default().pushDescriptor(pushDescriptors).address());
+            capabilities = DeviceCapabilities.query(physical, stack, apiVersion, pushExtension);
+            pushDescriptors = capabilities.pushDescriptor() && capabilities.maxPushDescriptors() >= 3 && !Boolean.getBoolean("vulkanforge.disablePushDescriptors");
+            // The KHR extension has no feature bit on 1.3. Never chain a Vulkan 1.4 structure on that path.
+            if (apiVersion >= VK_API_VERSION_1_4)
+                enabled.pNext(VkPhysicalDeviceVulkan14Features.calloc(stack).sType$Default().pushDescriptor(pushDescriptors).address());
             boolean driven = capabilities.gpuDriven() && !Boolean.getBoolean("vulkanforge.disableGpuDriven");
             var enabled12 = VkPhysicalDeviceVulkan12Features.calloc(stack).sType$Default().pNext(enabled.address())
                     .timelineSemaphore(capabilities.timeline()).drawIndirectCount(driven);
             var enabled11 = VkPhysicalDeviceVulkan11Features.calloc(stack).sType$Default().pNext(enabled12.address()).shaderDrawParameters(driven);
             var core = VkPhysicalDeviceFeatures.calloc(stack).multiDrawIndirect(driven).drawIndirectFirstInstance(driven);
+            nvidia = NvidiaExtensions.select(physical, stack, requestedNvidia, name -> hasDeviceExtension(physical, stack, name));
             VkDeviceCreateInfo deviceInfo = VkDeviceCreateInfo.calloc(stack).sType$Default().pQueueCreateInfos(queueInfo)
-                    .pNext(enabled11.address()).pEnabledFeatures(core);
+                    .pNext(nvidia.chain(stack, enabled11.address())).pEnabledFeatures(core);
             java.util.List<String> deviceExtensions = new java.util.ArrayList<>();
             if (!offscreen || interop) deviceExtensions.add(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
             if (interop) {
@@ -125,6 +157,7 @@ final class VulkanContext implements AutoCloseable {
                 deviceExtensions.add(org.lwjgl.vulkan.KHRExternalSemaphoreWin32.VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
             }
             if (pushDescriptors && pushExtension) deviceExtensions.add(org.lwjgl.vulkan.KHRPushDescriptor.VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+            deviceExtensions.addAll(nvidia.enabled);
             if (!deviceExtensions.isEmpty()) {
                 var names = stack.mallocPointer(deviceExtensions.size()); for (String name : deviceExtensions) names.put(stack.UTF8(name)); names.flip();
                 deviceInfo.ppEnabledExtensionNames(names);
@@ -133,13 +166,17 @@ final class VulkanContext implements AutoCloseable {
             device = new VkDevice(pointer.get(0), physical, deviceInfo);
             vkGetDeviceQueue(device, queueFamily, 0, pointer);
             queue = new VkQueue(pointer.get(0), device);
-            pushDescriptorCore = device.getCapabilities().vkCmdPushDescriptorSet != 0;
+            pushDescriptorCore = apiVersion >= VK_API_VERSION_1_4 && device.getCapabilities().vkCmdPushDescriptorSet != 0;
             pushDescriptors &= pushDescriptorCore || device.getCapabilities().vkCmdPushDescriptorSetKHR != 0;
             System.out.println("INSTANCE_API=" + version(app.apiVersion()));
             System.out.println("PUSH_DESCRIPTOR_PATH=" + (pushDescriptors ? pushDescriptorCore ? "VULKAN14_CORE" : "KHR_ALIAS" : "LEGACY"));
             System.out.println("DEVICE_CAPABILITIES=" + capabilities);
             System.out.println("GPU_DRIVEN_ENABLED=" + driven);
             System.out.println("PUSH_DESCRIPTORS_ENABLED=" + pushDescriptors);
+            // The mesh path reuses the GPU-driven arena and section bounds, so it needs the same capabilities.
+            meshShaderNV = nvidia.has(NvidiaExtensions.MESH_SHADER) && driven && !Boolean.getBoolean("vulkanforge.disableMeshShader");
+            System.out.println("NVIDIA_EXTENSIONS=" + nvidia);
+            System.out.println("MESH_SHADER_NV_ENABLED=" + meshShaderNV);
             memory = new GpuMemory(this);
             uploads = new AsyncUploads(this, capabilities.timeline() && !Boolean.getBoolean("vulkanforge.disableUploadTimeline"));
             System.out.println("DEVICE_CREATED=true");
@@ -158,7 +195,7 @@ final class VulkanContext implements AutoCloseable {
             VkPhysicalDevice candidate = new VkPhysicalDevice(devices.get(i), instance);
             VkPhysicalDeviceProperties props = VkPhysicalDeviceProperties.calloc(stack);
             vkGetPhysicalDeviceProperties(candidate, props);
-            boolean api = props.apiVersion() >= VK_API_VERSION_1_4;
+            boolean api = props.apiVersion() >= apiVersion;
             boolean offscreen = surface == NULL;
             boolean swapchain = !offscreen && hasDeviceExtension(candidate, stack, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
             int family = findQueueFamily(candidate, stack);
@@ -190,8 +227,8 @@ final class VulkanContext implements AutoCloseable {
             }
             System.out.printf("GPU[%d]=%s | API=%s | driverRaw=%s | vendor=0x%04x | device=0x%04x%n",
                     i, props.deviceNameString(), version(props.apiVersion()), Integer.toUnsignedString(props.driverVersion()), props.vendorID(), props.deviceID());
-            System.out.printf("  api14=%s swapchain=%s graphicsQueue=%d dynamicRendering=%s synchronization2=%s presentation=%s eligible=%s%n",
-                    api, swapchain, family, dynamicRendering, synchronization2, presentation, suitable);
+            System.out.printf("  requiredApi=%s apiSupported=%s swapchain=%s graphicsQueue=%d dynamicRendering=%s synchronization2=%s presentation=%s eligible=%s%n",
+                    version(apiVersion), api, swapchain, family, dynamicRendering, synchronization2, presentation, suitable);
             int score = props.deviceType() == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 100 : 10;
             if (suitable && score > best) {
                 physical = candidate;
@@ -200,7 +237,7 @@ final class VulkanContext implements AutoCloseable {
                 selected = props.deviceNameString();
             }
         }
-        if (physical == null) throw new IllegalStateException("No eligible Vulkan 1.4 GPU. Requires dynamicRendering, synchronization2 and a graphics queue; window tests also require VK_KHR_swapchain and presentation. Update the GPU driver or use a supported GPU.");
+        if (physical == null) throw new IllegalStateException("No eligible Vulkan " + version(apiVersion) + " GPU. Requires dynamicRendering, synchronization2 and a graphics queue; window tests also require VK_KHR_swapchain and presentation. Update the GPU driver or use a supported GPU.");
         System.out.println("SELECTED_GPU=" + selected);
     }
 

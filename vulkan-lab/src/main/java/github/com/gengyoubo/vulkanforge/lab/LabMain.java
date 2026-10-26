@@ -46,8 +46,8 @@ public final class LabMain {
             }
             int loader = VK.getInstanceVersionSupported();
             System.out.println("LOADER_API=" + VulkanContext.version(loader));
-            if (loader < org.lwjgl.vulkan.VK11.VK_API_VERSION_1_1) {
-                throw new IllegalStateException("Vulkan loader is too old; install a GPU driver supporting Vulkan 1.4");
+            if (loader < VulkanContext.requestedApiVersion()) {
+                throw new IllegalStateException("Vulkan " + VulkanContext.version(VulkanContext.requestedApiVersion()) + " loader required");
             }
             errors = GLFWErrorCallback.createPrint(System.err).set();
             if (!glfwInit()) throw new IllegalStateException("GLFW initialization failed");
@@ -56,7 +56,7 @@ public final class LabMain {
             glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
             glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
             glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
-            window = glfwCreateWindow(960, 600, "VulkanForge | Vulkan 1.4 triangle", NULL, NULL);
+            window = glfwCreateWindow(960, 600, "VulkanForge | Vulkan " + VulkanContext.version(VulkanContext.requestedApiVersion()) + " triangle", NULL, NULL);
             if (window == NULL) throw new IllegalStateException("Could not create Vulkan test window");
             context = new VulkanContext();
             context.initialize(window, loader, requireValidation);

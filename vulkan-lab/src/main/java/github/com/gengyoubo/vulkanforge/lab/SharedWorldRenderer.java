@@ -85,8 +85,8 @@ final class SharedWorldRenderer implements AutoCloseable {
             if ((families.get(context.queueFamily).queueFlags() & VK_QUEUE_COMPUTE_BIT) != 0 && !Boolean.getBoolean("vulkanforge.disableGpuCulling"))
                 culler = new GpuCuller(context, SLOT_COUNT);
             if (culler != null) world.enableGpuDriven(culler);
-            log.accept("GPU_DRIVEN=" + (culler != null && culler.compact() ? "COMPACT_INDIRECT_COUNT" : "FALLBACK"));
-            log.accept("GPU_CULLING=" + (culler == null ? "DISABLED" : "COMPUTE_INDIRECT"));
+            log.accept("GPU_DRIVEN=" + (world.meshShaderActive() ? "NV_TASK_MESH" : culler != null && culler.compact() ? "COMPACT_INDIRECT_COUNT" : "FALLBACK"));
+            log.accept("GPU_CULLING=" + (culler == null ? "DISABLED" : world.meshShaderActive() ? "TASK_SHADER" : "COMPUTE_INDIRECT"));
             var handle = stack.mallocLong(1);
             check(vkCreateCommandPool(context.device, VkCommandPoolCreateInfo.calloc(stack).sType$Default().queueFamilyIndex(context.queueFamily)
                     .flags(VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT), null, handle), "shared world pool"); pool = handle.get(0);

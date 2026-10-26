@@ -16,7 +16,9 @@ public final class BridgeSmokeTest {
 
     private static void run(String jar, boolean stopEarly) throws Exception {
         String executable = System.getProperty("os.name").startsWith("Windows") ? "java.exe" : "java";
-        List<String> command = new ArrayList<>(List.of(Path.of(System.getProperty("java.home"), "bin", executable).toString(), "-jar", jar, "--bridge"));
+        String api = System.getProperty("vulkanforge.vulkanVersion", "1.4");
+        List<String> command = new ArrayList<>(List.of(Path.of(System.getProperty("java.home"), "bin", executable).toString(),
+                "-Dvulkanforge.vulkanVersion=" + api, "-jar", jar, "--bridge"));
         if (!stopEarly) command.add("--frames=24");
         Path report = Path.of("build", "reports", stopEarly ? "bridge-stop-smoke.txt" : "bridge-pixel-smoke.txt");
         Files.createDirectories(report.getParent());
@@ -47,6 +49,7 @@ public final class BridgeSmokeTest {
             String log = Files.readString(report);
             require(child.exitValue() == 0 && log.contains("STATUS=OK"), "Child failed: " + log);
             require(log.contains("VALIDATION_ERRORS=0"), "Vulkan validation errors: " + log);
+            require(log.contains("INSTANCE_API=" + api + ".0"), "Bridge ignored the requested API version");
             require(stopEarly ? frames >= 3 && frames < 20 : frames == 24, "Wrong frame count: " + frames);
             require(first != null && last != null, "Missing frames");
             if (!stopEarly) require(!Arrays.equals(first, last), "Triangle did not animate");

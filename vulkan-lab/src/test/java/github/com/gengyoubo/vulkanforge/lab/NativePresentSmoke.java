@@ -31,6 +31,11 @@ public final class NativePresentSmoke {
             glfwMakeContextCurrent(hidden); GL.createCapabilities();
             backend = new MainWindowBackend(output.resolve("report.txt").toString(), GlInterop.deviceUUID(),
                     handles -> new FaultImage(GlInterop.importImage(handles), failurePhase), org.lwjgl.opengl.GL11::glFinish);
+            String startup = Files.readString(output.resolve("report.txt"));
+            if (!startup.contains("INSTANCE_API=" + VulkanContext.version(VulkanContext.requestedApiVersion())))
+                throw new AssertionError("Main-window backend ignored the requested API version");
+            if (VulkanContext.requestedApiVersion() == org.lwjgl.vulkan.VK13.VK_API_VERSION_1_3 && startup.contains("VULKAN14_CORE"))
+                throw new AssertionError("Vulkan 1.3 must not use Vulkan 1.4 core commands");
             glfwDefaultWindowHints(); glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
             glfwWindowHint(GLFW_FOCUSED, GLFW_FALSE); glfwWindowHint(GLFW_AUTO_ICONIFY, GLFW_FALSE);
             visible = glfwCreateWindow(640, 480, "VulkanForge main-window presentation check", 0, 0);

@@ -27,12 +27,14 @@ minecraft {
             mods { vulkanforge { source sourceSets.main } }
         }
         client {
+            if (project.hasProperty('vulkan13Smoke')) property 'vulkanforge.startup', 'VULKAN:V1_3'
             property 'vulkanforge.directPresent', System.getProperty('vulkanforge.directPresent', 'true')
             property 'vulkanforge.legacyPresent', System.getProperty('vulkanforge.legacyPresent', 'false')
             if (project.hasProperty('validationSmoke')) property 'vulkanforge.requireValidation', 'true'
             if (project.hasProperty('pushDescriptorSmoke')) property 'vulkanforge.preferPushDescriptors', 'true'
             if (project.hasProperty('configSmoke')) {
                 property 'vulkanforge.configSmoke', 'true'
+                if (project.hasProperty('restartClientSmoke')) property 'vulkanforge.restartClientSmoke', 'true'
                 mods { vulkanforge { source sourceSets.smoke } }
             }
             if (project.hasProperty('worldSmoke')) {
@@ -75,6 +77,14 @@ tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
 
 tasks.register('runProbe') { dependsOn ':vulkan-lab:runProbe' }
 tasks.register('runTriangle') { dependsOn ':vulkan-lab:runTriangle' }
+
+tasks.register('restartSmoke', JavaExec) {
+    dependsOn tasks.named('compileSmokeJava')
+    classpath = files(sourceSets.main.output.classesDirs, sourceSets.smoke.output.classesDirs,
+            configurations.runtimeClasspath.filter { it.name.startsWith('jna-') })
+    mainClass = 'github.com.gengyoubo.vulkanforge.client.GameRestartSmoke'
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+}
 
 if (project.hasProperty('gl46Smoke') || project.hasProperty('gl46Move')) {
     def gl46Report = project.hasProperty('gl46Move') ? 'run/logs/vulkanforge/gl46-move/report.txt' : 'run/logs/vulkanforge/gl46-smoke/report.txt'
