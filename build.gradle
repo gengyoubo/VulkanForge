@@ -12,6 +12,7 @@ sourceSets.main.java.srcDir 'bridge-protocol/src/main/java'
 sourceSets.main.java.srcDir 'gl-interop/src/main/java'
 sourceSets {
     smoke {
+        java.srcDir 'benchmark-support/src/main/java'
         compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
         runtimeClasspath += output + compileClasspath
     }
@@ -103,7 +104,7 @@ tasks.register('offscreenBenchmarkArgs') {
         def destination = file('build/reports/offscreen-performance/gl.args')
         destination.parentFile.mkdirs()
         destination.text = '-cp "' + sourceSets.smoke.runtimeClasspath.asPath.replace(File.separator, '/') + '"\n' +
-                '-Dlog4j.configurationFile="' + file('src/smoke/resources/offscreen-log4j2.xml').absolutePath.replace(File.separator, '/') + '"\n'
+                '-Dlog4j.configurationFile="' + file('src/smoke/resources/offscreen-log4j2.xml').toURI().toString() + '"\n'
     }
 }
 tasks.register('smokeGlOffscreen') { dependsOn 'smokeGl43', 'smokeGl44', 'smokeGl45', 'smokeGl46' }

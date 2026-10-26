@@ -15,5 +15,6 @@ public final class BenchmarkSceneExport {
             Files.writeString(file.resolveSibling("scene.txt"), scene + "\n");
             System.out.println(scene);
         }
+        dev.vulkanforge.bench.Workload.matched(file, file.resolveSibling("matched-scene.bin"));
     }
 }

@@ -4,6 +4,7 @@ version = '0.1.0'
 java.toolchain.languageVersion = JavaLanguageVersion.of(17)
 sourceSets.main.java.srcDir '../bridge-protocol/src/main/java'
 sourceSets.main.java.srcDir '../gl-interop/src/main/java'
+sourceSets.test.java.srcDir '../benchmark-support/src/main/java'
 repositories { mavenCentral() }
 
 def lwjglVersion = '3.3.6'

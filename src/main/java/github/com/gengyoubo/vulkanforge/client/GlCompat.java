@@ -16,9 +16,10 @@ final class GlCompat {
     private GlCompat() { }
     static void configure(int versionMinor) { minor = versionMinor; }
     static boolean core46() { return minor >= 6 && GL.getCapabilities().OpenGL46; }
+    static boolean indirectCount() { return core46() && !Boolean.getBoolean("vulkanforge.gl46.noIndirectCount"); }
     static boolean storage() { return minor >= 4 && GL.getCapabilities().OpenGL44; }
     private static boolean dsa() { return minor >= 5 && GL.getCapabilities().OpenGL45; }
-    static String paths() { return "DSA=" + dsa() + " PERSISTENT=" + storage() + " INDIRECT_COUNT=" + core46() + " SPIRV=" + core46(); }
+    static String paths() { return "DSA=" + dsa() + " PERSISTENT=" + storage() + " INDIRECT_COUNT=" + indirectCount() + " SPIRV=" + (core46() && !Boolean.getBoolean("vulkanforge.gl46.glsl")) + " GPU_DRIVEN=" + !Boolean.getBoolean("vulkanforge.gl46.noGpuDriven"); }
     static void written(int buffer, int offset, int bytes) {
         if (!mirrors.containsKey(buffer)) return;
         dirty.compute(buffer, (key, old) -> old == null ? new int[]{offset, offset + bytes}
@@ -163,7 +164,7 @@ final class GlCompat {
     }
     static void glMultiDrawElementsIndirectCount(int mode, int type, long offset, long countOffset, int maximum, int stride) {
         flushAll();
-        if (core46()) org.lwjgl.opengl.GL46C.glMultiDrawElementsIndirectCount(mode, type, offset, countOffset, maximum, stride);
+        if (indirectCount()) org.lwjgl.opengl.GL46C.glMultiDrawElementsIndirectCount(mode, type, offset, countOffset, maximum, stride);
         else {
             int old = bind(parameterBuffer);
             int[] count = new int[1]; try { glGetBufferSubData(GL_COPY_WRITE_BUFFER, countOffset, count); } finally { restore(old); }

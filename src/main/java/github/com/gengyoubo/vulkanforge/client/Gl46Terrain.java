@@ -132,6 +132,13 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
     private long epoch, frameCount, translucentFrames, translucentDraws, sorts, meshes, opaqueNanos, translucentNanos;
     private WorldProtocol.Camera camera;
     private boolean receivedMesh;
+    // Opt-in A/B: CPU generates the same compact commands; MDI, Indirect Count and shader format stay independent.
+    private final boolean cpuDriven = Boolean.getBoolean("vulkanforge.gl46.noGpuDriven");
+    private static final boolean MATCH_VULKAN_RASTER = Boolean.getBoolean("bench.matchVulkanTargets");
+    private record CpuSection(int x, int y, int z, float[] bounds, int first, int[] quads) { }
+    private final Map<Integer, CpuSection> cpuSections = new HashMap<>();
+    private ByteBuffer cpuCommands;
+    private int lastTranslucentOffset, lastTranslucentCount;
     private final Set<String> checkedPasses = new HashSet<>();
 
     Gl46Terrain() {
@@ -147,7 +154,8 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
             commands = new Gl46Buffers.Ring(2 << 20, 3);
             sectionBuffer = Gl46Buffers.immutable((long) MAX_SECTIONS * SECTION_BYTES, GL_DYNAMIC_STORAGE_BIT);
             glClearNamedBufferData(sectionBuffer, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, (ByteBuffer) null);
-            drawBuffer = Gl46Buffers.immutable((long) OPAQUE_LAYERS * MAX_SECTIONS * COMMAND_BYTES, 0);
+            drawBuffer = Gl46Buffers.immutable((long) OPAQUE_LAYERS * MAX_SECTIONS * COMMAND_BYTES, cpuDriven ? GL_DYNAMIC_STORAGE_BIT : 0);
+            if (cpuDriven) cpuCommands = MemoryUtil.memAlloc(OPAQUE_LAYERS * MAX_SECTIONS * COMMAND_BYTES);
             countBuffer = Gl46Buffers.immutable(COUNT_BYTES, GL_DYNAMIC_STORAGE_BIT);
             int read = GL_MAP_READ_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
             readback = Gl46Buffers.immutable(READBACK_SLOTS * 32L, read);
@@ -280,6 +288,10 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
 
     /** std430 Section { ivec4 origin; vec4 minimum; vec4 maximum; uvec4 draw(first, solid, cutoutMipped, cutout quads) }. */
     private void writeSlot(int slot, int x, int y, int z, float[] bounds, int first, int[] quads) {
+        if (cpuDriven) {
+            if (quads[0] + quads[1] + quads[2] == 0) cpuSections.remove(slot);
+            else cpuSections.put(slot, new CpuSection(x, y, z, bounds.clone(), first, quads.clone()));
+        }
         try (MemoryStack stack = MemoryStack.stackPush()) {
             ByteBuffer entry = stack.calloc(SECTION_BYTES);
             entry.putInt(0, x).putInt(4, y).putInt(8, z);
@@ -319,9 +331,12 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, drawBuffer);
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, countBuffer);
             glClearNamedBufferSubData(countBuffer, GL_R32UI, 0, COUNT_BYTES, GL_RED_INTEGER, GL_UNSIGNED_INT, stack.callocInt(1));
-            bindCulling();
-            glUseProgram(cull.id());
-            glDispatchCompute((slotCount + 63) / 64, 1, 1);
+            if (cpuDriven) cpuCull(stack);
+            else {
+                bindCulling();
+                glUseProgram(cull.id());
+                glDispatchCompute((slotCount + 63) / 64, 1, 1);
+            }
             // Indirect commands and counts, plus the statistics copy in collectCounts().
             glMemoryBarrier(GL_COMMAND_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
             glBindTextureUnit(2, light); glBindSampler(2, lightSampler); // the pyramid sat on unit 2 for the cull
@@ -331,7 +346,8 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
             glBindBuffer(GL_DRAW_INDIRECT_BUFFER, drawBuffer);
             glBindBuffer(GL_PARAMETER_BUFFER, countBuffer);
             glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL); glDepthMask(true);
-            glEnable(GL_CULL_FACE); glDisable(GL_BLEND);
+            if (MATCH_VULKAN_RASTER) glDisable(GL_CULL_FACE); else glEnable(GL_CULL_FACE);
+            glDisable(GL_BLEND);
             for (int layer = 0; layer < OPAQUE_LAYERS; layer++) {
                 if (layer > 0) bindFrame(atlas, light, CUTOFF[layer], layer == 2 ? flatSampler : mipSampler);
                 glMultiDrawElementsIndirectCount(GL_TRIANGLES, GL_UNSIGNED_INT, (long) layer * MAX_SECTIONS * COMMAND_BYTES, layer * 4L, slotCount, COMMAND_BYTES);
@@ -350,6 +366,71 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
         frameCount++;
         checkErrors("opaque");
         return true;
+    }
+
+    private void cpuCull(MemoryStack stack) {
+        int[] counts = new int[3]; int tested = 0, visibleCount = 0;
+        float[] m = camera.matrix();
+        for (var entry : cpuSections.entrySet()) {
+            int index = entry.getKey(); CpuSection section = entry.getValue();
+            if ((visibility[index >> 5] & (1 << (index & 31))) == 0) continue;
+            tested++;
+            int outside = 63;
+            for (int c = 0; c < 8; c++) {
+                float x = (float)(section.x - camera.x()) + section.bounds[(c & 1) == 0 ? 0 : 3] + ((c & 1) == 0 ? -.001f : .001f);
+                float y = (float)(section.y - camera.y()) + section.bounds[(c & 2) == 0 ? 1 : 4] + ((c & 2) == 0 ? -.001f : .001f);
+                float z = (float)(section.z - camera.z()) + section.bounds[(c & 4) == 0 ? 2 : 5] + ((c & 4) == 0 ? -.001f : .001f);
+                float cx=m[0]*x+m[4]*y+m[8]*z+m[12], cy=m[1]*x+m[5]*y+m[9]*z+m[13];
+                float cz=m[2]*x+m[6]*y+m[10]*z+m[14], w=m[3]*x+m[7]*y+m[11]*z+m[15];
+                outside &= (cx < -w ? 1 : 0) | (cx > w ? 2 : 0) | (cy < -w ? 4 : 0) | (cy > w ? 8 : 0) | (cz < -w ? 16 : 0) | (cz > w ? 32 : 0);
+            }
+            if (outside != 0) continue;
+            visibleCount++; int first = section.first;
+            for (int layer = 0; layer < 3; layer++) {
+                int quads = section.quads[layer];
+                if (quads > 0) {
+                    int at = (layer * MAX_SECTIONS + counts[layer]++) * COMMAND_BYTES;
+                    cpuCommands.putInt(at, quads * 6).putInt(at+4, 1).putInt(at+8, 0).putInt(at+12, first).putInt(at+16, index);
+                }
+                first += quads * 4;
+            }
+        }
+        for (int layer=0; layer<3; layer++) if (counts[layer] > 0) {
+            ByteBuffer bytes=cpuCommands.duplicate(); int at=layer*MAX_SECTIONS*COMMAND_BYTES;
+            bytes.position(at).limit(at+counts[layer]*COMMAND_BYTES); glNamedBufferSubData(drawBuffer, at, bytes);
+        }
+        ByteBuffer counters=stack.calloc(COUNT_BYTES);
+        for (int i=0;i<3;i++) counters.putInt(i*4, counts[i]);
+        counters.putInt(12, tested).putInt(16, visibleCount); glNamedBufferSubData(countBuffer, 0, counters);
+    }
+
+    /** Explicit diagnostics only, after glFinish; never called in a measured frame. Section key -> submitted quads. */
+    Map<Long, Long> auditOpaqueDraws() {
+        Map<Integer, Long> keys = new HashMap<>(); sections.forEach((key, section) -> keys.put(section.slot(), key));
+        Map<Long, Long> draws = new TreeMap<>();
+        int old = glGetInteger(GL_COPY_READ_BUFFER_BINDING);
+        ByteBuffer counts = MemoryUtil.memAlloc(COUNT_BYTES), commands = MemoryUtil.memAlloc(OPAQUE_LAYERS * MAX_SECTIONS * COMMAND_BYTES);
+        try {
+            glBindBuffer(GL_COPY_READ_BUFFER, countBuffer); glGetBufferSubData(GL_COPY_READ_BUFFER, 0, counts);
+            glBindBuffer(GL_COPY_READ_BUFFER, drawBuffer); glGetBufferSubData(GL_COPY_READ_BUFFER, 0, commands);
+            for (int layer=0;layer<3;layer++) for (int i=0;i<counts.getInt(layer*4);i++) {
+                int at=(layer*MAX_SECTIONS+i)*COMMAND_BYTES;
+                draws.merge(keys.get(commands.getInt(at+16)), commands.getInt(at)/6L, Long::sum);
+            }
+        } finally { glBindBuffer(GL_COPY_READ_BUFFER, old); MemoryUtil.memFree(counts); MemoryUtil.memFree(commands); }
+        return draws;
+    }
+    Map<Long, Long> auditTranslucentDraws() {
+        Map<Integer, Long> keys = new HashMap<>(); sections.forEach((key, section) -> keys.put(section.slot(), key));
+        Map<Long, Long> draws = new TreeMap<>();
+        if (lastTranslucentCount == 0) return draws;
+        int old = glGetInteger(GL_COPY_READ_BUFFER_BINDING);
+        ByteBuffer bytes = MemoryUtil.memAlloc(lastTranslucentCount * COMMAND_BYTES);
+        try {
+            glBindBuffer(GL_COPY_READ_BUFFER, commands.buffer); glGetBufferSubData(GL_COPY_READ_BUFFER, lastTranslucentOffset, bytes);
+            for (int i=0;i<lastTranslucentCount;i++) draws.put(keys.get(bytes.getInt(i*COMMAND_BYTES+16)),bytes.getInt(i*COMMAND_BYTES)/6L);
+        } finally { glBindBuffer(GL_COPY_READ_BUFFER,old); MemoryUtil.memFree(bytes); }
+        return draws;
     }
 
     /** Before drawOpaque: start this frame's vanilla visibility set; {@code known} false keeps every slot eligible. */
@@ -470,6 +551,7 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
 
     /** AFTER_TRANSLUCENT_BLOCKS: far-to-near sections, each far-to-near quads, with vanilla's translucent blend and depth write. */
     void drawTranslucent(int atlas, int light) {
+        lastTranslucentCount = 0;
         if (!ready() || layered.isEmpty()) return;
         long start = System.nanoTime();
         List<Section> ordered = orderSections();
@@ -502,6 +584,7 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
             glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL); glDepthMask(true); glEnable(GL_CULL_FACE);
             glEnable(GL_BLEND); glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
             glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, offset, ordered.size(), COMMAND_BYTES);
+            lastTranslucentOffset = offset; lastTranslucentCount = ordered.size();
             frames.submit(); commands.submit();
         }
         long spent = System.nanoTime() - start;
@@ -628,6 +711,7 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
     }
 
     private void clear() {
+        cpuSections.clear();
         for (Section section : sections.values()) release(section);
         if (uploads != null) uploads.flush();
         sections.clear(); layered.clear(); freeSlots.clear(); slotCount = 0;
@@ -636,6 +720,8 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
     }
 
     @Override public void close() {
+        if (cpuCommands != null) { MemoryUtil.memFree(cpuCommands); cpuCommands = null; }
+        cpuSections.clear();
         if (vertices != null) Gl46Context.report("TERRAIN_CLOSE frames=" + frameCount + " translucentFrames=" + translucentFrames
                 + " translucentDraws=" + translucentDraws + " sorts=" + sorts + " meshes=" + meshes + " peakSections=" + peakSections
                 + " vertexCapacity=" + vertices.capacity() + " vertexGrows=" + vertices.grows() + " indexGrows=" + (indices == null ? 0 : indices.grows())

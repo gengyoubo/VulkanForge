@@ -148,6 +148,19 @@ OpenGL 各版本使用同一套地形、实体和方块实体管线，调用受�
 
 2026-10-26 本机 RTX 3050 Laptop GPU：七个版本的离屏检查通过；OpenGL 实际上下文分别为 4.3、4.4、4.5、4.6，GL 错误为零；三个 Vulkan 共享测试各提交 96 帧，呈现帧数为零。本次环境未启用 Vulkan validation layer（报告为 `VALIDATION=UNAVAILABLE`），因此这些结果不代表校验层检查通过。
 
+性能对照使用独立的显式命令，不从功能 smoke 的帧数推算 FPS：
+
+```powershell
+.\gradlew.bat offscreenBenchmarkArgs
+python tools/benchmark-controlled-comparison.py --java 'C:\path\to\jdk17\bin\java.exe' --rounds 5 --seconds 6
+```
+
+每个 block 打乱配置顺序，并交替 GL 4.4/4.5 的先后；预热后计量完整完成的 GPU 帧。单目标组保留原 GL 场景，分别用 `vulkanforge.gl46.noGpuDriven`、`noIndirectCount`、`glsl` 做单项 A/B。`noGpuDriven` 仅把视锥与 compact 命令生成改为 CPU，MDI、Indirect Count 与 SPIR-V 保持独立；`noIndirectCount` 保留 GPU 命令生成，改为读回计数后普通 MDI；`glsl` 仅替换 shader 格式。正常游戏默认全部保持原路径。
+
+MATCH 组从同一份场景导出可见清单，统一 1920×1080、相机、纹理、光照、两帧目标、独立透明目标、两次 D32 深度复制、不透明背面剔除关闭与透明背面剔除开启；禁用 Hi-Z 和原版遮挡。预热后逐 Section ID / 不透明及透明四边形数核对真实提交清单，错误即终止。Vulkan 仍含 GL/VK 共享交接，顶点存储/索引形式也不同，因此结果描述当前实现，不能作为纯 API 效率或完整 Minecraft FPS。报告与每轮参数、绘制清单、NVIDIA 采样位于 `build/reports/controlled-comparison/`。检测到其他 Java GPU 基准时会等待；测量期间发生并发则丢弃并重测。`--resume` 可继续已完成的轮次。
+
+原版 GL 地形基线：准备上述运行参数后，执行 `python tools/benchmark-vanilla-comparison.py --java 'C:\path\to\jdk17\bin\java.exe'`。它直接使用 Minecraft 的 `ShaderInstance`、原版 `rendertype_solid/translucent` GLSL、`BufferBuilder` 与 `VertexBuffer`，复用 `LevelRenderer.renderChunkLayer` 的逐 Section 绘制顺序；原版资源的 include 在初始化时展开，以便独立运行。与自定义 GL 4.6 交替五轮，统一可见清单及单 FBO，并在计时外比较图像。报告位于 `build/reports/vanilla-comparison/`。这是原版地形绘制路径的离屏基线，不包含完整游戏世界和主循环；原版与自定义路径的 Alpha 混合配置保留原样，RGB 图像差值单独验证。
+
 ## 半透明地形（P6 第一步）
 
 `WorldCapture` 现在同时采集流体：水方块的 `RenderShape` 不是 `MODEL`，此前完全没有被采集，而 P4 跳过原版 solid 层后，覆盖范围内的岩浆会缺失。流体按 `ItemBlockRenderTypes.getRenderLayer(FluidState)` 分层：岩浆进入不透明网格，水与 `translucent` 层方块（染色玻璃、冰、史莱姆块、蜂蜜块等）进入 `Mesh.translucent`。

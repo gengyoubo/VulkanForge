@@ -29,11 +29,15 @@ public final class OffscreenBenchmark {
         MainWindowBackend backend = new MainWindowBackend(output.resolve("report.txt").toString(), GlInterop.deviceUUID(), GlInterop::importImage, org.lwjgl.opengl.GL11::glFinish);
         Consumer<Object[]> local = backend.worldCommands(GlInterop::importTerrain);
         Consumer<WorldProtocol.Command> send = command -> local.accept(WorldProtocol.pack(command));
-        System.out.println("OFFSCREEN_SCENE " + BenchmarkScene.load(send, width, height));
+        String sceneFile = System.getProperty("bench.scene");
+        if (sceneFile == null) System.out.println("OFFSCREEN_SCENE " + BenchmarkScene.load(send, width, height));
+        else dev.vulkanforge.bench.Workload.load(Path.of(sceneFile), send);
 
         var probe = new BenchmarkScene.Probe(backend);
         float yaw = 0;
         for (int i = 0; i < warmup; i++) { if (spin != 0) send.accept(BenchmarkScene.camera(yaw += spin, width, height)); frame(backend, width, height); }
+        probe.drain();
+        if (Boolean.getBoolean("bench.audit")) BenchmarkDrawAudit.write(backend, output.resolve("workload.txt"));
         int runs = Integer.getInteger("bench.runs", 1);
         double minimumSeconds = Double.parseDouble(System.getProperty("bench.seconds", "0"));
         for (int run = 1; run <= runs; run++) {

@@ -19,7 +19,8 @@ import static org.lwjgl.vulkan.VK13.*;
  * ~4 ms per-frame presentation cost exists without anything VulkanForge adds on top.
  * Per frame: fence wait, acquire, record+submit and vkQueuePresentKHR times (mean/p50/p99/max); present-to-present interval;
  * per image, the time from its present returning to the acquire that hands it back (image availability).
- * -Dbench.timerResolutionUs=N (see TimerResolution), -Dbench.frames, -Dbench.width/height, -Dbench.fullscreen, -Dbench.cpuMs (spin before acquire), -Dbench.inFlight=N (2),
+ * -Dbench.timerResolutionUs=N (see TimerResolution), -Dbench.frames, -Dbench.width/height, -Dbench.fullscreen, -Dbench.cpuMs (wait between present and the next acquire),
+ * -Dbench.cpuWait=spin (default, busy loop) | sleep (Thread.sleep(millis, nanos)) | park (LockSupport.parkNanos): how that wait is done, -Dbench.inFlight=N (2),
  * -Dvulkanforge.presentMode=immediate|mailbox|fifo (immediate), -Dvulkanforge.swapchainImages=N (min+1).
  * FPS counts completed frames only: the queue is idle at both ends of the timed window.
  * -Dbench.acquire=blocking (default, 5 s timeout) | zero (one timeout-0 call; on VK_NOT_READY fall back to blocking) | spin (repeat
@@ -38,6 +39,8 @@ final class SwapchainBenchmark {
         if (!java.util.List.of("blocking", "zero", "spin").contains(acquireMode)) throw new IllegalArgumentException("bench.acquire=" + acquireMode);
         boolean fullscreen = Boolean.getBoolean("bench.fullscreen");
         double cpuMs = Double.parseDouble(System.getProperty("bench.cpuMs", "0"));
+        String cpuWait = System.getProperty("bench.cpuWait", "spin").toLowerCase();
+        if (!java.util.List.of("spin", "sleep", "park").contains(cpuWait)) throw new IllegalArgumentException("bench.cpuWait=" + cpuWait);
         org.lwjgl.system.Configuration.STACK_SIZE.set(1024);
         TimerResolution.configure();
         if (!glfwInit()) throw new AssertionError("GLFW init failed");
@@ -103,7 +106,7 @@ final class SwapchainBenchmark {
             int total = WARMUP + frames;
             long[] fenceWait = new long[frames], acquire = new long[frames], submit = new long[frames], present = new long[frames], interval = new long[frames];
             long[] availability = new long[frames]; int availableSamples = 0;
-            long[] firstCall = new long[frames], acquireCalls = new long[frames];
+            long[] firstCall = new long[frames], acquireCalls = new long[frames], preWait = new long[frames];
             java.util.Map<String, Integer> firstResults = new java.util.TreeMap<>();
             long[] presentedAt = new long[swapImages.length]; int[] uses = new int[swapImages.length];
             String timelinePath = System.getProperty("bench.timeline");
@@ -123,7 +126,13 @@ final class SwapchainBenchmark {
                     if (glfwGetWindowAttrib(window, GLFW_ICONIFIED) != 0) { glfwRestoreWindow(window); glfwFocusWindow(window); }
                     glfwPollEvents();
                     // Stand-in for the game's CPU frame before it needs the next image.
-                    for (long until = System.nanoTime() + (long) (cpuMs * 1e6); System.nanoTime() < until; ) Thread.onSpinWait();
+                    long waitStart = System.nanoTime(), waitNanos = (long) (cpuMs * 1e6);
+                    if (waitNanos > 0) switch (cpuWait) {
+                        case "sleep" -> { try { Thread.sleep(waitNanos / 1_000_000, (int) (waitNanos % 1_000_000)); } catch (InterruptedException e) { throw new IllegalStateException(e); } }
+                        case "park" -> java.util.concurrent.locks.LockSupport.parkNanos(waitNanos);
+                        default -> { for (long until = waitStart + waitNanos; System.nanoTime() < until; ) Thread.onSpinWait(); }
+                    }
+                    if (at >= 0) preWait[at] = System.nanoTime() - waitStart;
                     long t0 = System.nanoTime();
                     if (clock != null && at >= 0) timeline[at * TIMELINE_COLUMNS.length] = clock.now();
                     check(vkWaitForFences(context.device, fences[slot], true, 5_000_000_000L), "wait slot");
@@ -187,8 +196,8 @@ final class SwapchainBenchmark {
             check(vkQueueWaitIdle(context.queue), "idle after timing");
             double seconds = (System.nanoTime() - start) / 1e9;
             timers.collectAll();
-            System.out.printf("SWAPCHAIN_BENCH %s %s images=%d inFlight=%d cpuMs=%s frames=%d fps=%.1f frameMs=%.3f%n", fullscreen ? "fullscreen" : "windowed",
-                    modeName(mode), swapImages.length, inFlight, cpuMs, frames, frames / seconds, seconds * 1000 / frames);
+            System.out.printf("SWAPCHAIN_BENCH %s %s images=%d inFlight=%d cpuMs=%s cpuWait=%s frames=%d fps=%.1f frameMs=%.3f %s%n", fullscreen ? "fullscreen" : "windowed",
+                    modeName(mode), swapImages.length, inFlight, cpuMs, cpuWait, frames, frames / seconds, seconds * 1000 / frames, stats("actualWait", preWait, frames));
             System.out.println("SWAPCHAIN_BENCH_MS " + stats("fenceWait", fenceWait, frames) + " " + stats("acquire", acquire, frames) + " "
                     + stats("recordSubmit", submit, frames) + " " + stats("queuePresent", present, frames));
             System.out.println("SWAPCHAIN_BENCH_PACING " + stats("presentInterval", Arrays.copyOfRange(interval, 1, frames), frames - 1) + " "

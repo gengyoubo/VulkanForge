@@ -14,6 +14,11 @@ import static org.lwjgl.opengl.GL43C.*;
 
 /** Completed-frame throughput over the same terrain/atlas/camera as the Vulkan offscreen benchmark. */
 public final class GlOffscreenBenchmark {
+    private static final boolean MATCHED = Boolean.getBoolean("bench.matchVulkanTargets");
+    private static final int[] opaqueTargets=new int[2], translucentTargets=new int[2], opaqueDepth=new int[2], translucentDepth=new int[2], sceneDepth=new int[2];
+    private static final int[] opaqueColors=new int[2], translucentColors=new int[2];
+    private static final long[] frameFences=new long[2];
+    private static int targetWidth,targetHeight,targetFrame;
     public static void main(String[] args) throws Exception {
         Locale.setDefault(Locale.ROOT);
         int width = Integer.getInteger("bench.width", 1920), height = Integer.getInteger("bench.height", 1080);
@@ -21,7 +26,7 @@ public final class GlOffscreenBenchmark {
         int runs = Integer.getInteger("bench.runs", 3);
         double minimumSeconds = Double.parseDouble(System.getProperty("bench.seconds", "6"));
         String api = args[0];
-        Path directory = Path.of("build/reports/offscreen-performance/gl-" + api).toAbsolutePath(); Files.createDirectories(directory);
+        Path directory = Path.of(System.getProperty("bench.output", "build/reports/offscreen-performance/gl-" + api)).toAbsolutePath(); Files.createDirectories(directory);
         System.setProperty("vulkanforge.offscreenReportDir", directory.toString());
         // Vulkan's benchmark has frustum culling, but no Hi-Z or vanilla occlusion graph.
         System.setProperty("vulkanforge.gl46.noHiZ", "true");
@@ -46,6 +51,7 @@ public final class GlOffscreenBenchmark {
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, depth, 0);
             if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) throw new AssertionError("Incomplete FBO");
             glViewport(0, 0, width, height);
+            if (MATCHED) matchedTargets(width,height);
             int atlas = 0, light = 0, sections = 0; long vertices = 0, translucentVertices = 0;
             RenderSystem.setShaderFogStart(1e8f); RenderSystem.setShaderFogEnd(2e8f);
             try (Gl46Terrain terrain = new Gl46Terrain(); DataInputStream in = new DataInputStream(new BufferedInputStream(Files.newInputStream(Path.of(args[1]))))) {
@@ -62,10 +68,12 @@ public final class GlOffscreenBenchmark {
                 report.add("SCENE sections=" + sections + " opaqueVertices=" + vertices + " translucentVertices=" + translucentVertices);
                 for (int i = 0; i < warmup; i++) frame(terrain, atlas, light);
                 glFinish();
+                if (Boolean.getBoolean("bench.audit")) dev.vulkanforge.bench.Workload.audit(directory.resolve("workload.txt"),terrain.auditOpaqueDraws(),terrain.auditTranslucentDraws());
                 // Verify actual geometry before measurement, with no pixel readback inside the timed loops.
                 ByteBuffer pixels = MemoryUtil.memAlloc(width * height * 4);
                 try {
                     glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+                    if (Boolean.getBoolean("bench.capture")) { byte[] rgba=new byte[pixels.capacity()];pixels.get(0,rgba);Files.write(directory.resolve("preview.rgba"),rgba); }
                     int geometry = 0; for (int i = 3; i < pixels.capacity(); i += 4) if ((pixels.get(i) & 255) > 0) geometry++;
                     if (geometry < width * height / 100) throw new AssertionError("Blank benchmark scene");
                     report.add("GEOMETRY_PIXELS=" + geometry);
@@ -89,6 +97,12 @@ public final class GlOffscreenBenchmark {
                 glDeleteQueries(queries);
             }
             glDeleteTextures(atlas); glDeleteTextures(light); glDeleteTextures(color); glDeleteTextures(depth); glDeleteFramebuffers(target);
+            if (MATCHED) for(int i=0;i<2;i++) {
+                if(frameFences[i]!=0) glDeleteSync(frameFences[i]);
+                glDeleteFramebuffers(opaqueTargets[i]); glDeleteFramebuffers(translucentTargets[i]);
+                glDeleteTextures(opaqueDepth[i]); glDeleteTextures(translucentDepth[i]); glDeleteTextures(sceneDepth[i]);
+                glDeleteTextures(opaqueColors[i]); glDeleteTextures(translucentColors[i]);
+            }
             if (glGetError() != GL_NO_ERROR) throw new AssertionError("OpenGL benchmark error");
             report.add("STATUS=OK");
         } finally {
@@ -97,8 +111,39 @@ public final class GlOffscreenBenchmark {
         }
     }
     private static void frame(Gl46Terrain terrain, int atlas, int light) {
+        int slot=targetFrame++%2;
+        if(MATCHED) {
+            if(frameFences[slot]!=0) {
+                int state;
+                do { state=glClientWaitSync(frameFences[slot],GL_SYNC_FLUSH_COMMANDS_BIT,1_000_000_000L); if(state==GL_WAIT_FAILED) throw new AssertionError("Fence wait failed"); } while(state==GL_TIMEOUT_EXPIRED);
+                glDeleteSync(frameFences[slot]);
+            }
+            glBindFramebuffer(GL_FRAMEBUFFER,opaqueTargets[slot]);
+        }
         glDepthMask(true); glClearColor(.5f, .7f, 1, 0); glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        if (!terrain.drawOpaque(atlas, light)) throw new AssertionError("Terrain not ready"); terrain.drawTranslucent(atlas, light);
+        if (!terrain.drawOpaque(atlas, light)) throw new AssertionError("Terrain not ready");
+        if(MATCHED) {
+            glCopyImageSubData(opaqueDepth[slot],GL_TEXTURE_2D,0,0,0,0,translucentDepth[slot],GL_TEXTURE_2D,0,0,0,0,targetWidth,targetHeight,1);
+            glCopyImageSubData(opaqueDepth[slot],GL_TEXTURE_2D,0,0,0,0,sceneDepth[slot],GL_TEXTURE_2D,0,0,0,0,targetWidth,targetHeight,1);
+            glBindFramebuffer(GL_FRAMEBUFFER,translucentTargets[slot]); glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
+        }
+        terrain.drawTranslucent(atlas, light);
+        if(MATCHED) { frameFences[slot]=glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE,0); glBindFramebuffer(GL_FRAMEBUFFER,opaqueTargets[slot]); }
+    }
+    private static void matchedTargets(int width,int height) {
+        targetWidth=width;targetHeight=height;
+        for(int i=0;i<2;i++) {
+            opaqueDepth[i]=texture(width,height,GL_DEPTH_COMPONENT32F);translucentDepth[i]=texture(width,height,GL_DEPTH_COMPONENT32F);sceneDepth[i]=texture(width,height,GL_DEPTH_COMPONENT32F);
+            opaqueColors[i]=texture(width,height,GL_RGBA8);translucentColors[i]=texture(width,height,GL_RGBA8);
+            opaqueTargets[i]=target(opaqueColors[i],opaqueDepth[i]);
+            translucentTargets[i]=target(translucentColors[i],translucentDepth[i]);
+        }
+    }
+    private static int target(int color,int depth) {
+        int fbo=glGenFramebuffers();glBindFramebuffer(GL_FRAMEBUFFER,fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,color,0);glFramebufferTexture2D(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_TEXTURE_2D,depth,0);
+        if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE) throw new AssertionError("Incomplete matched FBO");
+        return fbo;
     }
     private static int texture(int width, int height, int format) {
         int id = glGenTextures(); glBindTexture(GL_TEXTURE_2D, id); glTexStorage2D(GL_TEXTURE_2D, 1, format, width, height);
