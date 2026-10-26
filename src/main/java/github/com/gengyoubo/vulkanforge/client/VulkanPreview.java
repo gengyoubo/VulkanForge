@@ -85,7 +85,14 @@ final class VulkanPreview {
         glDrawn = false;
         if (captureEvent == null || Minecraft.getInstance().level == null) return;
         try {
+            long updateStart = System.nanoTime();
             WORLD.update(captureEvent, sink);
+            UPDATE_TIMER.sample(Math.max(1, System.nanoTime() - updateStart));
+            // Draw exactly what vanilla's occlusion graph keeps this frame (plus frustum and Hi-Z on top).
+            boolean known = !Boolean.getBoolean("vulkanforge.gl46.noVanillaVisibility") && VanillaVisibility.available();
+            gl.beginVisibility(known);
+            if (known) VanillaVisibility.forEach(Minecraft.getInstance().levelRenderer, gl::markVisible);
+            gl.view(captureEvent.getCamera().getYRot(), captureEvent.getCamera().getXRot(), captureEvent.getProjectionMatrix());
             int[] textures = glTextures();
             glDrawn = gl.drawOpaque(textures[0], textures[1]) && gl.epoch() == WORLD.epoch();
             if (glDrawn) { uploadedEpoch = WORLD.epoch(); uploaded = gl.frames(); }
@@ -97,6 +104,14 @@ final class VulkanPreview {
         mc.gameRenderer.lightTexture().turnOnLightLayer();
         return new int[]{mc.getTextureManager().getTexture(net.minecraft.world.inventory.InventoryMenu.BLOCK_ATLAS).getId(), RenderSystem.getShaderTexture(2)};
     }
+    /** BlockEntityMeshes hook; failures disable the entity pass like capture failures. */
+    static boolean gl46BlockEntity(net.minecraft.client.renderer.blockentity.BlockEntityRenderer<?> renderer, net.minecraft.world.level.block.entity.BlockEntity entity,
+                                   float partial, com.mojang.blaze3d.vertex.PoseStack pose, int light, int overlay) {
+        if (glEntities == null) return false;
+        try { return glEntities.blockEntity(renderer, entity, partial, pose, light, overlay); }
+        catch (RuntimeException error) { glEntitiesFailed(error); return false; }
+    }
+    static long[] gl46BlockEntityStats() { return glEntities != null ? glEntities.blockEntityStats() : new long[7]; }
     /** EntityDraws hook; an entity-pass failure only disables that pass. */
     static boolean gl46Entity(com.mojang.blaze3d.vertex.BufferBuilder.RenderedBuffer rendered) {
         if (glEntities == null) return false;
@@ -127,6 +142,11 @@ final class VulkanPreview {
         if (gl != null) {
             if (preparingAllowed && !prepared) glOpaque();
             prepared = false; preparingAllowed = false;
+            if (glDrawn) {
+                var target = Minecraft.getInstance().getMainRenderTarget();
+                try { gl.buildHiZ(target.getDepthTextureId(), target.width, target.height); }
+                catch (RuntimeException error) { glFailed(error); return; }
+            }
             // Entities and block entities follow; only frames whose terrain ran on GL 4.6 replay them there.
             if (glDrawn && glEntities != null) glEntities.begin();
             return;
@@ -189,7 +209,15 @@ final class VulkanPreview {
     /** ViewportEvent.ComputeFogColor: LevelRenderer is about to clear and draw the sky. */
     static void skyBegin() { if (enabled && direct) EntityDraws.openSky(); }
     /** AFTER_SKY: captured sky waits for this frame's terrain submit. */
-    static void skyEnd(net.minecraftforge.client.event.RenderLevelStageEvent event) { EntityDraws.closeSky();captureEvent=event;prepared=false;preparingAllowed=true; }
+    static void skyEnd(net.minecraftforge.client.event.RenderLevelStageEvent event) {
+        EntityDraws.closeSky();captureEvent=event;prepared=false;preparingAllowed=true;
+        long now = System.nanoTime();
+        if (lastSky != 0 && enabled && gl != null) FRAME_TIMER.sample(now - lastSky);
+        lastSky = now;
+    }
+    /** GL 4.6 diagnostics: interval between consecutive frames' AFTER_SKY (whole frame), and WorldCapture.update CPU. */
+    static final Gl46Timer FRAME_TIMER = new Gl46Timer(), UPDATE_TIMER = new Gl46Timer();
+    private static long lastSky;
     static void prepareTerrain(){
         if (gl != null) { if (enabled && preparingAllowed && !prepared) { prepared = true; glOpaque(); } return; }
         if(!preparingAllowed||prepared||!nativeTerrain()||sink==null||captureEvent==null||!NativeMainWindow.worldVisible())return;
@@ -242,7 +270,7 @@ final class VulkanPreview {
     static long translucentComposites() { return translucentComposites; }
     static long translucentQuads() { return WORLD.translucentQuads(); }
     static long translucentMeshes() { return WORLD.translucentMeshes(); }
-    static void invalidateWorld() { WORLD.invalidate(); }
+    static void invalidateWorld() { WORLD.invalidate(); if (glEntities != null) glEntities.invalidateBlockEntities(); }
     static void markDirty(int x, int y, int z) { if (enabled) WORLD.markDirty(x, y, z); }
     static void toggleInset() { inset = !inset; }
     static long worldEpoch() { return uploadedEpoch == WORLD.epoch() ? uploadedEpoch : 0; }
@@ -270,6 +298,8 @@ final class VulkanPreview {
         return "terrainOpaque{" + (gl != null ? gl.opaqueTimer : "-") + "} terrainTranslucent{" + (gl != null ? gl.translucentTimer : "-")
                 + "} entityCapture{" + (glEntities != null ? glEntities.captureTimer : "-") + "} entityFlush{" + (glEntities != null ? glEntities.flushTimer : "-") + "}";
     }
+    static long[] gl46CullStats() { return gl != null ? gl.cullStats() : new long[9]; }
+    static long[] gl46GrowStats() { return gl != null ? gl.growStats() : new long[3]; }
     static long[] gl46SortStats() { return gl != null ? gl.sortStats() : new long[4]; }
     static long[] gl46Phases() { return gl != null ? gl.phases() : new long[5]; }
     static long[] gl46EntityPhases() { return glEntities != null ? glEntities.phases() : new long[4]; }

@@ -26,6 +26,11 @@ public final class TerrainMeshes {
     private static final BufferBuilder fallbackBuilder=new BufferBuilder(262144);
     private static long skippedGlUploads,restoredGlUploads,skippedGlBytes;
     private static final Map<ChunkRenderDispatcher.RenderChunk, Snapshot> ready = new ConcurrentHashMap<>();
+    /** The same snapshots by section key, plus every key whose snapshot changed, for incremental consumers. */
+    private static final Map<Long, Snapshot> byKey = new ConcurrentHashMap<>();
+    private static final java.util.concurrent.ConcurrentLinkedQueue<Long> changed = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    /** Bumped when the whole set is replaced (ViewArea created or released): consumers rescan. */
+    private static volatile long generation;
     private static volatile Set<ChunkRenderDispatcher.RenderChunk> members = Set.of();
     private static ClientLevel level;
     private static ViewArea currentArea;
@@ -40,19 +45,19 @@ public final class TerrainMeshes {
 
     /** ViewArea constructor: the cache follows the actual render distance and the dimension's complete vertical range. */
     public static synchronized void area(ViewArea area) {
-        uploads.clear(); deferred.clear(); ready.clear(); bytes = 0;
+        uploads.clear(); deferred.clear(); ready.clear(); byKey.clear(); changed.clear(); generation++; bytes = 0;
         level = Minecraft.getInstance().level;
         currentArea = area;
         members = Set.copyOf(Arrays.asList(area.chunks));
     }
     public static synchronized void released(ViewArea area) {
         if (currentArea != area) return;
-        uploads.clear(); deferred.clear(); ready.clear(); bytes = 0; members = Set.of(); level = null; currentArea = null;
+        uploads.clear(); deferred.clear(); ready.clear(); byKey.clear(); changed.clear(); generation++; bytes = 0; members = Set.of(); level = null; currentArea = null;
     }
 
     /** RenderChunk.setOrigin/releaseBuffers: pooled chunk objects must never carry geometry to a different section. */
     public static void moved(ChunkRenderDispatcher.RenderChunk chunk) {
-        ready.remove(chunk);
+        forget(ready.remove(chunk));
         for (RenderType type : LAYERS) {
             deferred.remove(chunk.getBuffer(type));
             byte[] old = uploads.remove(chunk.getBuffer(type));
@@ -112,11 +117,22 @@ public final class TerrainMeshes {
             else {
                 // Nonempty rebuilds finish on the render thread after their last upload. Empty builds may finish on a worker.
                 layers[i] = RenderSystem.isOnRenderThread() ? uploads.get(chunk.getBuffer(LAYERS[i])) : null;
-                if (layers[i] == null) { ready.remove(chunk); missed++; return; }
+                if (layers[i] == null) { forget(ready.remove(chunk)); missed++; return; }
             }
         }
-        ready.put(chunk, new Snapshot(chunk, compiled, chunk.getOrigin().immutable(), layers)); commits++;
+        Snapshot snapshot = new Snapshot(chunk, compiled, chunk.getOrigin().immutable(), layers);
+        forget(ready.put(chunk, snapshot));
+        byKey.put(snapshot.key(), snapshot); changed.add(snapshot.key()); commits++;
     }
+    private static void forget(Snapshot old) {
+        if (old == null) return;
+        byKey.remove(old.key(), old); changed.add(old.key());
+    }
+    /** Current snapshot of a section, or null. */
+    static Snapshot snapshot(long key) { return byKey.get(key); }
+    /** Next changed key since the last call, or null. */
+    static Long nextChange() { return changed.poll(); }
+    static long generation() { return generation; }
 
     static Collection<Snapshot> snapshots(ClientLevel expected) { return level == expected ? ready.values() : List.of(); }
     static boolean available(ClientLevel expected) { return level == expected && !members.isEmpty(); }

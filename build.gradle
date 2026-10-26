@@ -38,11 +38,14 @@ minecraft {
                 property 'vulkanforge.worldSmoke', 'true'
                 mods { vulkanforge { source sourceSets.smoke } }
             }
-            if (project.hasProperty('gl46Smoke')) {
-                property 'vulkanforge.gl46Smoke', 'true'
+            if (project.hasProperty('gl46Smoke') || project.hasProperty('gl46Move')) {
+                // -Pgl46Smoke: feature/parity check in a flat world; -Pgl46Move: fast flight through a generated world.
+                property(project.hasProperty('gl46Move') ? 'vulkanforge.gl46Move' : 'vulkanforge.gl46Smoke', 'true')
                 property 'vulkanforge.startup', 'OPENGL:GL_4_6'
                 // -Pgl46Verify: compare every cached GL state snapshot with glGet (correctness run; timings are not representative).
                 if (project.hasProperty('gl46Verify')) property 'vulkanforge.gl46.verifyState', 'true'
+                // -Pgl46Flags=glsl,noHiZ,noBlockEntityCache,noVanillaVisibility,noEntities: A/B switches (vulkanforge.gl46.<flag>=true).
+                if (project.hasProperty('gl46Flags')) project.property('gl46Flags').toString().split(',').each { if (it.trim()) property "vulkanforge.gl46.${it.trim()}", 'true' }
                 mods { vulkanforge { source sourceSets.smoke } }
             }
         }
@@ -72,17 +75,18 @@ tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
 tasks.register('runProbe') { dependsOn ':vulkan-lab:runProbe' }
 tasks.register('runTriangle') { dependsOn ':vulkan-lab:runTriangle' }
 
-if (project.hasProperty('gl46Smoke')) {
+if (project.hasProperty('gl46Smoke') || project.hasProperty('gl46Move')) {
+    def gl46Report = project.hasProperty('gl46Move') ? 'run/logs/vulkanforge/gl46-move/report.txt' : 'run/logs/vulkanforge/gl46-smoke/report.txt'
     tasks.matching { it.name == 'runClient' }.configureEach {
         doFirst {
-            def report = file('run/logs/vulkanforge/gl46-smoke/report.txt')
+            def report = file(gl46Report)
             report.parentFile.mkdirs()
             report.text = 'STATUS=RUNNING\n'
         }
         doLast {
-            def report = file('run/logs/vulkanforge/gl46-smoke/report.txt')
+            def report = file(gl46Report)
             if (!report.exists() || !report.text.contains('STATUS=OK') || report.text.contains('EXIT_TIMEOUT')) {
-                throw new GradleException('GL 4.6 smoke did not finish successfully; see run/logs/vulkanforge/gl46-smoke/report.txt')
+                throw new GradleException('GL 4.6 smoke did not finish successfully; see ' + gl46Report)
             }
         }
     }

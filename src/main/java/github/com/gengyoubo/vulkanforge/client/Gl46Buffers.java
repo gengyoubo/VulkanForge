@@ -167,6 +167,13 @@ final class Gl46Buffers {
             return null;
         }
         private void grow(int needed) {
+            long start = System.nanoTime();
+            try { resize(needed); } finally { long spent = System.nanoTime() - start; growNanos += spent; maxGrowNanos = Math.max(maxGrowNanos, spent); }
+        }
+        private long growNanos, maxGrowNanos;
+        /** {grows, total ns, worst ns}: CPU time of creating the larger buffer and queuing the GPU copy. */
+        long[] growStats() { return new long[]{grows, growNanos, maxGrowNanos}; }
+        private void resize(int needed) {
             long next = Math.max(capacity, 1);
             while (next - capacity < needed) next *= 2;
             if (next * unit > limitBytes) throw new IllegalStateException(name + " arena exceeds " + (limitBytes >> 20) + " MiB");

@@ -20,7 +20,8 @@ import static org.lwjgl.opengl.GL46C.*;
  * baseInstance indexes its record. Anything else flushes the pending draws first and is then drawn by vanilla.
  */
 final class Gl46Entities implements AutoCloseable {
-    private static final int STRIDE = 36, RECORD = 256, COMMAND = 20;
+    private static final int STRIDE = 36, COMMAND = 20;
+    static final int RECORD = 256;
     /** Fragment variant per vanilla shader (entity.frag); all use DefaultVertexFormat.NEW_ENTITY. */
     private static final Map<String, Integer> VARIANTS = Map.of(
             "rendertype_entity_cutout", 0, "rendertype_entity_cutout_no_cull", 0, "rendertype_entity_cutout_no_cull_z_offset", 0,
@@ -29,7 +30,7 @@ final class Gl46Entities implements AutoCloseable {
             "rendertype_entity_shadow", 4);
 
     /** Everything a run of draws must share: raw GL state plus the three sampler textures. */
-    private record Key(boolean blend, int srcRGB, int dstRGB, int srcAlpha, int dstAlpha, boolean depthTest, int depthFunc,
+    record Key(boolean blend, int srcRGB, int dstRGB, int srcAlpha, int dstAlpha, boolean depthTest, int depthFunc,
                        boolean depthMask, boolean cull, int texture, int overlay, int lightmap) { }
     /** quads: sequential QUADS drawn through the static quad index buffer; otherwise indices live in the index ring. */
     private record Draw(Key key, boolean quads, int record, int indices, int firstIndex, int baseVertex) { }
@@ -38,6 +39,8 @@ final class Gl46Entities implements AutoCloseable {
 
     private static Gl46Entities current;
     private Gl46Programs.Program program;
+    /** Cached block-entity meshes; null when they could not be set up (block entities then stay on the capture path). */
+    private Gl46BlockEntities blockEntities;
     private Gl46Buffers.Ring vertices, indices, records, commands;
     private int listVao, quadVao, quadIndices;
     private final List<Draw> pending = new ArrayList<>();
@@ -59,6 +62,10 @@ final class Gl46Entities implements AutoCloseable {
             glVertexArrayElementBuffer(listVao, indices.buffer);
             glVertexArrayElementBuffer(quadVao, quadIndices);
             Gl46Context.report("ENTITY_INIT shaders=" + (program.spirv() ? "SPIRV" : "GLSL"));
+            if (!Boolean.getBoolean("vulkanforge.gl46.noBlockEntityCache")) {
+                try { blockEntities = new Gl46BlockEntities(this, quadIndices); }
+                catch (RuntimeException error) { Gl46Context.report("BLOCK_ENTITY_UNAVAILABLE=" + error); }
+            }
         } catch (Throwable error) { close(); throw error; }
         current = this;
     }
@@ -96,6 +103,21 @@ final class Gl46Entities implements AutoCloseable {
             pass.split();
             return false;
         } finally { long spent = System.nanoTime() - start; pass.captureNanos += spent; pass.captureTimer.add(spent); }
+    }
+
+    /** BlockEntityMeshes hook: true when a cached mesh instance replaced the renderer call. */
+    boolean blockEntity(net.minecraft.client.renderer.blockentity.BlockEntityRenderer<?> renderer, net.minecraft.world.level.block.entity.BlockEntity entity,
+                        float partial, com.mojang.blaze3d.vertex.PoseStack pose, int light, int overlay) {
+        return open && blockEntities != null && RenderSystem.isOnRenderThread() && blockEntities.render(renderer, entity, partial, pose, light, overlay);
+    }
+    void invalidateBlockEntities() { if (blockEntities != null) blockEntities.invalidate(); }
+    long[] blockEntityStats() { return blockEntities != null ? blockEntities.stats() : new long[7]; }
+    static Integer variant(ShaderInstance shader) { return VARIANTS.get(shader.getName()); }
+    /** A record for {@code shader} with the current RenderSystem state; byte offset in the records ring, or -1. */
+    int record(ShaderInstance shader, int variant) {
+        int offset = allocate(records, RECORD, RECORD);
+        if (offset >= 0) writeRecord(shader, offset, variant);
+        return offset;
     }
 
     /** After this frame's GL 4.6 opaque terrain: entities and block entities come next. */
@@ -206,7 +228,7 @@ final class Gl46Entities implements AutoCloseable {
     }
 
     /** Null when GL 4.6 cannot reproduce the state exactly (offset, scissor, logic op, partial color mask, odd blend/cull). */
-    private static Key key() {
+    static Key key() {
         GlStateCache.Snapshot state = GlStateCache.snapshot();
         if (state.polygonOffset() || state.scissor() || state.colorLogic() || !state.colorMaskAll()) return null;
         // Neither is cached by vanilla, and vanilla never changes them for these shaders (blend "add", back faces, CCW).
@@ -228,16 +250,17 @@ final class Gl46Entities implements AutoCloseable {
     private void split() { if (!pending.isEmpty()) { splits++; flush(); } }
 
     private void flush() {
-        if (pending.isEmpty()) return;
+        if (pending.isEmpty() && (blockEntities == null || blockEntities.pendingCommands() == 0)) return;
         long start = System.nanoTime();
         try { submit(); } finally { long spent = System.nanoTime() - start; flushNanos += spent; flushTimer.add(spent); }
     }
 
     private void submit() {
         List<Draw> ordered = order();
-        int offset = commands.allocate(ordered.size() * COMMAND, 4);
-        if (offset < 0) { commands.submit(); offset = commands.allocate(ordered.size() * COMMAND, 4); }
-        if (offset < 0) throw new IllegalStateException("Entity command ring too small for " + ordered.size() + " draws");
+        int instanced = blockEntities == null ? 0 : blockEntities.pendingCommands(), total = ordered.size() + instanced;
+        int offset = commands.allocate(total * COMMAND, 4);
+        if (offset < 0) { commands.submit(); offset = commands.allocate(total * COMMAND, 4); }
+        if (offset < 0) throw new IllegalStateException("Entity command ring too small for " + total + " draws");
         ByteBuffer out = commands.mapped;
         for (int i = 0; i < ordered.size(); i++) {
             // baseInstance carries the record index, so records need not be contiguous and the SSBO is bound once.
@@ -248,9 +271,11 @@ final class Gl46Entities implements AutoCloseable {
         Gl46State saved = new Gl46State();
         long t1 = System.nanoTime();
         try {
-            glUseProgram(program.id());
             glBindBuffer(GL_DRAW_INDIRECT_BUFFER, commands.buffer);
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, records.buffer);
+            // Cached block-entity instances are opaque: drawn first, like the other opaque groups.
+            if (instanced > 0) blockEntities.draw(commands, offset + ordered.size() * COMMAND);
+            glUseProgram(program.id());
             int boundVao = 0;
             Key applied = null;
             for (int start = 0; start < ordered.size(); ) {
@@ -304,7 +329,7 @@ final class Gl46Entities implements AutoCloseable {
     long[] phases() { return phases.clone(); }
 
     /** Only what differs from the previous run ({@code last} null: everything). */
-    private static void apply(Key last, Key key) {
+    static void apply(Key last, Key key) {
         if (last == null || last.blend() != key.blend()) Gl46State.toggle(GL_BLEND, key.blend());
         if (key.blend() && (last == null || last.srcRGB() != key.srcRGB() || last.dstRGB() != key.dstRGB() || last.srcAlpha() != key.srcAlpha() || last.dstAlpha() != key.dstAlpha()))
             glBlendFuncSeparate(key.srcRGB(), key.dstRGB(), key.srcAlpha(), key.dstAlpha());
@@ -325,6 +350,7 @@ final class Gl46Entities implements AutoCloseable {
                 + " rings{fences,waits,waitNanos,oversized} vertices=" + Arrays.toString(vertices.stats()) + " indices=" + Arrays.toString(indices.stats())
                 + " records=" + Arrays.toString(records.stats()) + " commands=" + Arrays.toString(commands.stats()) + " grows=" + grows
                 + " retired=" + retired.stream().map(Arrays::toString).toList() + " captureCpu{" + captureTimer + "} flushCpu{" + flushTimer + "}");
+        if (blockEntities != null) { blockEntities.close(); blockEntities = null; }
         if (program != null) glDeleteProgram(program.id());
         program = null;
         for (AutoCloseable ring : new AutoCloseable[]{vertices, indices, records, commands}) {

@@ -4,12 +4,12 @@ import java.util.Arrays;
 
 /**
  * Per-frame CPU time of one GL 4.6 pass over the last {@link #WINDOW} frames. Driver queue stalls make means noisy, so reports
- * use percentiles. Measures the CPU cost of issuing GL commands, not GPU time.
+ * use percentiles plus the worst frame. Measures the CPU cost of issuing GL commands, not GPU time.
  */
 final class Gl46Timer {
-    private static final int WINDOW = 2048;
+    private static final int WINDOW = 4096;
     private final long[] samples = new long[WINDOW];
-    private long frames, pending;
+    private long frames, pending, worst;
 
     /** Time spent inside this frame so far. */
     void add(long nanos) { pending += nanos; }
@@ -17,14 +17,25 @@ final class Gl46Timer {
     void frame() {
         if (pending == 0) return;
         samples[(int) (frames++ % WINDOW)] = pending;
+        worst = Math.max(worst, pending);
         pending = 0;
     }
-    /** {p50, p95} in microseconds. */
+    /** One whole sample, e.g. a frame interval. */
+    void sample(long nanos) { add(nanos); frame(); }
+    void reset() { frames = pending = worst = 0; }
+    /** {p50, p95, p99, max} in microseconds (max over the timer's lifetime, percentiles over the window). */
     double[] percentiles() {
         int count = (int) Math.min(frames, WINDOW);
-        if (count == 0) return new double[2];
+        if (count == 0) return new double[4];
         long[] sorted = Arrays.copyOf(samples, count); Arrays.sort(sorted);
-        return new double[]{sorted[(count - 1) / 2] / 1e3, sorted[(count - 1) * 95 / 100] / 1e3};
+        return new double[]{sorted[(count - 1) / 2] / 1e3, sorted[(count - 1) * 95 / 100] / 1e3, sorted[(count - 1) * 99 / 100] / 1e3, worst / 1e3};
     }
-    @Override public String toString() { double[] p = percentiles(); return String.format("p50=%.1fus p95=%.1fus", p[0], p[1]); }
+    /** Samples in the window above {@code micros}. */
+    long over(double micros) {
+        int count = (int) Math.min(frames, WINDOW); long result = 0;
+        for (int i = 0; i < count; i++) if (samples[i] > micros * 1e3) result++;
+        return result;
+    }
+    long frames() { return frames; }
+    @Override public String toString() { double[] p = percentiles(); return String.format("p50=%.1fus p95=%.1fus p99=%.1fus max=%.1fus", p[0], p[1], p[2], p[3]); }
 }

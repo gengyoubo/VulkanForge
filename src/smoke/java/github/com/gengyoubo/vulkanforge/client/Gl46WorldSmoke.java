@@ -29,6 +29,7 @@ import java.util.concurrent.TimeUnit;
 public final class Gl46WorldSmoke {
     private static int stage, ticks;
     private static long[] sortsBefore;
+    private static long skippedBefore;
     private static final long START = System.nanoTime();
     private static Path report;
 
@@ -82,6 +83,20 @@ public final class Gl46WorldSmoke {
                 log(String.format("CPU entity capture %.1f us/frame (%.2f us/draw), flush %.1f us/frame (%.2f flushes/frame); terrain opaque %.1f us, translucent %.1f us per frame",
                         entities[5] / 1e3 / frames, entities[5] / 1e3 / Math.max(1, entities[0]), entities[6] / 1e3 / frames, entities[1] / (double) frames,
                         VulkanPreview.gl46Stats()[9] / 1e3 / Math.max(1, stats[0]), VulkanPreview.gl46Stats()[10] / 1e3 / Math.max(1, stats[0])));
+                long[] blockEntities = VulkanPreview.gl46BlockEntityStats(), hook = BlockEntityMeshes.stats();
+                // {cached meshes, recordings, instances drawn, instanced draws, animated, uncacheable, ns per cached call}
+                if (!Boolean.getBoolean("vulkanforge.gl46.noBlockEntityCache"))
+                    require(blockEntities[0] > 0 && blockEntities[2] > 0, "No chest went through the block-entity mesh cache: " + java.util.Arrays.toString(blockEntities));
+                log(String.format("PASS block entities: %s; renderer hook %.2f us per block entity (%d calls)", java.util.Arrays.toString(blockEntities),
+                        hook[1] / 1e3 / Math.max(1, hook[0]), hook[0]));
+                long[] cull = VulkanPreview.gl46CullStats();
+                // {cull frames, tested (vanilla-visible), frustumVisible, occluded, layerDraws, vanillaMarked, hizBuilds, hizFrames, hizSkipped}
+                require(cull[0] > 0 && cull[2] > 0, "Cull counters never came back: " + java.util.Arrays.toString(cull));
+                require(cull[6] > 0 && cull[7] > 0, "Hi-Z was never built or used: " + java.util.Arrays.toString(cull));
+                require(cull[3] > 0, "Hi-Z rejected nothing behind the wall: " + java.util.Arrays.toString(cull));
+                log(String.format("PASS culling per frame: slots=%d vanilla-visible=%.1f frustum=%.1f hi-z occluded=%.1f (%.0f%% of frustum-visible) layer draws=%.1f; hi-z frames=%d skipped=%d",
+                        stats[2], cull[1] / (double) cull[0], cull[2] / (double) cull[0], cull[3] / (double) cull[0], 100.0 * cull[3] / Math.max(1, cull[2]),
+                        cull[4] / (double) cull[0], cull[7], cull[8]));
                 log("CPU per frame " + VulkanPreview.gl46Timers());
                 log("CPU us/frame breakdown: opaque {snapshot, cull, draws, fence, restore}=" + perFrame(VulkanPreview.gl46Phases(), stats[0])
                         + " entity flush {snapshot, draws, restore, fences}=" + perFrame(VulkanPreview.gl46EntityPhases(), frames));
@@ -107,7 +122,16 @@ public final class Gl46WorldSmoke {
                 double x = -20 + ticks * 0.4, z = 11.0 - ticks * 0.15;
                 var server = mc.getSingleplayerServer(); var uuid = mc.player.getUUID();
                 server.execute(() -> { var player = server.getPlayerList().getPlayer(uuid); player.teleportTo(server.overworld(), x, 68.0, z, 180, 18); });
-            } else if (stage == 6) {
+            } else if (stage == 6 && ticks == 101) {
+                // A 180 degree snap: last frame's pyramid must not be trusted for this view.
+                skippedBefore = VulkanPreview.gl46CullStats()[8];
+                var server = mc.getSingleplayerServer(); var uuid = mc.player.getUUID();
+                server.execute(() -> { var player = server.getPlayerList().getPlayer(uuid); player.teleportTo(server.overworld(), 0.5, 68.0, -5.0, 0, 18); });
+                ticks++;
+            } else if (stage == 6 && ++ticks > 112) {
+                require(VulkanPreview.gl46CullStats()[8] > skippedBefore, "Hi-Z was not skipped after a 180 degree turn");
+                log("PASS Hi-Z skipped after the snap turn: " + java.util.Arrays.toString(VulkanPreview.gl46CullStats()));
+                screenshot(mc, "gl46-turned.png");
                 long[] sorts = VulkanPreview.gl46SortStats();
                 require(sorts[0] > sortsBefore[0], "Camera flight did not re-sort any translucent quads");
                 log("PASS translucent sorting during flight: {sortedQuads, insertionSorts, fullSorts, deferredSorts} "
@@ -156,6 +180,12 @@ public final class Gl46WorldSmoke {
             }
             for (int x = -12; x <= 12; x++) level.setBlock(new BlockPos(x, 65, -15), Blocks.CHEST.defaultBlockState(), 3);
             for (int x = -24; x <= 24; x++) for (int y = 65; y <= 67; y++) level.setBlock(new BlockPos(x, y, -18), Blocks.WHITE_STAINED_GLASS.defaultBlockState(), 3);
+            // Hi-Z occluder: a wall from the ground up with one hole in the middle of every section, so vanilla's
+            // occlusion graph still sees each wall section as see-through, while the depth buffer is almost solid.
+            for (int x = -40; x <= 40; x++) for (int y = -60; y <= 90; y++) {
+                boolean hole = Math.floorMod(x, 16) == 8 && Math.floorMod(y, 16) == 8;
+                level.setBlock(new BlockPos(x, y, -30), hole ? Blocks.AIR.defaultBlockState() : Blocks.STONE.defaultBlockState(), 2);
+            }
             var cow =net.minecraft.world.entity.EntityType.COW.spawn(level, new BlockPos(-3, 65, 6), net.minecraft.world.entity.MobSpawnType.COMMAND);
             if (cow != null) { cow.setNoAi(true); cow.setYRot(30); }
             var player = server.getPlayerList().getPlayer(uuid);

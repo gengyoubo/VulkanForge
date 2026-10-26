@@ -24,8 +24,12 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
     /** WorldCapture admits at most MAX_MESH_BYTES of triangle-expanded geometry per layer group, i.e. fewer quads than this. */
     private static final int MAX_QUADS = 1 << 16;
     private static final int SECTION_BYTES = 64, FRAME_BYTES = 144, COMMAND_BYTES = 20, OPAQUE_LAYERS = 3;
+    /** Counts { drawCounts[3]; tested; frustumVisible; occluded }; READBACK_SLOTS frames of copies in flight. */
+    private static final int COUNT_BYTES = 24, OCCLUSION_BYTES = 112, READBACK_SLOTS = 4;
     /** Re-sorted quads per frame, nearest stale sections first (at least one section per frame). */
     private static final int QUAD_BUDGET = 32768;
+    /** CPU time for re-sorting per frame; the nearest stale section is always sorted. */
+    private static final long SORT_NANOS = 400_000;
     /** Camera moves beyond this (blocks) since the last sort use a full sort instead of insertion sort on the previous order. */
     private static final double FULL_SORT_DISTANCE = 8;
     /** Vanilla rendertype_solid / cutout_mipped / cutout discard thresholds; 0 never discards. */
@@ -74,12 +78,28 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
     private final List<Section> drawOrder = new ArrayList<>();
     private long insertionSorts, fullSorts, sortedQuads, deferredSorts;
 
-    private Gl46Programs.Program cull, opaque, translucent;
+    private Gl46Programs.Program cull, opaque, translucent, hiz;
+    /** Vanilla's visible sections for this frame, one bit per slot (all ones when unavailable). */
+    private final int[] visibility = new int[(MAX_SECTIONS + 31) / 32];
+    private boolean visibilityKnown;
+    private long vanillaMarked;
+    /** Previous frame's depth pyramid (R32F, max of 2x2) and the camera it was built with. */
+    private static final boolean HIZ = !Boolean.getBoolean("vulkanforge.gl46.noHiZ");
+    private static final float MAX_TURN_DEGREES = 10, MAX_MOVE_BLOCKS = 2, MAX_PROJECTION_CHANGE = .02f;
+    private int pyramid, pyramidWidth, pyramidHeight, pyramidLevels, readback, readbackFrame;
+    private ByteBuffer readbackMapped;
+    private WorldProtocol.Camera previousCamera;
+    private long previousEpoch;
+    private float yaw, pitch, previousYaw, previousPitch;
+    private final float[] projection = new float[16], previousProjection = new float[16];
+    /** {cull frames, tested, frustumVisible, occluded, layerDraws}; read back a few frames late from countBuffer. */
+    private final long[] culling = new long[5];
+    private long hizBuilds, hizFrames, hizSkipped, hizNanos;
     private Gl46Buffers.Arena vertices, indices;
     private Gl46Buffers.Ring frames, commands;
     private Gl46Buffers.Uploader uploads;
     private int sectionBuffer, drawBuffer, countBuffer, quadIndices, opaqueVao, translucentVao;
-    private int mipSampler, flatSampler, lightSampler, uboAlignment, vaoVertexBuffer, vaoIndexBuffer;
+    private int mipSampler, flatSampler, lightSampler, uboAlignment, ssboAlignment, vaoVertexBuffer, vaoIndexBuffer;
     private final Map<Long, Section> sections = new HashMap<>();
     private final ArrayDeque<Integer> freeSlots = new ArrayDeque<>();
     private int slotCount, peakSections;
@@ -91,6 +111,7 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
     Gl46Terrain() {
         try {
             cull = Gl46Programs.load("cull.comp");
+            if (HIZ) hiz = Gl46Programs.load("hiz.comp");
             opaque = Gl46Programs.load("terrain.vert", "terrain.frag");
             translucent = Gl46Programs.load("terrain.vert", "terrain_translucent.frag");
             vertices = new Gl46Buffers.Arena("vertex", STRIDE, 1 << 18, 256L << 20);
@@ -101,9 +122,14 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
             sectionBuffer = Gl46Buffers.immutable((long) MAX_SECTIONS * SECTION_BYTES, GL_DYNAMIC_STORAGE_BIT);
             glClearNamedBufferData(sectionBuffer, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, (ByteBuffer) null);
             drawBuffer = Gl46Buffers.immutable((long) OPAQUE_LAYERS * MAX_SECTIONS * COMMAND_BYTES, 0);
-            countBuffer = Gl46Buffers.immutable(4 * OPAQUE_LAYERS, GL_DYNAMIC_STORAGE_BIT);
+            countBuffer = Gl46Buffers.immutable(COUNT_BYTES, GL_DYNAMIC_STORAGE_BIT);
+            int read = GL_MAP_READ_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
+            readback = Gl46Buffers.immutable(READBACK_SLOTS * 32L, read);
+            readbackMapped = glMapNamedBufferRange(readback, 0, READBACK_SLOTS * 32L, read);
+            Arrays.fill(visibility, -1);
             quadIndices = quadIndexBuffer();
             uboAlignment = Math.max(16, glGetInteger(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT));
+            ssboAlignment = Math.max(16, glGetInteger(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT));
             opaqueVao = vertexArray(); translucentVao = vertexArray();
             glVertexArrayElementBuffer(opaqueVao, quadIndices);
             // Vanilla's block sheet: NEAREST_MIPMAP_LINEAR for solid, cutoutMipped and translucent; cutout skips mipmaps.
@@ -266,10 +292,13 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
             bindFrame(atlas, light, CUTOFF[0], mipSampler);
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, drawBuffer);
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, countBuffer);
-            glClearNamedBufferSubData(countBuffer, GL_R32UI, 0, 4 * OPAQUE_LAYERS, GL_RED_INTEGER, GL_UNSIGNED_INT, stack.callocInt(1));
+            glClearNamedBufferSubData(countBuffer, GL_R32UI, 0, COUNT_BYTES, GL_RED_INTEGER, GL_UNSIGNED_INT, stack.callocInt(1));
+            bindCulling();
             glUseProgram(cull.id());
             glDispatchCompute((slotCount + 63) / 64, 1, 1);
-            glMemoryBarrier(GL_COMMAND_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+            // Indirect commands and counts, plus the statistics copy in collectCounts().
+            glMemoryBarrier(GL_COMMAND_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+            glBindTextureUnit(2, light); glBindSampler(2, lightSampler); // the pyramid sat on unit 2 for the cull
             t2 = System.nanoTime();
             glUseProgram(opaque.id());
             bindVertexArray(opaqueVao);
@@ -282,6 +311,7 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
                 glMultiDrawElementsIndirectCount(GL_TRIANGLES, GL_UNSIGNED_INT, (long) layer * MAX_SECTIONS * COMMAND_BYTES, layer * 4L, slotCount, COMMAND_BYTES);
             }
             t3 = System.nanoTime();
+            collectCounts();
             frames.submit();
         } finally {
             long t4 = System.nanoTime();
@@ -296,6 +326,115 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
         return true;
     }
 
+    /** Before drawOpaque: start this frame's vanilla visibility set; {@code known} false keeps every slot eligible. */
+    void beginVisibility(boolean known) {
+        visibilityKnown = known;
+        Arrays.fill(visibility, 0, (slotCount + 31) / 32, known ? 0 : -1);
+    }
+    void markVisible(long key) {
+        Section section = sections.get(key);
+        if (section == null) return;
+        visibility[section.slot() >> 5] |= 1 << (section.slot() & 31);
+        vanillaMarked++;
+    }
+    /** This frame's camera orientation and projection, for the conservative Hi-Z checks. */
+    void view(float yaw, float pitch, org.joml.Matrix4f projection) { this.yaw = yaw; this.pitch = pitch; projection.get(this.projection); }
+
+    /**
+     * Uploads the visibility bits and the Occlusion block, and binds last frame's pyramid on unit 2. Hi-Z is used only when
+     * this frame looks almost like the one the pyramid came from; fast turns, moves, FOV or size changes skip it for a frame.
+     */
+    private void bindCulling() {
+        int alignment = Math.max(uboAlignment, ssboAlignment), words = Math.max(1, (slotCount + 31) / 32);
+        int offset = frames.allocate(words * 4, alignment);
+        if (offset < 0) { frames.submit(); offset = frames.allocate(words * 4, alignment); }
+        for (int i = 0; i < words; i++) frames.mapped.putInt(offset + i * 4, visibility[i]);
+        glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 3, frames.buffer, offset, words * 4L);
+        boolean enabled = occlusionUsable();
+        if (enabled) hizFrames++; else if (pyramid != 0) hizSkipped++;
+        offset = frames.allocate(OCCLUSION_BYTES, uboAlignment);
+        if (offset < 0) { frames.submit(); offset = frames.allocate(OCCLUSION_BYTES, uboAlignment); }
+        ByteBuffer block = frames.mapped;
+        if (enabled) {
+            float[] matrix = previousCamera.matrix();
+            for (int i = 0; i < 16; i++) block.putFloat(offset + i * 4, matrix[i]);
+            double[] position = {previousCamera.x(), previousCamera.y(), previousCamera.z()};
+            for (int axis = 0; axis < 3; axis++) {
+                double floor = Math.floor(position[axis]);
+                block.putInt(offset + 64 + axis * 4, (int) floor).putFloat(offset + 80 + axis * 4, (float) (position[axis] - floor));
+            }
+        }
+        block.putInt(offset + 96, pyramidWidth).putInt(offset + 100, pyramidHeight).putInt(offset + 104, pyramidLevels).putInt(offset + 108, enabled ? 1 : 0);
+        glBindBufferRange(GL_UNIFORM_BUFFER, 1, frames.buffer, offset, OCCLUSION_BYTES);
+        glBindTextureUnit(2, pyramid); glBindSampler(2, 0);
+    }
+    private boolean occlusionUsable() {
+        if (pyramid == 0 || previousCamera == null || previousEpoch != epoch) return false;
+        double dx = camera.x() - previousCamera.x(), dy = camera.y() - previousCamera.y(), dz = camera.z() - previousCamera.z();
+        if (dx * dx + dy * dy + dz * dz > MAX_MOVE_BLOCKS * MAX_MOVE_BLOCKS) return false;
+        if (Math.abs(net.minecraft.util.Mth.wrapDegrees(yaw - previousYaw)) > MAX_TURN_DEGREES || Math.abs(pitch - previousPitch) > MAX_TURN_DEGREES) return false;
+        for (int i = 0; i < 16; i++) if (Math.abs(projection[i] - previousProjection[i]) > MAX_PROJECTION_CHANGE * Math.max(1, Math.abs(previousProjection[i]))) return false;
+        return true;
+    }
+    /** Copies this frame's counters into a readback slot after accumulating the copy made READBACK_SLOTS frames ago. */
+    private void collectCounts() {
+        int slot = readbackFrame++ % READBACK_SLOTS;
+        if (readbackFrame > READBACK_SLOTS) {
+            int at = slot * 32;
+            culling[0]++;
+            culling[1] += Integer.toUnsignedLong(readbackMapped.getInt(at + 12));
+            culling[2] += Integer.toUnsignedLong(readbackMapped.getInt(at + 16));
+            culling[3] += Integer.toUnsignedLong(readbackMapped.getInt(at + 20));
+            for (int layer = 0; layer < OPAQUE_LAYERS; layer++) culling[4] += Integer.toUnsignedLong(readbackMapped.getInt(at + layer * 4));
+        }
+        glCopyNamedBufferSubData(countBuffer, readback, 0, slot * 32L, COUNT_BYTES);
+    }
+
+    /**
+     * AFTER_CUTOUT_BLOCKS: every opaque terrain layer (GL 4.6 and vanilla's remaining sections) is in the main depth buffer and
+     * no entity has drawn yet. Builds next frame's occluder pyramid from it.
+     */
+    void buildHiZ(int depthTexture, int width, int height) {
+        if (hiz == null || !ready() || width <= 0 || height <= 0) return;
+        long start = System.nanoTime();
+        int levelWidth = (width + 1) / 2, levelHeight = (height + 1) / 2;
+        if (pyramid == 0 || pyramidWidth != levelWidth || pyramidHeight != levelHeight) {
+            if (pyramid != 0) glDeleteTextures(pyramid);
+            pyramidWidth = levelWidth; pyramidHeight = levelHeight;
+            pyramidLevels = 32 - Integer.numberOfLeadingZeros(Math.max(levelWidth, levelHeight));
+            pyramid = glCreateTextures(GL_TEXTURE_2D);
+            glTextureStorage2D(pyramid, pyramidLevels, GL_R32F, levelWidth, levelHeight);
+            previousCamera = null; // a pyramid of another size never describes the next frame
+        }
+        try (Gl46State ignored = new Gl46State()) {
+            glUseProgram(hiz.id());
+            glBindSampler(0, 0);
+            int sourceWidth = width, sourceHeight = height;
+            for (int level = 0; level < pyramidLevels; level++) {
+                int offset = frames.allocate(16, uboAlignment);
+                if (offset < 0) { frames.submit(); offset = frames.allocate(16, uboAlignment); }
+                frames.mapped.putInt(offset, level == 0 ? 0 : level - 1).putInt(offset + 4, sourceWidth).putInt(offset + 8, sourceHeight);
+                glBindBufferRange(GL_UNIFORM_BUFFER, 1, frames.buffer, offset, 16);
+                glBindTextureUnit(0, level == 0 ? depthTexture : pyramid);
+                glBindImageTexture(0, pyramid, level, false, 0, GL_WRITE_ONLY, GL_R32F);
+                int w = Math.max(1, pyramidWidth >> level), h = Math.max(1, pyramidHeight >> level);
+                glDispatchCompute((w + 7) / 8, (h + 7) / 8, 1);
+                glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+                sourceWidth = w; sourceHeight = h;
+            }
+            frames.submit();
+        }
+        previousCamera = camera; previousEpoch = epoch; previousYaw = yaw; previousPitch = pitch;
+        System.arraycopy(projection, 0, previousProjection, 0, 16);
+        hizBuilds++; hizNanos += System.nanoTime() - start;
+        checkErrors("hiz");
+    }
+    /** {cull frames, tested (vanilla-visible), frustumVisible, occluded, layerDraws, vanillaMarked, hizBuilds, hizFrames, hizSkipped}. */
+    long[] cullStats() {
+        return new long[]{culling[0], culling[1], culling[2], culling[3], culling[4], vanillaMarked, hizBuilds, hizFrames, hizSkipped};
+    }
+
+    long[] growStats() { return vertices != null ? vertices.growStats() : new long[3]; }
     /** {sortedQuads, insertionSorts, fullSorts, deferredSorts}. */
     long[] sortStats() { return new long[]{sortedQuads, insertionSorts, fullSorts, deferredSorts}; }
     final Gl46Timer opaqueTimer = new Gl46Timer(), translucentTimer = new Gl46Timer();
@@ -314,7 +453,7 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
             Section section = ordered.get(i); Translucent layer = section.translucent();
             double x = camera.x() - section.x(), y = camera.y() - section.y(), z = camera.z() - section.z();
             if (!layer.stale(x, y, z)) continue;
-            if (budget <= 0 || (layer.quads > budget && budget < QUAD_BUDGET)) { deferredSorts++; continue; }
+            if (budget <= 0 || (layer.quads > budget && budget < QUAD_BUDGET) || (budget < QUAD_BUDGET && System.nanoTime() - start > SORT_NANOS)) { deferredSorts++; continue; }
             sort(layer, x, y, z); budget -= layer.quads;
         }
         uploads.flush();
@@ -467,7 +606,7 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
         if (uploads != null) uploads.flush();
         sections.clear(); layered.clear(); freeSlots.clear(); slotCount = 0;
         if (sectionBuffer != 0) glClearNamedBufferData(sectionBuffer, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, (ByteBuffer) null);
-        camera = null; receivedMesh = false;
+        camera = null; receivedMesh = false; previousCamera = null;
     }
 
     @Override public void close() {
@@ -477,12 +616,18 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
                 + " uploadedBytes=" + (vertices.uploadedBytes() + (indices == null ? 0 : indices.uploadedBytes()))
                 + " stagingWaits=" + uploads.staging.waits() + " uploads{issued,merged,direct}=" + Arrays.toString(uploads.stats()) + " freeRanges=" + vertices.freeRanges()
                 + " sortedQuads=" + sortedQuads + " insertionSorts=" + insertionSorts + " fullSorts=" + fullSorts + " deferredSorts=" + deferredSorts
+                + " culling{frames,tested,frustumVisible,occluded,layerDraws,vanillaMarked,hizBuilds,hizFrames,hizSkipped}=" + Arrays.toString(cullStats())
+                + " hizNanos=" + hizNanos + " vanillaVisibility=" + visibilityKnown
                 + " opaqueNanos=" + opaqueNanos + " translucentNanos=" + translucentNanos + " opaqueCpu{" + opaqueTimer + "} translucentCpu{" + translucentTimer + "}"
+                + " vertexGrowCpu{grows,ns,maxNs}=" + Arrays.toString(vertices.growStats())
                 + " rings{fences,waits,waitNanos,oversized} staging=" + Arrays.toString(uploads.staging.stats()) + " frames=" + Arrays.toString(frames.stats())
                 + " commands=" + Arrays.toString(commands.stats()));
         sections.clear(); freeSlots.clear();
-        for (Gl46Programs.Program program : new Gl46Programs.Program[]{cull, opaque, translucent}) if (program != null) glDeleteProgram(program.id());
-        cull = opaque = translucent = null;
+        for (Gl46Programs.Program program : new Gl46Programs.Program[]{cull, opaque, translucent, hiz}) if (program != null) glDeleteProgram(program.id());
+        cull = opaque = translucent = hiz = null;
+        if (pyramid != 0) glDeleteTextures(pyramid);
+        if (readback != 0) { glUnmapNamedBuffer(readback); glDeleteBuffers(readback); }
+        pyramid = readback = 0; readbackMapped = null;
         for (AutoCloseable resource : new AutoCloseable[]{vertices, indices, uploads, frames, commands}) {
             try { if (resource != null) resource.close(); } catch (Exception ignored) { }
         }
