@@ -37,6 +37,8 @@ public final class MainWindowBackend implements AutoCloseable {
     private long directSourceFrames, copiedSourceFrames, compatibilityImages;
     private long earlyAcquires, lateAcquires, cancelledAcquires, acquireNanos, maxAcquireNanos;
     private long fenceWaitNanos, maxFenceWaitNanos, presentNanos, maxPresentNanos;
+    /** CPU spent recording/submitting the present command buffer, and in the GL side of the shared-source handoff (signal+flush, wait). */
+    private long recordNanos, maxRecordNanos, handoffNanos, maxHandoffNanos;
     private boolean dirty = true, vsync = true;
     private String capture;
     private PrintWriter report;
@@ -116,6 +118,8 @@ public final class MainWindowBackend implements AutoCloseable {
     public long[] presentationStats() { return new long[]{directSourceFrames, copiedSourceFrames, compatibilityImages}; }
     public int generations() { return generations; }
     public long earlyAcquires() { return earlyAcquires; }
+    /** Cumulative CPU nanoseconds: {frames, fenceWait, acquire, recordSubmit, glHandoff, queuePresent}. */
+    public long[] cpuStats() { return new long[]{frames, fenceWaitNanos, acquireNanos, recordNanos, handoffNanos, presentNanos}; }
     public long lateAcquires() { return lateAcquires; }
     public boolean gpuDrivenEnabled() { return world != null && world.gpuDrivenEnabled(); }
     public long[] optimizationStats() { return world == null ? new long[4] : world.optimizationStats(); }
@@ -229,6 +233,7 @@ public final class MainWindowBackend implements AutoCloseable {
 
     /** Wait for a slot/image before Minecraft polls input and advances its timer. */
     public boolean beginFrame(int framebufferWidth, int framebufferHeight) {
+        context.uploads.flush(); // Never carry an open upload batch across frames.
         boolean acquired = acquire(framebufferWidth, framebufferHeight, true);
         if (acquired && world != null) world.prepareFrame();
         return acquired;
@@ -274,12 +279,14 @@ public final class MainWindowBackend implements AutoCloseable {
             boolean submitted = false, sourceReleased = false;
             try {
                 SharedPresentImage shared;
+                long handoff = System.nanoTime();
                 if (directSource != null) {
                     directSource.releaseGL(); sourceReleased = true; shared = directSource.color;
                 } else {
                     shared = compatibilitySource(slot, stack);
                     shared.copyFromGL(sourceFramebuffer, sourceWidth, sourceHeight);
                 }
+                long recordStart = System.nanoTime(); handoff = recordStart - handoff;
                 check(vkResetCommandBuffer(command, 0), "reset presentation command");
                 check(vkBeginCommandBuffer(command, VkCommandBufferBeginInfo.calloc(stack).sType$Default().flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)), "begin presentation command");
                 timers.begin(command, timerSlot);
@@ -339,11 +346,14 @@ public final class MainWindowBackend implements AutoCloseable {
                 var submit = VkSubmitInfo2.calloc(1, stack).sType$Default().pWaitSemaphoreInfos(waits).pSignalSemaphoreInfos(signals)
                         .pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1, stack).sType$Default().commandBuffer(command));
                 check(vkResetFences(context.device, fence), "reset presentation fence");
+                context.uploads.flush(); // Batched texture uploads sampled by hand/GUI passes go first.
                 check(vkQueueSubmit2(context.queue, submit, fence), "submit main-window presentation");
                 timers.submitted(timerSlot);
+                long recordEnd = System.nanoTime(); recordNanos += recordEnd - recordStart; maxRecordNanos = Math.max(maxRecordNanos, recordEnd - recordStart);
                 slot.imageIndex = -1;
                 submitted = true;
                 if (directSource != null) directSource.acquireGL();
+                handoff += System.nanoTime() - recordEnd; handoffNanos += handoff; maxHandoffNanos = Math.max(maxHandoffNanos, handoff);
             } finally {
                 if (!submitted) {
                     try {
@@ -421,7 +431,7 @@ public final class MainWindowBackend implements AutoCloseable {
             if (format == 0) throw new IllegalStateException("UNORM swapchain format required to preserve Minecraft colors");
             var features = VkFormatProperties.calloc(stack); vkGetPhysicalDeviceFormatProperties(context.physical, format, features);
             if ((features.optimalTilingFeatures() & VK_FORMAT_FEATURE_BLIT_DST_BIT) == 0) throw new IllegalStateException("Swapchain format cannot be a blit destination");
-            int imageCount = caps.minImageCount() + 1;
+            int imageCount = Math.max(caps.minImageCount(), Integer.getInteger("vulkanforge.swapchainImages", caps.minImageCount() + 1));
             if (caps.maxImageCount() > 0) imageCount = Math.min(imageCount, caps.maxImageCount());
             int mode = VK_PRESENT_MODE_FIFO_KHR;
             check(vkGetPhysicalDeviceSurfacePresentModesKHR(context.physical, context.surface, count, null), "present modes");
@@ -432,6 +442,10 @@ public final class MainWindowBackend implements AutoCloseable {
             // Mailbox keeps VSync and replaces older pending frames; FIFO remains the portable fallback.
             if (vsync && mailbox) mode = VK_PRESENT_MODE_MAILBOX_KHR;
             else if (!vsync) mode = immediate ? VK_PRESENT_MODE_IMMEDIATE_KHR : mailbox ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_FIFO_KHR;
+            String forced = System.getProperty("vulkanforge.presentMode", "");
+            if (forced.equalsIgnoreCase("mailbox") && mailbox) mode = VK_PRESENT_MODE_MAILBOX_KHR;
+            else if (forced.equalsIgnoreCase("immediate") && immediate) mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+            else if (forced.equalsIgnoreCase("fifo")) mode = VK_PRESENT_MODE_FIFO_KHR;
             var info = VkSwapchainCreateInfoKHR.calloc(stack).sType$Default().surface(context.surface).minImageCount(imageCount).imageFormat(format).imageColorSpace(colorSpace)
                     .imageExtent(e -> e.set(width, height)).imageArrayLayers(1).imageUsage(required).imageSharingMode(VK_SHARING_MODE_EXCLUSIVE)
                     .preTransform(caps.currentTransform()).compositeAlpha(Integer.lowestOneBit(caps.supportedCompositeAlpha())).presentMode(mode).clipped(true);
@@ -517,6 +531,8 @@ public final class MainWindowBackend implements AutoCloseable {
             log("CPU_FENCE_WAIT_MS mean=" + fenceWaitNanos / (frames * 1_000_000.0) + " max=" + maxFenceWaitNanos / 1_000_000.0);
             log("CPU_PRESENT_MS mean=" + presentNanos / (frames * 1_000_000.0) + " max=" + maxPresentNanos / 1_000_000.0);
             log("CPU_ACQUIRE_MS mean=" + acquireNanos / (Math.max(1, earlyAcquires + lateAcquires) * 1_000_000.0) + " max=" + maxAcquireNanos / 1_000_000.0);
+            log("CPU_RECORD_SUBMIT_MS mean=" + recordNanos / (frames * 1_000_000.0) + " max=" + maxRecordNanos / 1_000_000.0);
+            log("CPU_GL_HANDOFF_MS mean=" + handoffNanos / (frames * 1_000_000.0) + " max=" + maxHandoffNanos / 1_000_000.0);
         }
         log("ACQUIRES_BEFORE_INPUT=" + earlyAcquires); log("ACQUIRES_AFTER_RENDER=" + lateAcquires); log("CANCELLED_ACQUIRES=" + cancelledAcquires);
         if (skippedExtents > 0 || abandonedFrames > 0) log("ZERO_EXTENT_FRAMES=" + skippedExtents + " ABANDONED_FRAMES=" + abandonedFrames);

@@ -94,3 +94,12 @@ tasks.register('benchmarkBindings', JavaExec) {
     mainClass = 'github.com.gengyoubo.vulkanforge.lab.BindingBenchmark'
     systemProperty 'vulkanforge.disableValidation', 'true'
 }
+
+tasks.register('benchmarkPresent', JavaExec) {
+    dependsOn 'testClasses'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.lab.PresentBenchmark'
+    systemProperty 'vulkanforge.disableValidation', 'true'
+    // -Pbench.fullscreen=true -Pbench.frames=3000 ... are forwarded as system properties.
+    rootProject.properties.findAll { it.key.startsWith('bench.') || it.key.startsWith('vulkanforge.') }.each { systemProperty it.key, it.value }
+}

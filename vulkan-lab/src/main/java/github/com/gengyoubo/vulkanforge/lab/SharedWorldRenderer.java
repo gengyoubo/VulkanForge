@@ -58,6 +58,8 @@ final class SharedWorldRenderer implements AutoCloseable {
     private int nativeReading = -1;
     private long nativeComposites, nativeEntityPasses;
     private long overlayPasses, skyDraws, handoffGroups, handoffImages;
+    /** Sync-chain cost per frame: queue submits, CPU blocked in fence waits, GL semaphore calls (see SharedPresentImage.groupNanos). */
+    private long submits, fenceWaitNanos, maxFenceWaitNanos, reportedFrames, reportedSubmits, reportedFenceNanos, reportedGlCalls, reportedGlNanos;
     private int depthTexture, translucentTexture, translucentDepthTexture;
     private long translucentSectionDraws;
     private static final long DEPTH_STAGES = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
@@ -259,7 +261,7 @@ final class SharedWorldRenderer implements AutoCloseable {
                 submit.pWaitSemaphoreInfos(waits);
             }
             check(vkResetFences(context.device, slot.fence), "reset shared world fence");
-            check(vkQueueSubmit2(context.queue, submit, slot.fence), "submit shared world");
+            context.uploads.flush(); check(vkQueueSubmit2(context.queue, submit, slot.fence), "submit shared world"); submits++;
             slot.used = slot.pending = true; slot.nativeOwned = nativeMode; timers.submitted(index); frames++;
             if (prepareNativeTarget) {
                 slot.overlayUsed = true;
@@ -275,7 +277,7 @@ final class SharedWorldRenderer implements AutoCloseable {
                     : SharedPresentImage.beginGroupGL(images);
             if(!nativeMode){handoffGroups++;handoffImages+=images.length;}
             int texture = textures[0]; depthTexture = textures[1]; translucentTexture = textures[2]; translucentDepthTexture = textures[3];
-            if (frames % 300 == 0) { log.accept("WORLD_RENDERED_FRAMES=" + frames + " sections=" + world.trackedSections()); timers.report(log); }
+            if (frames % 300 == 0) { log.accept("WORLD_RENDERED_FRAMES=" + frames + " sections=" + world.trackedSections()); timers.report(log); reportSync(); }
             return texture;
         }
     }
@@ -352,7 +354,7 @@ final class SharedWorldRenderer implements AutoCloseable {
                 submit.pWaitSemaphoreInfos(waits);
             }
             check(vkResetFences(context.device, slot.overlayFences[pass]), "reset overlay fence");
-            check(vkQueueSubmit2(context.queue, submit, slot.overlayFences[pass]), "submit overlay");
+            context.uploads.flush(); check(vkQueueSubmit2(context.queue, submit, slot.overlayFences[pass]), "submit overlay"); submits++;
             slot.overlayUsed = slot.overlayPending[pass] = true; overlayPasses++;
             overlayReading = index;
             handoffGroups++; handoffImages += 2;
@@ -408,9 +410,9 @@ final class SharedWorldRenderer implements AutoCloseable {
             var wait=VkSemaphoreSubmitInfo.calloc(1,stack).sType$Default().semaphore(targetColor.complete).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             var signal=VkSemaphoreSubmitInfo.calloc(1,stack).sType$Default().semaphore(targetColor.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             check(vkResetFences(context.device,slot.overlayFences[pass]),"reset native composite fence");
-            check(vkQueueSubmit2(context.queue,VkSubmitInfo2.calloc(1,stack).sType$Default().pWaitSemaphoreInfos(wait).pSignalSemaphoreInfos(signal)
+            context.uploads.flush(); check(vkQueueSubmit2(context.queue,VkSubmitInfo2.calloc(1,stack).sType$Default().pWaitSemaphoreInfos(wait).pSignalSemaphoreInfos(signal)
                     .pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1,stack).sType$Default().commandBuffer(command)),slot.overlayFences[pass]),"submit native composite");
-            slot.overlayPending[pass]=true;
+            slot.overlayPending[pass]=true; submits++;
         }
         if (target != null) target.acquireGL();
         else {
@@ -498,13 +500,23 @@ final class SharedWorldRenderer implements AutoCloseable {
                 signals.get(i).sType$Default().semaphore(all.get(i).color.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             }
             check(vkResetFences(context.device, slot.overlayFences[pass]), "reset native post fence");
-            check(vkQueueSubmit2(context.queue, VkSubmitInfo2.calloc(1, stack).sType$Default().pWaitSemaphoreInfos(waits).pSignalSemaphoreInfos(signals)
+            context.uploads.flush(); check(vkQueueSubmit2(context.queue, VkSubmitInfo2.calloc(1, stack).sType$Default().pWaitSemaphoreInfos(waits).pSignalSemaphoreInfos(signals)
                     .pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1, stack).sType$Default().commandBuffer(command)), slot.overlayFences[pass]), "submit native post");
-            slot.overlayPending[pass] = true;
+            slot.overlayPending[pass] = true; submits++;
         }
         for (var owner : all) owner.acquireGL();
         renderTargets.post();
         return true;
+    }
+    /** Per-frame averages since the previous report. */
+    private void reportSync() {
+        long frameCount = frames - reportedFrames;
+        if (frameCount <= 0) return;
+        log.accept(String.format(java.util.Locale.ROOT, "WORLD_SYNC frames=%d submitsPerFrame=%.2f glHandoffsPerFrame=%.2f cpuGlHandoffMs=%.3f cpuFenceWaitMs=%.3f maxFenceWaitMs=%.3f",
+                frameCount, (double) (submits - reportedSubmits) / frameCount, (double) (SharedPresentImage.groupCalls - reportedGlCalls) / frameCount,
+                (SharedPresentImage.groupNanos - reportedGlNanos) / 1e6 / frameCount, (fenceWaitNanos - reportedFenceNanos) / 1e6 / frameCount, maxFenceWaitNanos / 1e6));
+        reportedFrames = frames; reportedSubmits = submits; reportedFenceNanos = fenceWaitNanos;
+        reportedGlCalls = SharedPresentImage.groupCalls; reportedGlNanos = SharedPresentImage.groupNanos; maxFenceWaitNanos = 0;
     }
     private void finishNativeLeases(){for(Slot slot:slots)if(slot.nativeTargetLeased){SharedPresentImage.endGroupGL(slot.overlayColor,slot.overlayDepth);slot.nativeTargetLeased=false;}}
 
@@ -540,11 +552,19 @@ final class SharedWorldRenderer implements AutoCloseable {
     }
     private void waitSlot(int index) {
         Slot slot = slots[index];
-        for (int k = 0; k < MAX_OVERLAYS; k++) if (slot.overlayPending[k]) {
-            check(vkWaitForFences(context.device, slot.overlayFences[k], true, 5_000_000_000L), "wait shared overlay slot"); slot.overlayPending[k] = false;
+        // One call for the terrain fence and every overlay fence of this slot, instead of one blocking call per fence.
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            var fences = stack.mallocLong(MAX_OVERLAYS + 1);
+            for (int k = 0; k < MAX_OVERLAYS; k++) if (slot.overlayPending[k]) { fences.put(slot.overlayFences[k]); slot.overlayPending[k] = false; }
+            if (slot.pending) fences.put(slot.fence);
+            fences.flip();
+            if (fences.hasRemaining()) {
+                long start = System.nanoTime();
+                check(vkWaitForFences(context.device, fences, true, 5_000_000_000L), "wait shared world slot");
+                long elapsed = System.nanoTime() - start; fenceWaitNanos += elapsed; maxFenceWaitNanos = Math.max(maxFenceWaitNanos, elapsed);
+            }
         }
         if (!slot.pending) return;
-        check(vkWaitForFences(context.device, slot.fence, true, 5_000_000_000L), "wait shared world slot");
         slot.pending = false; timers.collect(index);
         if (culler != null) culler.collect(index);
         completedFrames = Math.max(completedFrames, slot.serial);
@@ -595,6 +615,7 @@ final class SharedWorldRenderer implements AutoCloseable {
         log.accept("WORLD_TRANSLUCENT sectionDraws=" + translucentSectionDraws + " sorts=" + world.translucentSorts());
         log.accept("WORLD_RGBA_READBACK_BYTES=0");
         log.accept("GL_VULKAN_READ_LEASES groups=" + handoffGroups + " images=" + handoffImages);
+        reportSync();
         if (entities != null) {
             long[] entity = entities.stats();
             log.accept("WORLD_BINDINGS=" + java.util.Arrays.toString(entities.bindingStats()));

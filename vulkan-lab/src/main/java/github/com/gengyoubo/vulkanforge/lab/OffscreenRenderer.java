@@ -177,6 +177,7 @@ final class OffscreenRenderer implements AutoCloseable {
             check(vkEndCommandBuffer(command), "vkEndCommandBuffer(offscreen)");
             check(vkResetFences(context.device, fence), "vkResetFences(offscreen)");
             VkSubmitInfo submit = VkSubmitInfo.calloc(stack).sType$Default().pCommandBuffers(stack.pointers(command.address()));
+            context.uploads.flush();
             check(vkQueueSubmit(context.queue, submit, fence), "vkQueueSubmit(offscreen)");
             timers.submitted(0);
             check(vkWaitForFences(context.device, fence, true, 5_000_000_000L), "vkWaitForFences(offscreen)");

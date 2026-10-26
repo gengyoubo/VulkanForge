@@ -10,7 +10,8 @@ layout(push_constant) uniform Draw { mat4 viewProjection; vec4 sectionOffset; } 
 layout(location = 0) out vec4 vertexColor;
 layout(location = 1) out vec2 uv;
 void main() {
-    gl_Position = draw.viewProjection * vec4(inPosition + sections[gl_BaseInstance].origin.xyz, 1.0);
+    // origin is anchor-relative; sectionOffset carries anchor - camera.
+    gl_Position = draw.viewProjection * vec4(inPosition + sections[gl_BaseInstance].origin.xyz + draw.sectionOffset.xyz, 1.0);
     gl_Position.y = -gl_Position.y;
     gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;
     vec2 lightUV = clamp(vec2(inLight) / 256.0, vec2(0.5 / 16.0), vec2(15.5 / 16.0));

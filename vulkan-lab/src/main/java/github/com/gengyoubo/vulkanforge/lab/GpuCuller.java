@@ -15,13 +15,13 @@ final class GpuCuller implements AutoCloseable {
     private final GpuBuffer[] inputs, outputs, drawCounts;
     private final boolean compact;
     private final long[] sets;
-    private final int[] counts;
+    private final int[] counts, lives;
     private long descriptorLayout, descriptorPool, layout, pipeline;
     private long tested, visible;
     GpuCuller(VulkanContext context, int slots) {
         this.context = context;
         compact = context.capabilities.gpuDriven() && context.capabilities.maxIndirectDraws() >= CAPACITY && !Boolean.getBoolean("vulkanforge.disableGpuDriven");
-        inputs = new GpuBuffer[slots]; outputs = new GpuBuffer[slots]; drawCounts = new GpuBuffer[slots]; sets = new long[slots]; counts = new int[slots];
+        inputs = new GpuBuffer[slots]; outputs = new GpuBuffer[slots]; drawCounts = new GpuBuffer[slots]; sets = new long[slots]; counts = new int[slots]; lives = new int[slots];
         try (MemoryStack stack = MemoryStack.stackPush()) {
             var handle = stack.mallocLong(1);
             var bindings = VkDescriptorSetLayoutBinding.calloc(3, stack);
@@ -45,7 +45,7 @@ final class GpuCuller implements AutoCloseable {
                 vkUpdateDescriptorSets(context.device, writes, null);
             }
             check(vkCreatePipelineLayout(context.device, VkPipelineLayoutCreateInfo.calloc(stack).sType$Default().pSetLayouts(stack.longs(descriptorLayout))
-                    .pPushConstantRanges(VkPushConstantRange.calloc(1, stack).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT).size(80)), null, handle), "cull pipeline layout"); layout = handle.get(0);
+                    .pPushConstantRanges(VkPushConstantRange.calloc(1, stack).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT).size(96)), null, handle), "cull pipeline layout"); layout = handle.get(0);
             long shader = ShaderCompiler.module(context, "/shaders/cull.comp", org.lwjgl.util.shaderc.Shaderc.shaderc_glsl_compute_shader);
             try {
                 check(vkCreateComputePipelines(context.device, 0, VkComputePipelineCreateInfo.calloc(1, stack).sType$Default().layout(layout)
@@ -59,9 +59,10 @@ final class GpuCuller implements AutoCloseable {
     long descriptorLayout() { return descriptorLayout; }
     long descriptorSet(int slot) { return sets[slot]; }
     ByteBuffer input(int slot) { return inputs[slot].mapped; }
-    void record(VkCommandBuffer command, int slot, float[] matrix, int count, MemoryStack stack) {
+    /** count: input records (including free, all-zero ones); live: sections counted as tested. shift: anchor - camera. */
+    void record(VkCommandBuffer command, int slot, float[] matrix, float[] shift, int count, int live, MemoryStack stack) {
         if (count > CAPACITY) throw new IllegalArgumentException("Too many sections for GPU culling");
-        counts[slot] = count;
+        counts[slot] = count; lives[slot] = live;
         if (count == 0) return;
         vkCmdFillBuffer(command, drawCounts[slot].buffer, 0, 4, 0);
         var reset = VkBufferMemoryBarrier2.calloc(1, stack).sType$Default().srcStageMask(VK_PIPELINE_STAGE_2_CLEAR_BIT).srcAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
@@ -71,7 +72,8 @@ final class GpuCuller implements AutoCloseable {
         vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pBufferMemoryBarriers(reset));
         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, stack.longs(sets[slot]), null);
-        var push = stack.calloc(80); push.asFloatBuffer().put(matrix); push.putInt(64, count); push.putInt(68, compact ? 1 : 0);
+        var push = stack.calloc(96); push.asFloatBuffer().put(matrix); push.putInt(64, count); push.putInt(68, compact ? 1 : 0);
+        push.putFloat(80, shift[0]).putFloat(84, shift[1]).putFloat(88, shift[2]);
         vkCmdPushConstants(command, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
         vkCmdDispatch(command, (count + 63) / 64, 1, 1);
         var barrier = VkMemoryBarrier2.calloc(1, stack).sType$Default().srcStageMask(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT).srcAccessMask(VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT)
@@ -79,9 +81,9 @@ final class GpuCuller implements AutoCloseable {
         vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pMemoryBarriers(barrier));
     }
     /** Mesh path: the task shader culls and counts, so only the visible counter is reset here. Must be outside rendering. */
-    void recordMesh(VkCommandBuffer command, int slot, int count, MemoryStack stack) {
+    void recordMesh(VkCommandBuffer command, int slot, int count, int live, MemoryStack stack) {
         if (count > CAPACITY) throw new IllegalArgumentException("Too many sections for GPU culling");
-        counts[slot] = count;
+        counts[slot] = count; lives[slot] = live;
         if (count == 0) return;
         vkCmdFillBuffer(command, drawCounts[slot].buffer, 0, 4, 0);
         var reset = VkBufferMemoryBarrier2.calloc(1, stack).sType$Default().srcStageMask(VK_PIPELINE_STAGE_2_CLEAR_BIT).srcAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
@@ -98,7 +100,7 @@ final class GpuCuller implements AutoCloseable {
     void collect(int slot) {
         if (compact && counts[slot] != 0) visible += drawCounts[slot].mapped.getInt(0);
         else for (int i = 0; i < counts[slot]; i++) if (outputs[slot].mapped.getInt(i * 16) != 0) visible++;
-        tested += counts[slot]; counts[slot] = 0;
+        tested += lives[slot]; counts[slot] = lives[slot] = 0;
     }
     long[] stats() { return new long[]{tested, visible, tested - visible}; }
     void report(Consumer<String> log) { log.accept("GPU_CULLING tested=" + tested + " visible=" + visible + " culled=" + (tested - visible)); }

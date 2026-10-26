@@ -11,13 +11,19 @@ import static org.lwjgl.vulkan.VK13.*;
 /** GPU section cache. Commands are applied on the Vulkan thread after the previous frame fence. */
 final class WorldScene implements AutoCloseable {
     /** buffer is null when the section only has translucent geometry; translucent is null when it has none. */
-    private record Section(int x, int y, int z, int vertices, GpuBuffer buffer, MeshArena.Allocation allocation, float[] bounds, Translucent translucent) implements AutoCloseable {
+    /** cullIndex: stable record in the GPU culling input; it survives rebuilds of the same section. */
+    private record Section(int x, int y, int z, int vertices, GpuBuffer buffer, MeshArena.Allocation allocation, float[] bounds, Translucent translucent, int cullIndex) implements AutoCloseable {
         @Override public void close() { if (buffer != null) buffer.close(); if (allocation != null) allocation.close(); if (translucent != null) translucent.close(); }
     }
     /** Frame slots that may record translucent draws concurrently; matches SharedWorldRenderer. */
     static final int TRANSLUCENT_SLOTS = 2;
-    /** Re-sorts beyond a section's first sort per slot, per frame; the nearest stale sections go first. */
-    private static final int RESORT_BUDGET = 16;
+    /**
+     * Translucent sorts per slot, per frame: at most this many sections and (after the first) this many quads, nearest stale
+     * sections first. A never-sorted slot draws its identity quad order until its turn comes.
+     */
+    private static final int SORT_BUDGET = 16, SORT_QUAD_BUDGET = 1 << 16;
+    /** Culling records are stored relative to an anchor within this many blocks of the camera, keeping float offsets small. */
+    private static final double ANCHOR_RANGE = 512;
     /** Triangles stay in quad order (6 vertices per quad); each frame slot owns an index buffer it rewrites only after its fence. */
     private final class Translucent implements AutoCloseable {
         final GpuBuffer vertices;
@@ -34,7 +40,12 @@ final class WorldScene implements AutoCloseable {
             for (int quad = 0; quad < quads; quad++) for (int corner : corners) for (int axis = 0; axis < 3; axis++)
                 centers[quad * 3 + axis] += data.getFloat((quad * 6 + corner) * WorldProtocol.STRIDE + axis * 4) * .25f;
             GpuBuffer created = new GpuBuffer(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-            try { for (int slot = 0; slot < TRANSLUCENT_SLOTS; slot++) indices[slot] = new GpuBuffer(context, quads * 6 * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT); }
+            try {
+                for (int slot = 0; slot < TRANSLUCENT_SLOTS; slot++) {
+                    indices[slot] = new GpuBuffer(context, quads * 6 * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+                    var out = indices[slot].mapped.asIntBuffer(); for (int i = 0; i < quads * 6; i++) out.put(i);
+                }
+            }
             catch (Throwable error) { created.close(); for (GpuBuffer index : indices) if (index != null) index.close(); throw error; }
             vertices = created;
         }
@@ -44,13 +55,13 @@ final class WorldScene implements AutoCloseable {
         }
         /** x/y/z: camera relative to the section origin. Farthest quad first. */
         void sort(int slot, double x, double y, double z) {
-            long[] keys = new long[quads];
+            long[] keys = sortKeys = sortKeys.length >= quads ? sortKeys : new long[Math.max(quads, sortKeys.length * 2)];
             for (int quad = 0; quad < quads; quad++) {
                 float dx = (float)(centers[quad * 3] - x), dy = (float)(centers[quad * 3 + 1] - y), dz = (float)(centers[quad * 3 + 2] - z);
                 // Non-negative float bits order like the floats themselves.
                 keys[quad] = (long) Float.floatToIntBits(dx * dx + dy * dy + dz * dz) << 32 | quad;
             }
-            Arrays.sort(keys);
+            Arrays.sort(keys, 0, quads);
             var out = indices[slot].mapped.asIntBuffer();
             for (int i = quads - 1; i >= 0; i--) { int base = (int) keys[i] * 6; for (int k = 0; k < 6; k++) out.put(base + k); }
             sortedAt[slot * 3] = x; sortedAt[slot * 3 + 1] = y; sortedAt[slot * 3 + 2] = z; sorted[slot] = true;
@@ -64,7 +75,16 @@ final class WorldScene implements AutoCloseable {
     private final java.util.function.Consumer<String> log;
     private int peakSections;
     private long epoch, descriptorLayout, descriptorPool, descriptorSet, layout, pipeline, translucentPipeline, sampler, lightSampler;
-    private long translucentSorts, translucentDraws;
+    private long translucentSorts, translucentDraws, cullWrites, arenaReuses;
+    /** Reused scratch: quad sort keys, per-frame translucent section order and its distance keys. */
+    private long[] sortKeys = new long[0], orderKeys = new long[0];
+    private final List<Section> translucentOrder = new ArrayList<>();
+    private final List<Section> cullSections = new ArrayList<>();
+    private final BitSet freeCull = new BitSet();
+    /** Per culler slot: records changed since that slot's input buffer was last written. */
+    private BitSet[] cullDirty;
+    private double anchorX, anchorY, anchorZ;
+    private boolean anchored;
     private GpuImage atlas, lightMap;
     private MeshArena arena;
     private long drivenLayout, drivenPipeline, indirectBatches;
@@ -146,7 +166,7 @@ final class WorldScene implements AutoCloseable {
             }
             check(vkCreatePipelineLayout(context.device, VkPipelineLayoutCreateInfo.calloc(stack).sType$Default()
                     .pSetLayouts(stack.longs(descriptorLayout, cullerLayout, arenaLayout))
-                    .pPushConstantRanges(VkPushConstantRange.calloc(1, stack).stageFlags(stages).size(80)), null, handle), "mesh world layout");
+                    .pPushConstantRanges(VkPushConstantRange.calloc(1, stack).stageFlags(stages).size(96)), null, handle), "mesh world layout");
             meshLayout = handle.get(0);
             meshPipeline = GraphicsPipeline.createMesh(context, meshLayout, VK_FORMAT_R8G8B8A8_UNORM, "/shaders/world_mesh.task", "/shaders/world_mesh.mesh", stack);
         }
@@ -160,7 +180,7 @@ final class WorldScene implements AutoCloseable {
     }
     /** GPU-driven terrain batches: indirect-count draws or NV mesh task launches. */
     long indirectBatches() { return indirectBatches + meshBatches; }
-    long[] arenaStats() { return arena == null ? new long[3] : arena.stats(); }
+    long[] arenaStats() { return arena == null ? new long[5] : arena.stats(); }
 
     void apply(WorldProtocol.Command command) {
         if (command instanceof WorldProtocol.Reset reset) {
@@ -172,26 +192,55 @@ final class WorldScene implements AutoCloseable {
         if (command instanceof WorldProtocol.Camera view) camera = view;
         else if (command instanceof WorldProtocol.Atlas image) uploadAtlas(image);
         else if (command instanceof WorldProtocol.TexturePatch patch) updateTexture(patch);
-        else if (command instanceof WorldProtocol.Remove remove) { tracked.remove(remove.key()); Section old = sections.remove(remove.key()); if (old != null) retirement.accept(old::close); }
+        else if (command instanceof WorldProtocol.Remove remove) {
+            tracked.remove(remove.key()); Section old = sections.remove(remove.key());
+            if (old != null) { setCull(old.cullIndex(), null); retirement.accept(old::close); }
+        }
         else if (command instanceof WorldProtocol.Mesh mesh) {
             receivedMesh = true;
             if (tracked.size() >= GpuCuller.CAPACITY && !tracked.contains(mesh.key())) throw new IllegalStateException("World section cache limit exceeded");
-            Section replacement = null;
+            Section old = sections.get(mesh.key()), replacement = null;
             if (mesh.vertices().length > 0 || mesh.translucent().length > 0) {
-                GpuBuffer opaque = mesh.vertices().length == 0 || arena != null ? null : new GpuBuffer(context, mesh.vertices(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-                MeshArena.Allocation allocation = arena != null && mesh.vertices().length > 0 ? arena.upload(mesh.vertices()) : null;
+                int cullIndex = old != null ? old.cullIndex() : claimCullIndex();
+                GpuBuffer opaque = null;
+                MeshArena.Allocation allocation = null;
+                boolean reused = false;
                 try {
+                    if (mesh.vertices().length > 0 && arena == null) opaque = new GpuBuffer(context, mesh.vertices(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+                    if (mesh.vertices().length > 0 && arena != null) {
+                        // A rebuilt section overwrites its own arena range when the new mesh fits.
+                        if (old != null && old.allocation() != null) { allocation = old.allocation().replace(mesh.vertices()); reused = allocation != null; }
+                        if (allocation == null) allocation = arena.upload(mesh.vertices());
+                    }
                     replacement = new Section(mesh.x(), mesh.y(), mesh.z(), mesh.vertices().length / WorldProtocol.STRIDE, opaque, allocation,
-                            bounds(mesh.vertices().length > 0 ? mesh.vertices() : mesh.translucent()), mesh.translucent().length == 0 ? null : new Translucent(mesh.translucent()));
-                } catch (Throwable error) { if (opaque != null) opaque.close(); if (allocation != null) allocation.close(); throw error; }
+                            bounds(mesh.vertices().length > 0 ? mesh.vertices() : mesh.translucent()), mesh.translucent().length == 0 ? null : new Translucent(mesh.translucent()), cullIndex);
+                } catch (Throwable error) {
+                    if (opaque != null) opaque.close(); if (allocation != null) allocation.close();
+                    // The old section no longer owns its range once it was reused; drop it rather than draw overwritten vertices.
+                    if (reused) { sections.remove(mesh.key()); retirement.accept(old::close); }
+                    if (old == null || reused) setCull(cullIndex, null);
+                    throw error;
+                }
+                if (reused) arenaReuses++;
             }
-            Section old = sections.remove(mesh.key());
-            if (old != null) retirement.accept(old::close);
-            if (replacement != null) sections.put(mesh.key(), replacement);
+            if (old != null) { sections.remove(mesh.key()); retirement.accept(old::close); }
+            if (replacement != null) { sections.put(mesh.key(), replacement); setCull(replacement.cullIndex(), replacement); }
+            else if (old != null) setCull(old.cullIndex(), null);
             tracked.add(mesh.key()); peakSections = Math.max(peakSections, tracked.size());
             log.accept("WORLD_MESH=" + mesh.key() + " vertices=" + mesh.vertices().length / WorldProtocol.STRIDE + " translucent=" + mesh.translucent().length / WorldProtocol.STRIDE
                     + " cached=" + sections.size() + " tracked=" + tracked.size());
         }
+    }
+
+    private int claimCullIndex() {
+        int index = freeCull.nextSetBit(0);
+        if (index < 0) { index = cullSections.size(); cullSections.add(null); } else freeCull.clear(index);
+        return index;
+    }
+    private void setCull(int index, Section section) {
+        cullSections.set(index, section);
+        if (section == null) freeCull.set(index);
+        if (cullDirty != null) for (BitSet dirty : cullDirty) dirty.set(index);
     }
 
     boolean ready() { return camera != null && atlas != null && lightMap != null && receivedMesh; }
@@ -243,7 +292,7 @@ final class WorldScene implements AutoCloseable {
     }
 
     private void uploadPixels(GpuImage image, int x, int y, int width, int height, byte[] rgba, boolean fresh) {
-        context.uploads.submit(rgba, (upload, staging, stack) -> {
+        context.uploads.submit(rgba, (upload, staging, offset, stack) -> {
             var barrier = VkImageMemoryBarrier2.calloc(1, stack).sType$Default()
                     .srcStageMask(fresh ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT)
                     .srcAccessMask(fresh ? 0 : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)
@@ -253,7 +302,7 @@ final class WorldScene implements AutoCloseable {
                     .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
             var dependency = VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barrier);
             vkCmdPipelineBarrier2(upload, dependency);
-            var region = VkBufferImageCopy.calloc(1, stack).imageSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1))
+            var region = VkBufferImageCopy.calloc(1, stack).bufferOffset(offset).imageSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1))
                     .imageOffset(o -> o.set(x, y, 0)).imageExtent(e -> e.set(width, height, 1));
             vkCmdCopyBufferToImage(upload, staging.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
             barrier.srcStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).srcAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
@@ -282,19 +331,35 @@ final class WorldScene implements AutoCloseable {
         }
         return result;
     }
+    /** Rewrites only the records changed since this slot's last frame; the camera moves through a push-constant shift. */
     void prepareCulling(VkCommandBuffer command, MemoryStack stack, GpuCuller culler, int slot) {
-        var input = culler.input(slot); input.clear();
-        for (Section section : sections.values()) {
-            double[] offset = {section.x() - camera.x(), section.y() - camera.y(), section.z() - camera.z()};
-            for (int bound = 0; bound < 2; bound++) {
-                for (int axis = 0; axis < 3; axis++) input.putFloat((float)(offset[axis] + section.bounds()[bound * 3 + axis]) + (bound == 0 ? -.001f : .001f));
-                input.putFloat(0);
-            }
-            input.putInt(section.vertices()).putInt(section.allocation() == null ? 0 : section.allocation().firstVertex).putInt(0).putInt(0);
-            for (int axis = 0; axis < 3; axis++) input.putFloat((float) offset[axis]); input.putFloat(0);
+        int count = cullSections.size();
+        if (cullDirty == null) { cullDirty = new BitSet[culler.slots()]; for (int i = 0; i < cullDirty.length; i++) (cullDirty[i] = new BitSet()).set(0, count); }
+        if (!anchored || Math.abs(camera.x() - anchorX) > ANCHOR_RANGE || Math.abs(camera.y() - anchorY) > ANCHOR_RANGE || Math.abs(camera.z() - anchorZ) > ANCHOR_RANGE) {
+            anchorX = Math.floor(camera.x() / 256) * 256; anchorY = Math.floor(camera.y() / 256) * 256; anchorZ = Math.floor(camera.z() / 256) * 256;
+            anchored = true;
+            for (BitSet dirty : cullDirty) dirty.set(0, count);
         }
-        if (meshPipeline != 0) culler.recordMesh(command, slot, sections.size(), stack);
-        else culler.record(command, slot, camera.matrix(), sections.size(), stack);
+        var input = culler.input(slot); BitSet dirty = cullDirty[slot];
+        for (int i = dirty.nextSetBit(0); i >= 0 && i < count; i = dirty.nextSetBit(i + 1)) { writeCull(input, i, cullSections.get(i)); cullWrites++; }
+        dirty.clear();
+        if (meshPipeline != 0) culler.recordMesh(command, slot, count, sections.size(), stack);
+        else culler.record(command, slot, camera.matrix(), cameraShift(), count, sections.size(), stack);
+    }
+    /** Anchor-relative records + this shift = camera-relative positions. */
+    private float[] cameraShift() { return new float[]{(float) (anchorX - camera.x()), (float) (anchorY - camera.y()), (float) (anchorZ - camera.z())}; }
+    /** 64-byte record: AABB min, AABB max, {vertices, firstVertex, 0, 0}, origin; all zero (never visible) for a free index. */
+    private void writeCull(java.nio.ByteBuffer input, int index, Section section) {
+        input.position(index * GpuCuller.INPUT_STRIDE);
+        if (section == null) { for (int i = 0; i < GpuCuller.INPUT_STRIDE / 4; i++) input.putInt(0); return; }
+        // Subtract in double before conversion: preserves precision at large world coordinates.
+        double[] offset = {section.x() - anchorX, section.y() - anchorY, section.z() - anchorZ};
+        for (int bound = 0; bound < 2; bound++) {
+            for (int axis = 0; axis < 3; axis++) input.putFloat((float)(offset[axis] + section.bounds()[bound * 3 + axis]) + (bound == 0 ? -.001f : .001f));
+            input.putFloat(0);
+        }
+        input.putInt(section.vertices()).putInt(section.allocation() == null ? 0 : section.allocation().firstVertex).putInt(0).putInt(0);
+        for (int axis = 0; axis < 3; axis++) input.putFloat((float) offset[axis]); input.putFloat(0);
     }
     void draw(VkCommandBuffer command, MemoryStack stack) { draw(command, stack, null, 0); }
     void draw(VkCommandBuffer command, MemoryStack stack, GpuCuller culler, int slot) {
@@ -309,7 +374,9 @@ final class WorldScene implements AutoCloseable {
             }
             vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipeline);
             vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, meshLayout, 0, stack.longs(descriptorSet, culler.descriptorSet(slot), arenaSets[slot]), null);
-            var push = stack.calloc(80); push.asFloatBuffer().put(camera.matrix()); push.putInt(64, count);
+            float[] shift = cameraShift();
+            var push = stack.calloc(96); push.asFloatBuffer().put(camera.matrix()); push.putInt(64, count);
+            push.putFloat(80, shift[0]).putFloat(84, shift[1]).putFloat(88, shift[2]);
             vkCmdPushConstants(command, meshLayout, NVMeshShader.VK_SHADER_STAGE_TASK_BIT_NV | NVMeshShader.VK_SHADER_STAGE_MESH_BIT_NV, 0, push);
             NVMeshShader.vkCmdDrawMeshTasksNV(command, (count + 31) / 32, 0); meshBatches++;
             return;
@@ -318,7 +385,8 @@ final class WorldScene implements AutoCloseable {
             if (arena.buffer() == 0) return;
             vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, drivenPipeline);
             vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, drivenLayout, 0, stack.longs(descriptorSet, culler.descriptorSet(slot)), null);
-            var push = stack.callocFloat(20); push.put(camera.matrix()).position(0);
+            float[] shift = cameraShift();
+            var push = stack.callocFloat(20); push.put(camera.matrix()).put(shift).position(0);
             vkCmdPushConstants(command, drivenLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, push);
             vkCmdBindVertexBuffers(command, 0, stack.longs(arena.buffer()), stack.longs(0));
             culler.drawAll(command, slot); indirectBatches++;
@@ -331,7 +399,6 @@ final class WorldScene implements AutoCloseable {
         push.put(0).put(0).put(0).put(0).flip();
         var buffers = stack.mallocLong(1);
         var offsets = stack.longs(0);
-        int index = 0;
         for (Section section : sections.values()) {
             // Subtract in double before conversion: preserves precision at large world coordinates.
             push.put(16, (float) (section.x() - camera.x())).put(17, (float) (section.y() - camera.y())).put(18, (float) (section.z() - camera.z()));
@@ -340,26 +407,28 @@ final class WorldScene implements AutoCloseable {
                 buffers.put(0, section.buffer().buffer);
                 vkCmdBindVertexBuffers(command, 0, buffers, offsets);
                 if (culler == null) vkCmdDraw(command, section.vertices(), 1, 0, 0);
-                else culler.draw(command, slot, index);
+                else culler.draw(command, slot, section.cullIndex());
             }
-            index++;
         }
     }
 
     /** Back-to-front sections, each with back-to-front quads; drawn after opaque terrain into the translucent target. */
     void drawTranslucent(VkCommandBuffer command, MemoryStack stack, int slot) {
         if (slot < 0 || slot >= TRANSLUCENT_SLOTS) throw new IllegalArgumentException("Translucent slot out of range: " + slot);
-        List<Section> ordered = new ArrayList<>();
+        List<Section> ordered = translucentOrder; ordered.clear();
         for (Section section : sections.values()) if (section.translucent() != null) ordered.add(section);
-        if (ordered.isEmpty()) return;
-        ordered.sort(Comparator.comparingDouble(section -> -distanceSquared(section)));
-        int resorts = 0;
-        // Nearest stale sections spend the re-sort budget first; never-sorted slots are always filled before use.
-        for (int i = ordered.size() - 1; i >= 0; i--) {
-            Section section = ordered.get(i); Translucent translucent = section.translucent();
+        int count = ordered.size();
+        if (count == 0) return;
+        // Nearest first by packed (distance bits, index) keys: no comparator, no boxing.
+        long[] keys = orderKeys = orderKeys.length >= count ? orderKeys : new long[Math.max(count, orderKeys.length * 2)];
+        for (int i = 0; i < count; i++) keys[i] = (long) Float.floatToIntBits((float) distanceSquared(ordered.get(i))) << 32 | i;
+        Arrays.sort(keys, 0, count);
+        int sorts = 0; long sortedQuads = 0;
+        for (int i = 0; i < count && sorts < SORT_BUDGET; i++) {
+            Section section = ordered.get((int) keys[i]); Translucent translucent = section.translucent();
             double x = camera.x() - section.x(), y = camera.y() - section.y(), z = camera.z() - section.z();
-            if (!translucent.sorted[slot]) translucent.sort(slot, x, y, z);
-            else if (resorts < RESORT_BUDGET && translucent.stale(slot, x, y, z)) { translucent.sort(slot, x, y, z); resorts++; }
+            if (!translucent.stale(slot, x, y, z) || (sorts > 0 && sortedQuads + translucent.quads > SORT_QUAD_BUDGET)) continue;
+            translucent.sort(slot, x, y, z); sorts++; sortedQuads += translucent.quads;
         }
         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, translucentPipeline);
         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, stack.longs(descriptorSet), null);
@@ -368,8 +437,8 @@ final class WorldScene implements AutoCloseable {
         push.put(0).put(0).put(0).put(0).flip();
         var buffers = stack.mallocLong(1);
         var offsets = stack.longs(0);
-        for (Section section : ordered) {
-            Translucent translucent = section.translucent();
+        for (int i = count - 1; i >= 0; i--) { // Back to front.
+            Section section = ordered.get((int) keys[i]); Translucent translucent = section.translucent();
             push.put(16, (float) (section.x() - camera.x())).put(17, (float) (section.y() - camera.y())).put(18, (float) (section.z() - camera.z()));
             vkCmdPushConstants(command, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, push);
             buffers.put(0, translucent.vertices.buffer);
@@ -388,12 +457,14 @@ final class WorldScene implements AutoCloseable {
     private void clear() {
         context.uploads.drain();
         sections.values().forEach(Section::close); sections.clear(); tracked.clear(); camera = null; receivedMesh = false;
+        cullSections.clear(); freeCull.clear(); anchored = false; if (cullDirty != null) for (BitSet dirty : cullDirty) dirty.clear();
         if (atlas != null) { atlas.close(); atlas = null; }
         if (lightMap != null) { lightMap.close(); lightMap = null; }
     }
 
     @Override public void close() {
         vkDeviceWaitIdle(context.device); clear();
+        log.accept("CULL_INPUT_WRITES=" + cullWrites + " ARENA_IN_PLACE_REBUILDS=" + arenaReuses + " TRANSLUCENT_SORTS=" + translucentSorts);
         if (arena != null) { log.accept("MESH_ARENA=" + java.util.Arrays.toString(arena.stats()) + " indirectBatches=" + indirectBatches + " meshTaskBatches=" + meshBatches); arena.close(); arena = null; }
         destroyMeshShader();
         if (drivenPipeline != 0) { vkDestroyPipeline(context.device, drivenPipeline, null); drivenPipeline = 0; }

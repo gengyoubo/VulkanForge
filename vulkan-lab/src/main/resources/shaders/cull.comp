@@ -4,7 +4,8 @@ struct Bounds { vec4 minimum; vec4 maximum; uvec4 draw; vec4 origin; };
 layout(std430, binding=0) readonly buffer Input { Bounds sections[]; };
 layout(std430, binding=1) writeonly buffer Output { uvec4 commands[]; };
 layout(std430, binding=2) buffer Count { uint visibleCount; };
-layout(push_constant) uniform View { mat4 viewProjection; uint count; uint compact; } view;
+// Records are anchor-relative; shift = anchor - camera turns them camera-relative.
+layout(push_constant) uniform View { mat4 viewProjection; uint count; uint compact; vec4 shift; } view;
 void main() {
     uint index = gl_GlobalInvocationID.x;
     if (index >= view.count) return;
@@ -14,7 +15,7 @@ void main() {
         vec3 position = vec3((corner & 1u) == 0u ? bounds.minimum.x : bounds.maximum.x,
                              (corner & 2u) == 0u ? bounds.minimum.y : bounds.maximum.y,
                              (corner & 4u) == 0u ? bounds.minimum.z : bounds.maximum.z);
-        vec4 clip = view.viewProjection * vec4(position, 1.0);
+        vec4 clip = view.viewProjection * vec4(position + view.shift.xyz, 1.0);
         uint mask = (clip.x < -clip.w ? 1u : 0u) | (clip.x > clip.w ? 2u : 0u)
                   | (clip.y < -clip.w ? 4u : 0u) | (clip.y > clip.w ? 8u : 0u)
                   | (clip.z < -clip.w ? 16u : 0u) | (clip.z > clip.w ? 32u : 0u);

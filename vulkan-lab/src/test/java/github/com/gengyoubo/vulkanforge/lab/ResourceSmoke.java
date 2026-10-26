@@ -21,7 +21,8 @@ public final class ResourceSmoke {
                 var waits = VkSemaphoreSubmitInfo.calloc(1, stack).sType$Default().semaphore(gate).value(1).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
                 check(vkQueueSubmit2(context.queue, VkSubmitInfo2.calloc(1, stack).sType$Default().pWaitSemaphoreInfos(waits), 0), "block upload queue");
                 long ticket = 0;
-                for (int i = 0; i < 8; i++) ticket = context.uploads.submit(new byte[]{1}, (command, staging, memory) -> {});
+                // Flush each upload as its own batch so every ring slot is in flight behind the gate.
+                for (int i = 0; i < 8; i++) { ticket = context.uploads.submit(new byte[]{1}, (command, staging, offset, memory) -> {}); context.uploads.flush(); }
                 if (context.uploads.available(1, 1) || context.uploads.stats()[3] != 0 || context.uploads.stats()[1] != 0)
                     throw new AssertionError("Busy upload admission waited or reused in-flight staging");
                 int[] retired = {0}; context.uploads.retire(ticket, () -> retired[0]++);
@@ -40,6 +41,17 @@ public final class ResourceSmoke {
                 if (context.memory.stats()[4] > 2) throw new AssertionError("Small buffers fragmented the device memory pool");
                 System.out.println("GPU_MEMORY_SMOKE=OK allocations=" + context.memory.stats()[3] + " blocks=" + context.memory.stats()[4]);
             } finally { for (GpuBuffer buffer : buffers) if (buffer != null) buffer.close(); }
+            // Builds cull.comp, world_driven.vert and (with -Dvulkanforge.nvidiaExtensions=VK_NV_mesh_shader) the task/mesh pipeline.
+            if (context.capabilities.gpuDriven()) {
+                StringBuilder log = new StringBuilder();
+                WorldScene scene = new WorldScene(context, line -> log.append(line).append('\n'));
+                GpuCuller culler = null;
+                try {
+                    scene.initialize(); culler = new GpuCuller(context, 2); scene.enableGpuDriven(culler);
+                    if (scene.meshShaderActive() != context.meshShaderNV) throw new AssertionError("Mesh shader pipeline fell back:\n" + log);
+                } finally { scene.close(); if (culler != null) culler.close(); }
+                System.out.println("WORLD_PIPELINE_SMOKE=OK meshShaderNV=" + context.meshShaderNV);
+            }
         } finally {
             if (gate != 0) try (MemoryStack stack = MemoryStack.stackPush()) {
                 if (!released) vkSignalSemaphore(context.device, VkSemaphoreSignalInfo.calloc(stack).sType$Default().semaphore(gate).value(1));

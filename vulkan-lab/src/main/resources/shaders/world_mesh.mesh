@@ -9,7 +9,7 @@ struct Bounds { vec4 minimum; vec4 maximum; uvec4 draw; vec4 origin; };
 layout(std430, set=1, binding=0) readonly buffer Sections { Bounds sections[]; };
 layout(std430, set=2, binding=0) readonly buffer Vertices { uint words[]; };
 layout(binding = 1) uniform sampler2D lightMap;
-layout(push_constant) uniform View { mat4 viewProjection; uint count; } view;
+layout(push_constant) uniform View { mat4 viewProjection; uint count; vec4 shift; } view; // shift = anchor - camera
 taskNV in Task { uint first[SECTIONS]; uint section[SECTIONS]; } task;
 layout(location = 0) out vec4 vertexColor[];
 layout(location = 1) out vec2 uv[];
@@ -23,7 +23,7 @@ void main() {
     for (uint v = gl_LocalInvocationID.x; v < vertices; v += 32u) {
         uint word = (bounds.draw.y + firstTriangle * 3u + v) * 7u;
         vec3 position = uintBitsToFloat(uvec3(words[word], words[word + 1u], words[word + 2u]));
-        vec4 clip = view.viewProjection * vec4(position + bounds.origin.xyz, 1.0);
+        vec4 clip = view.viewProjection * vec4(position + bounds.origin.xyz + view.shift.xyz, 1.0);
         clip.y = -clip.y;
         clip.z = (clip.z + clip.w) * 0.5;
         gl_MeshVerticesNV[v].gl_Position = clip;

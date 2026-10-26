@@ -118,7 +118,7 @@ final class EntityPass implements AutoCloseable {
         GpuImage image = new GpuImage(context, width, height, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
         long ticket;
         try {
-            ticket = context.uploads.submit(rgba, (upload, staging, stack) -> {
+            ticket = context.uploads.submit(rgba, (upload, staging, offset, stack) -> {
             var barrier = VkImageMemoryBarrier2.calloc(1, stack).sType$Default().srcStageMask(VK_PIPELINE_STAGE_2_NONE)
                     .dstStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).dstAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
                     .oldLayout(VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
@@ -145,7 +145,7 @@ final class EntityPass implements AutoCloseable {
                         .oldLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
                 vkCmdPipelineBarrier2(upload, dependency); // Copy destination -> patch destination write hazard.
             }
-            vkCmdCopyBufferToImage(upload, staging.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VkBufferImageCopy.calloc(1, stack)
+            vkCmdCopyBufferToImage(upload, staging.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VkBufferImageCopy.calloc(1, stack).bufferOffset(offset)
                     .imageSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1)).imageOffset(o -> o.set(x, y, 0)).imageExtent(e -> e.set(patchWidth, patchHeight, 1)));
             barrier.srcStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).srcAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
                     .dstStageMask(VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT).dstAccessMask(VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)
