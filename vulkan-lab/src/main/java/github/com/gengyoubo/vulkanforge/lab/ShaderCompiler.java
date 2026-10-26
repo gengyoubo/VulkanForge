@@ -48,7 +48,7 @@ final class ShaderCompiler {
         try {
             options = shaderc_compile_options_initialize();
             if (options == 0) throw new IllegalStateException("shaderc options initialization failed");
-            // Vulkan 1.3 SPIR-V is also valid on 1.4; these shaders need no 1.4-only instructions.
+            // Vulkan 1.2 accepts SPIR-V 1.5; the 1.3/1.4 paths can use SPIR-V 1.6.
             shaderc_compile_options_set_target_env(options, shaderc_target_env_vulkan, context.apiVersion < org.lwjgl.vulkan.VK13.VK_API_VERSION_1_3 ? shaderc_env_version_vulkan_1_2 : shaderc_env_version_vulkan_1_3);
             shaderc_compile_options_set_target_spirv(options, context.apiVersion < org.lwjgl.vulkan.VK13.VK_API_VERSION_1_3 ? shaderc_spirv_version_1_5 : shaderc_spirv_version_1_6);
             result = shaderc_compile_into_spv(compiler, source, kind, resource, "main", options);

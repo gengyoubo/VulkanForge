@@ -4,7 +4,7 @@ Minecraft **1.20.1 / Forge 47.4.28 / Java 17** 客户端 Vulkan 渲染实验。
 
 当前已经打通四条路径：
 
-- 独立 Vulkan 1.3/1.4 窗口：交换链、动态渲染、缩放重建、三角形绘制。
+- 独立 Vulkan 1.2/1.3/1.4 窗口：交换链、动态渲染、缩放重建、三角形绘制。
 - Minecraft 主窗口呈现（Windows）：可见窗口使用 `GLFW_NO_API`，创建 Win32 Vulkan Surface / Swapchain；原版主 framebuffer 经共享 GPU 图像和跨 API 信号量交给 `vkQueuePresentKHR`，Vulkan 在最终图像中追加受支持的手持物和 HUD。正常呈现过程不经过 CPU 像素读回。
 - 游戏主窗口预览：同进程 Vulkan 绘制旋转三角形 → 导出共享 GPU 图像 → 原有 GL 上下文采样 → 主菜单 / HUD 显示。
 - 世界不透明和镂空方块：采集原版烘焙模型、贴图 UV、染色、环境遮蔽与光照坐标 → 分区顶点缓冲 → Vulkan 图集/光照图采样、相机变换、alpha 丢弃、D32 深度测试 → 在原版 cutout 阶段之后合成。
@@ -26,7 +26,7 @@ IntelliJ IDEA：导入根目录的 `build.gradle`，将 **Gradle JVM** 和 **Pro
 
 产物：`build/libs/vulkanforge-0.1.0.jar`。放入 Forge 1.20.1 客户端的 `mods` 文件夹即可；Vulkan 测试程序和运行库已打包，无需另放 LWJGL jar。当前随包提供 Windows/Linux x86_64 原生库；Linux 路径尚未实机验证。
 
-主窗口 Vulkan 呈现目前仅支持 **Windows x86_64**，要求同一 GPU 支持所选的 Vulkan 1.3 或 1.4、`dynamicRendering`、`synchronization2`、`VK_KHR_swapchain`、Win32 external-memory / external-semaphore，以及 GL 对应的两个 Win32 扩展。启动时按设备 UUID 匹配，并实际验证共享内存导入和 framebuffer；失败时使用原来的 OpenGL 窗口。其他平台继续使用原来的 GL 呈现。可在启动器 JVM 参数中加入 `-Dvulkanforge.directPresent=false`，重启后关闭主窗口 Vulkan 路径；开发环境：
+主窗口 Vulkan 呈现目前仅支持 **Windows x86_64**，要求同一 GPU 支持所选的 Vulkan 1.2、1.3 或 1.4、`dynamicRendering`、`synchronization2`（1.2 通过 `VK_KHR_dynamic_rendering` / `VK_KHR_synchronization2`）、`VK_KHR_swapchain`、Win32 external-memory / external-semaphore，以及 GL 对应的两个 Win32 扩展。启动时按设备 UUID 匹配，并实际验证共享内存导入和 framebuffer；失败时使用原来的 OpenGL 窗口。其他平台继续使用原来的 GL 呈现。可在启动器 JVM 参数中加入 `-Dvulkanforge.directPresent=false`，重启后关闭主窗口 Vulkan 路径；开发环境：
 
 ```powershell
 .\gradlew.bat '-Dvulkanforge.directPresent=false' runClient
@@ -40,7 +40,6 @@ IntelliJ IDEA：导入根目录的 `build.gradle`，将 **Gradle JVM** 和 **Pro
 
 - **F8**：启停 Vulkan。在主菜单显示三角形预览，进入世界后自动切换为真实不透明和镂空地形。
 - **F10**：在全视图合成与右上角小窗对照之间切换。
-- 主菜单左下角 **Vulkan 窗口内预览 / Vulkan preview** 按钮也可启停。
 - **F9**：打开独立 Vulkan 三角形窗口；该窗口按 Esc 关闭。
 - 快捷键可以在原版按键设置中重新绑定。
 - 没有满足所选 Vulkan 版本要求的设备时，预览显示失败状态并保存报告，原版游戏继续运行。
@@ -111,9 +110,43 @@ java -jar vulkan-lab/build/libs/vulkan-lab.jar --triangle --frames=90 --resize-s
 java -jar vulkan-lab/build/libs/vulkan-lab.jar --probe --require-validation
 ```
 
-普通 `build` 不要求 GPU 或 Vulkan 驱动。GPU 检查默认需要 Vulkan 1.4 硬件和驱动，加入 `-Pvulkan13Smoke` 可验证 1.3 路径。日志中 `VALIDATION=UNAVAILABLE` 表示没有启用校验层；此时错误计数为零不代表通过了校验层检查。
+普通 `build` 不要求 GPU 或 Vulkan 驱动。GPU 检查默认需要 Vulkan 1.4 硬件和驱动，加入 `-Pvulkan13Smoke` 可验证 1.3 路径，或通过 `'-PvulkanVersion=1.2'` 指定 1.2。日志中 `VALIDATION=UNAVAILABLE` 表示没有启用校验层；此时错误计数为零不代表通过了校验层检查。
 
 `-PvalidationSmoke` 要求主窗口校验层实际启用，并在客户端退出后检查 `VALIDATION=ENABLED`、`VALIDATION_ERRORS=0`、共享地形计时与完整关闭标记；兼容路径额外检查地形桥。检查缺少校验层或退出超时会失败。同进程检查核对后端 PID 等于游戏 PID、复用原版网格、远处与垂直范围覆盖、渲染距离增减和无地形子进程启动。独立 GPU 像素测试仍使用固定 45 个非空分区。`smokePresent` 额外检查 acquire 后取消帧、GL 交接前/后故障恢复，以及仍持有已 acquire 图像时的关闭。同步验证通过 `VK_VALIDATION_VALIDATE_SYNC=1` 开启，正式性能测量时应关闭校验层。
+
+## Vulkan / OpenGL 版本与离屏检查
+
+配置界面支持 Vulkan **1.2 / 1.3 / 1.4** 和 OpenGL **4.3 / 4.4 / 4.5 / 4.6**。原主菜单左下角的预览按钮已移除，F8 快捷键保留。版本设置在重启后生效。
+
+Vulkan 1.2 检查并启用 `VK_KHR_dynamic_rendering`、`VK_KHR_synchronization2`，使用 KHR 命令和 SPIR-V 1.5；1.3/1.4 使用核心命令及 SPIR-V 1.6。驱动不满足必要扩展时会报告不可用。
+
+OpenGL 各版本使用同一套地形、实体和方块实体管线，调用受所选版本限制：
+
+| 版本 | 缓冲与对象操作 | 着色器 / 间接绘制 |
+| --- | --- | --- |
+| 4.3 | 可变缓冲、CPU 暂存并上传、绑定式对象操作 | GLSL 4.30、实例属性传递记录索引、读回 GPU 计数后多重间接绘制 |
+| 4.4 | 不可变缓冲、持久映射、绑定式对象操作 | 同 4.3 |
+| 4.5 | 不可变缓冲、持久映射、DSA | 同 4.3 |
+| 4.6 | 不可变缓冲、持久映射、DSA | SPIR-V（失败时 GLSL）、核心 GPU 计数间接绘制 |
+
+4.3–4.5 的 GPU 绘制计数读回会发生同步，因此不能把这些兼容路径的耗时直接等同于 4.6。
+
+```powershell
+# 全部七个版本；不启动 Minecraft，不显示窗口，不调用 SwapBuffers / Present
+.\gradlew.bat smokeOffscreenVersions
+
+# 分别运行：OpenGL 使用隐藏上下文及 FBO；Vulkan 使用无 Surface 的离屏图像
+.\gradlew.bat smokeGlOffscreen
+.\gradlew.bat :vulkan-lab:smokeVulkanOffscreen
+
+# 单版本
+.\gradlew.bat smokeGl43
+.\gradlew.bat :vulkan-lab:smokeVk12
+```
+
+报告按版本保存在 `build/reports/offscreen-versions/gl-4.x/` 和 `vk-1.x/`。OpenGL 检查生产地形管线的深度、镂空阈值、贴图/光照更新、Hi-Z、相机、删除、重置、透明混合、GPU 计数和实体着色器编译，并检查 GL debug 错误。Vulkan 检查离屏像素、动画和协议、世界更新、上传资源寿命，以及主窗口后端在没有 Surface/Swapchain 时的共享图像像素、双缓冲信号量往返、尺寸变化和资源关闭。诊断像素读回只发生在测试中。
+
+2026-10-26 本机 RTX 3050 Laptop GPU：七个版本的离屏检查通过；OpenGL 实际上下文分别为 4.3、4.4、4.5、4.6，GL 错误为零；三个 Vulkan 共享测试各提交 96 帧，呈现帧数为零。本次环境未启用 Vulkan validation layer（报告为 `VALIDATION=UNAVAILABLE`），因此这些结果不代表校验层检查通过。
 
 ## 半透明地形（P6 第一步）
 
@@ -235,11 +268,11 @@ HAND 从 `AFTER_LEVEL` 到 `GameRenderer.render` 的 GUI 深度清除，保存�
 
 2026-10-26 本轮回归：资源压力、GPU Driven / push 与回退路径、世界和兼容桥像素检查、完整 Forge 场景及 `build` 均通过。新增远处/垂直 Section 覆盖、4→6→4 距离变化、退出世界缓存释放、手持物直画交换链及 GUI 回退顺序检查。主窗口启用 Khronos 与同步校验，完成 12978 帧呈现，`VALIDATION_ERRORS=0`；5485 次异步上传背压等待为零。手持物光照图按版本绑定后，同一回归流程的 uniform Descriptor 更新从 1928 次降至 6 次；这是缓存工作量计数，不代表 FPS 提升。报告位于 `run/logs/vulkanforge/world-client-smoke/report.txt` 与 `run/logs/vulkanforge/main-window-report.txt`。
 
-## OpenGL 4.6 后端（Issue #4）
+## OpenGL 4.3–4.6 后端（Issue #4）
 
-对应 [GL43-46 / issue #4](https://github.com/gengyoubo/VulkanForge/issues/4)。配置 `renderer.backend = "OPENGL"`、`opengl.version = "GL_4_6"`，重启后进入世界按 F8（或主菜单左下角按钮）开启。配置在窗口创建前直接读取 TOML（Forge 此时尚未加载客户端配置），所以修改需重启；`-Dvulkanforge.startup=OPENGL:GL_4_6` 可只对本次启动覆盖。目前已实现 Vulkan 1.3、1.4 与 OpenGL 4.6：Vulkan 1.2 保留原版 GL 窗口，OpenGL 4.3–4.5 只请求对应上下文、地形仍走原版，配置界面标注“未实现”。在设置中选择 Vulkan 1.3 后点击“保存并重启”即可应用，1.4 仍为默认值。OpenGL 后端不创建 Vulkan 主窗口，也不运行启动期 Vulkan 探测。
+对应 [GL43-46 / issue #4](https://github.com/gengyoubo/VulkanForge/issues/4)。配置 `renderer.backend = "OPENGL"`、`opengl.version = "GL_4_6"`，重启后进入世界按 F8 开启。配置在窗口创建前直接读取 TOML（Forge 此时尚未加载客户端配置），所以修改需重启；`-Dvulkanforge.startup=OPENGL:GL_4_6` 可只对本次启动覆盖。目前已实现 Vulkan 1.2、1.3、1.4 与 OpenGL 4.3–4.6，兼容路径见前面的版本表；OpenGL 配置可改为 `GL_4_3`、`GL_4_4` 或 `GL_4_5`。在设置中选择 Vulkan 1.3 后点击“保存并重启”即可应用，1.4 仍为默认值。OpenGL 后端不创建 Vulkan 主窗口，也不运行启动期 Vulkan 探测。
 
-Forge 早期窗口按 4.6 → 3.2 依次尝试，已经拿到驱动支持的最高版本；只有关闭 `earlyWindowControl` 且上下文低于 4.6 时才按 4.6 core 重建窗口。所有绘制都在游戏自己的 GL 上下文中直接画进主 framebuffer 与原版深度，不需要合成、共享图像或纹理读回：直接采样原版方块图集和光照图。
+Forge 早期窗口按 4.6 → 3.2 依次尝试，已经拿到驱动支持的最高版本；只有关闭 `earlyWindowControl` 且上下文低于所选版本时才按该版本 core 重建窗口；后端调用始终受所选版本限制。所有绘制都在游戏自己的 GL 上下文中直接画进主 framebuffer 与原版深度，不需要合成、共享图像或纹理读回：直接采样原版方块图集和光照图。
 
 | GL 版本 | 功能 | 当前用法 |
 | --- | --- | --- |

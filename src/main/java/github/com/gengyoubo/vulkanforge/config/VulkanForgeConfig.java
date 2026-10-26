@@ -16,7 +16,7 @@ import net.minecraftforge.fml.loading.FMLPaths;
 /**
  * Client config (config/vulkanforge-client.toml), edited from the Mods list "Config" button.
  * All values are startup choices: {@link #startup()} snapshots them once, before the game window exists.
- * Implemented today: Vulkan 1.3/1.4 (main-window presentation) and OpenGL 4.6 (GPU-driven terrain).
+ * Vulkan 1.2/1.3/1.4 (main-window presentation) and OpenGL 4.3 through 4.6 (GPU-driven terrain).
  */
 public final class VulkanForgeConfig {
     public enum Backend { VULKAN, OPENGL }
@@ -26,7 +26,7 @@ public final class VulkanForgeConfig {
         public final String label;
         /** Packed VkApplicationInfo.apiVersion, passed across the isolated backend boundary as an int. */
         public final int apiVersion;
-        /** False: selectable and saved, but startup falls back to the vanilla OpenGL window. */
+        /** Whether this version has a rendering implementation. Device support is checked separately. */
         public final boolean implemented;
         VulkanVersion(int minor, boolean implemented) {
             this.label = "1." + minor; this.apiVersion = (1 << 22) | (minor << 12); this.implemented = implemented;
@@ -38,7 +38,7 @@ public final class VulkanForgeConfig {
         public final String label;
         /** Requested core context version; 0.0 keeps Minecraft's own request. */
         public final int major, minor;
-        /** False: the context is requested, but terrain stays on vanilla rendering. */
+        /** Whether this version has a rendering implementation. Device support is checked separately. */
         public final boolean implemented;
         OpenGLVersion(String label, int major, int minor, boolean implemented) {
             this.label = label; this.major = major; this.minor = minor; this.implemented = implemented;
@@ -102,7 +102,7 @@ public final class VulkanForgeConfig {
         }
         /** Vulkan Surface/Swapchain main window (Windows only, also gated by -Dvulkanforge.directPresent). */
         public boolean vulkanMainWindow() { return backend == Backend.VULKAN && vulkanVersion.implemented; }
-        /** In-context OpenGL 4.6 terrain renderer instead of the Vulkan bridge. */
+        /** In-context OpenGL 4.3+ terrain renderer instead of the Vulkan bridge. */
         public boolean gl46Terrain() { return backend == Backend.OPENGL && openGLVersion != OpenGLVersion.DEFAULT; }
         @Override public String toString() {
             if (backend != Backend.VULKAN) return "OPENGL " + openGLVersion.label;

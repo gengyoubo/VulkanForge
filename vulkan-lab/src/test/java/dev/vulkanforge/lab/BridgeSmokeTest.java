@@ -20,7 +20,7 @@ public final class BridgeSmokeTest {
         List<String> command = new ArrayList<>(List.of(Path.of(System.getProperty("java.home"), "bin", executable).toString(),
                 "-Dvulkanforge.vulkanVersion=" + api, "-jar", jar, "--bridge"));
         if (!stopEarly) command.add("--frames=24");
-        Path report = Path.of("build", "reports", stopEarly ? "bridge-stop-smoke.txt" : "bridge-pixel-smoke.txt");
+        Path report = Path.of(System.getProperty("vulkanforge.smokeReportDir", "build/reports"), stopEarly ? "bridge-stop-smoke.txt" : "bridge-pixel-smoke.txt");
         Files.createDirectories(report.getParent());
         Process child = new ProcessBuilder(command).redirectError(report.toFile()).start();
         ScheduledExecutorService watchdog = Executors.newSingleThreadScheduledExecutor();

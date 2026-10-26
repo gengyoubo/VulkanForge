@@ -111,7 +111,7 @@ def main():
             elif eid == '451':
                 hwq_fence[(d[0], d[1])] = t
             elif eid == '259':
-                flips.append((t, d[0], int(d[7])))
+                flips.append((t, d[0], int(d[7]), d[4], int(d[2])))  # time, adapter, present id, flipped-to allocation, plane
 
     # Hardware-scheduled packets: map their progress fence to the 450/451 pair, so both schedulers expose start/end times.
     for key, fence in fence_of.items():
@@ -173,7 +173,7 @@ def main():
         print(f"    started->completed           {fmt(r['on_hw'])}")
         print(f"    submitted->done              {fmt(r['total'])}")
         print(f"    start-to-start cadence       {fmt(r['cadence'])}")
-    disp_flips = [t for t, a, _ in flips if a == display and lo <= t <= hi]
+    disp_flips = [t for t, a, *_ in flips if a == display and lo <= t <= hi]
     if len(disp_flips) > 2:
         print(f'\nflips on display adapter: {len(disp_flips) * 1000 / span_ms:.0f}/s interval {fmt([(b - a) * TICK_MS for a, b in zip(disp_flips, disp_flips[1:])])}')
 
@@ -188,16 +188,16 @@ def main():
         events.append((t, name, f'submit {kind} #{key[1]}'))
         for table, what in ((ready, 'ready'), (hw_start, 'GPU start'), (hw_end, 'GPU done'), (done, 'retired')):
             if key in table and table[key] <= end: events.append((table[key], name, f'    {what} #{key[1]}'))
-    events += [(t, 'display', 'FLIP') for t, a, _ in flips if a == display and first <= t <= end]
+    events += [(t, 'display', f'FLIP -> {alloc[-5:]}') for t, a, _, alloc, _ in flips if a == display and first <= t <= end]
     events += [(t, 'display', 'vsync') for t in vs if first <= t <= end]
     print(f'\ntimeline ({frames} frames, ms):')
     for t, who, what in sorted(events):
         print(f'  {(t - first) * TICK_MS:8.3f}  {who:28s} {what}')
     if app_frames:
-        breakdown(app_frames, render_submits, wakeups, rows, queued, done, ready)
+        breakdown(app_frames, render_submits, wakeups, rows, queued, done, ready, sorted((t, alloc, plane) for t, a, _, alloc, plane in flips if a == display))
 
 
-def breakdown(app_frames, render_submits, wakeups, rows, queued, done, ready):
+def breakdown(app_frames, render_submits, wakeups, rows, queued, done, ready, display_flips):
     import bisect
     render_submits.sort(); wakeups.sort()
     # Clock check: the render thread's own DxgKrnl submit must fall inside the app's vkQueueSubmit2 window.
@@ -236,6 +236,56 @@ def breakdown(app_frames, render_submits, wakeups, rows, queued, done, ready):
     for name, values in parts.items():
         print(f'  {name:44s} {fmt(values)}')
     print('  render-thread wakeups inside acquire: ' + ', '.join(f'{k}x: {v}' for k, v in sorted(wake_counts.items())))
+    lifecycle(app_frames, flips, display_flips)
+
+
+def lifecycle(app_frames, flip_packets, display_flips):
+    """
+    Per swapchain image: acquired -> submitted -> presented -> its cross-adapter copy done (the app's Intel flip packet retires
+    once the copy has signalled) -> flipped to the screen (DxgKrnl 259, FlipToDriverAllocation) -> released when the next flip on
+    that plane shows another allocation -> acquired again. Then: when an acquire returns image j, how long had image j already
+    been free, by either definition?
+    """
+    import bisect
+    flip_times = [t for t, _, _ in display_flips]
+    ms = lambda a, b: (b - a) * TICK_MS
+    life = []  # per app frame: dict with image, packet, flip, alloc, released
+    for n, fr in enumerate(app_frames):
+        nxt = app_frames[n + 1]['submitBegin'] if n + 1 < len(app_frames) else fr['submitBegin'] + 10 ** 6
+        i = bisect.bisect_right(flip_packets, fr['submitBegin'])
+        if i >= len(flip_packets) or flip_packets[i] > nxt: life.append(None); continue
+        packet = flip_packets[i]
+        k = bisect.bisect_left(flip_times, packet - 5000)  # the screen flip is programmed just before the packet retires
+        near = [f for f in display_flips[k:bisect.bisect_right(flip_times, packet + 3000)]]
+        if not near: life.append(None); continue
+        t, alloc, plane = min(near, key=lambda f: abs(f[0] - packet))
+        later = [f for f in display_flips[bisect.bisect_right(flip_times, t):bisect.bisect_right(flip_times, t + 10 ** 6)] if f[2] == plane and f[1] != alloc]
+        life.append(dict(image=fr['image'], packet=packet, flip=t, alloc=alloc, released=later[0][0] if later else None))
+    pairs = collections.Counter((l['image'], l['alloc'][-6:]) for l in life if l)
+    print('\nswapchain image -> flipped Intel-side allocation (frames):  ' + ', '.join(f'img{i}->{a}: {c}' for (i, a), c in sorted(pairs.items()) if c > 5))
+    order = collections.Counter(tuple(fr['image'] for fr in app_frames[n:n + 4]) for n in range(0, len(app_frames) - 4))
+    print('most common image order (4 frames): ' + ', '.join(f'{k}: {v}' for k, v in order.most_common(3)))
+    last = {}; reuse = collections.Counter(); parts = collections.defaultdict(list)
+    for n, fr in enumerate(app_frames):
+        j = fr['image']
+        if j in last and life[last[j]]:
+            m = last[j]; prev = life[m]; reuse[n - m] += 1
+            parts['previous use: copy done (Intel flip packet) -> acquire BEGIN'].append(ms(prev['packet'], fr['acquireBegin']))
+            parts['previous use: copy done -> acquire RETURNS'].append(ms(prev['packet'], fr['acquireEnd']))
+            if prev['released']:
+                parts['previous use: Intel buffer released -> acquire BEGIN'].append(ms(prev['released'], fr['acquireBegin']))
+                parts['previous use: Intel buffer released -> acquire RETURNS'].append(ms(prev['released'], fr['acquireEnd']))
+        if n > 0 and life[n - 1]:
+            parts['last frame flipped -> acquire RETURNS'].append(ms(life[n - 1]['flip'], fr['acquireEnd']))
+        # The Intel-side buffer this frame's copy writes into: when was it last released by the display?
+        if life[n]:
+            p = next((q for q in range(n - 1, max(n - 8, -1), -1) if life[q] and life[q]['alloc'] == life[n]['alloc']), None)
+            if p is not None and life[p]['released']:
+                parts["this frame's Intel buffer released -> acquire BEGIN"].append(ms(life[p]['released'], fr['acquireBegin']))
+        last[j] = n
+    print('frames between two uses of the same image: ' + ', '.join(f'{k}: {v}' for k, v in sorted(reuse.items())))
+    for name, values in parts.items():
+        print(f'  {name:58s} {fmt(values)}')
 
 
 if __name__ == '__main__':

@@ -10,7 +10,7 @@ import java.util.function.Predicate;
 /** Runs the actual world command protocol and checks depth, atlas, camera, removals and epochs on a GPU. */
 public final class WorldSmokeTest {
     public static void main(String[] args) throws Exception {
-        Path report = Path.of("build/reports/world-smoke.txt"); Files.createDirectories(report.getParent());
+        Path report = Path.of(System.getProperty("vulkanforge.smokeReportDir", "build/reports"), "world-smoke.txt"); Files.createDirectories(report.getParent());
         String executable = System.getProperty("os.name").startsWith("Windows") ? "java.exe" : "java";
         String api = System.getProperty("vulkanforge.vulkanVersion", "1.4");
         Process process = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", executable).toString(),

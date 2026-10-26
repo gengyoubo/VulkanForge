@@ -86,6 +86,62 @@ tasks.register('restartSmoke', JavaExec) {
     javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
 }
 
+// Explicit GPU tests, using the production terrain code in hidden GL contexts and FBOs only.
+['4.3', '4.4', '4.5', '4.6'].each { api ->
+    tasks.register('smokeGl' + api.replace('.', ''), JavaExec) {
+        dependsOn tasks.named('compileSmokeJava'), tasks.named('processResources')
+        classpath = sourceSets.smoke.runtimeClasspath
+        mainClass = 'github.com.gengyoubo.vulkanforge.client.GlOffscreenSmoke'
+        javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+        systemProperty 'log4j.configurationFile', file('src/smoke/resources/offscreen-log4j2.xml').absolutePath
+        args api
+    }
+}
+tasks.register('offscreenBenchmarkArgs') {
+    dependsOn 'compileSmokeJava', 'processResources', ':vulkan-lab:exportBenchmarkScene', ':vulkan-lab:traceArgs'
+    doLast {
+        def destination = file('build/reports/offscreen-performance/gl.args')
+        destination.parentFile.mkdirs()
+        destination.text = '-cp "' + sourceSets.smoke.runtimeClasspath.asPath.replace(File.separator, '/') + '"\n' +
+                '-Dlog4j.configurationFile="' + file('src/smoke/resources/offscreen-log4j2.xml').absolutePath.replace(File.separator, '/') + '"\n'
+    }
+}
+tasks.register('smokeGlOffscreen') { dependsOn 'smokeGl43', 'smokeGl44', 'smokeGl45', 'smokeGl46' }
+['4.3', '4.4', '4.5', '4.6'].each { api ->
+    tasks.register('benchmarkGl' + api.replace('.', ''), JavaExec) {
+        dependsOn tasks.named('compileSmokeJava'), tasks.named('processResources'), ':vulkan-lab:exportBenchmarkScene'
+        classpath = sourceSets.smoke.runtimeClasspath
+        mainClass = 'github.com.gengyoubo.vulkanforge.client.GlOffscreenBenchmark'
+        javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+        systemProperty 'log4j.configurationFile', file('src/smoke/resources/offscreen-log4j2.xml').absolutePath
+        rootProject.properties.findAll { it.key.startsWith('bench.') }.each { systemProperty it.key, it.value }
+        args api, file('build/reports/offscreen-performance/scene.bin').absolutePath
+    }
+}
+tasks.register('smokeOffscreenVersions') {
+    dependsOn 'smokeGlOffscreen', ':vulkan-lab:smokeVulkanOffscreen'
+    doLast {
+        def reports = file('build/reports/offscreen-versions')
+        def lines = ['# Offscreen version checks', '', '| API | Result | Evidence |', '| --- | --- | --- |']
+        ['4.3', '4.4', '4.5', '4.6'].each { api ->
+            def report = new File(reports, 'gl-' + api + '/report.txt')
+            if (!report.text.contains('STATUS=OK')) throw new GradleException('Missing OpenGL ' + api + ' success report')
+            lines.add('| OpenGL ' + api + ' | PASS | [FBO pixels and GL errors](gl-' + api + '/report.txt) |')
+        }
+        ['1.2', '1.3', '1.4'].each { api ->
+            ['world', 'bridge', 'resources', 'shared'].each { check ->
+                if (!new File(reports, 'vk-' + api + '/' + check + '-result.txt').text.contains('STATUS=OK'))
+                    throw new GradleException('Missing Vulkan ' + api + ' ' + check + ' success report')
+            }
+            lines.add('| Vulkan ' + api + ' | PASS | [World](vk-' + api + '/world-result.txt), [bridge](vk-' + api + '/bridge-result.txt), [resources](vk-' + api + '/resources-result.txt), [shared images](vk-' + api + '/shared-result.txt) |')
+        }
+        lines.addAll(['', 'No visible windows, SwapBuffers or presentation. Diagnostic pixel readback is used to verify offscreen images.',
+                'See each Vulkan log for VALIDATION=ENABLED or UNAVAILABLE; zero errors with an unavailable layer is not a validation-layer pass.', '',
+                'Reproduce: `gradlew.bat smokeOffscreenVersions`'])
+        new File(reports, 'summary.md').text = lines.join('\n') + '\n'
+    }
+}
+
 if (project.hasProperty('gl46Smoke') || project.hasProperty('gl46Move')) {
     def gl46Report = project.hasProperty('gl46Move') ? 'run/logs/vulkanforge/gl46-move/report.txt' : 'run/logs/vulkanforge/gl46-smoke/report.txt'
     tasks.matching { it.name == 'runClient' }.configureEach {

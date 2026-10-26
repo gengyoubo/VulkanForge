@@ -15,7 +15,7 @@ import static org.lwjgl.opengl.GL32C.*;
 import static org.lwjgl.opengl.GL44C.*;
 import static org.lwjgl.opengl.GL45C.*;
 
-/** GL 4.4 immutable storage / persistent mapping and GL 4.5 DSA buffers for the OpenGL 4.6 terrain renderer. */
+/** Persistent rings on GL 4.4+, with dirty CPU mirrors uploaded before GPU use on GL 4.3. */
 final class Gl46Buffers {
     private Gl46Buffers() { }
 

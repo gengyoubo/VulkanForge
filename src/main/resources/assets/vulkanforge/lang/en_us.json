@@ -44,9 +44,9 @@
   "vulkanforge.config.nvidia.shading_rate_image": "Shading rate image",
   "vulkanforge.config.nvidia.shading_rate_image.tooltip": "Variable-rate shading driven by an image; lowers shading cost in less important screen regions.",
   "vulkanforge.config.unimplemented": " (not implemented)",
-  "vulkanforge.gl46.status": "OpenGL 4.6 terrain | %s sections | frame %s",
-  "vulkanforge.gl46.waiting": "OpenGL 4.6 terrain | waiting for section meshes",
+  "vulkanforge.gl46.status": "OpenGL %s terrain | %s sections | frame %s",
+  "vulkanforge.gl46.waiting": "OpenGL %s terrain | waiting for section meshes",
   "vulkanforge.gl46.controls": "F8 toggle | GPU culling + indirect draws",
-  "vulkanforge.gl46.unavailable": "OpenGL 4.6 terrain unavailable: %s",
-  "vulkanforge.gl46.failed": "OpenGL 4.6 terrain failed and fell back to vanilla; see the log"
+  "vulkanforge.gl46.unavailable": "OpenGL %s terrain unavailable: %s",
+  "vulkanforge.gl46.failed": "OpenGL %s terrain failed and fell back to vanilla; see the log"
 }

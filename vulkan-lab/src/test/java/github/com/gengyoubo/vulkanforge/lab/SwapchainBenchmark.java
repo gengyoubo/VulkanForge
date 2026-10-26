@@ -22,6 +22,8 @@ import static org.lwjgl.vulkan.VK13.*;
  * -Dbench.timerResolutionUs=N (see TimerResolution), -Dbench.frames, -Dbench.width/height, -Dbench.fullscreen, -Dbench.cpuMs (spin before acquire), -Dbench.inFlight=N (2),
  * -Dvulkanforge.presentMode=immediate|mailbox|fifo (immediate), -Dvulkanforge.swapchainImages=N (min+1).
  * FPS counts completed frames only: the queue is idle at both ends of the timed window.
+ * -Dbench.acquire=blocking (default, 5 s timeout) | zero (one timeout-0 call; on VK_NOT_READY fall back to blocking) | spin (repeat
+ * timeout-0 calls until an image is returned): tests whether the image is already acquirable when vkAcquireNextImageKHR is called.
  * -Dbench.timeline=file.csv also writes each timed frame's fence-wait/acquire/submit/present begin and end as Windows system time
  * (GetSystemTimePreciseAsFileTime, 100 ns, the clock tracerpt reports), plus the render thread id, for
  * trace/analyze-present-trace.py --timeline to place on the ETW GPU timeline.
@@ -32,6 +34,8 @@ final class SwapchainBenchmark {
     static void run() {
         int frames = Integer.getInteger("bench.frames", 3000), width = Integer.getInteger("bench.width", 1600), height = Integer.getInteger("bench.height", 900);
         int inFlight = Integer.getInteger("bench.inFlight", 2);
+        String acquireMode = System.getProperty("bench.acquire", "blocking").toLowerCase();
+        if (!java.util.List.of("blocking", "zero", "spin").contains(acquireMode)) throw new IllegalArgumentException("bench.acquire=" + acquireMode);
         boolean fullscreen = Boolean.getBoolean("bench.fullscreen");
         double cpuMs = Double.parseDouble(System.getProperty("bench.cpuMs", "0"));
         org.lwjgl.system.Configuration.STACK_SIZE.set(1024);
@@ -99,6 +103,8 @@ final class SwapchainBenchmark {
             int total = WARMUP + frames;
             long[] fenceWait = new long[frames], acquire = new long[frames], submit = new long[frames], present = new long[frames], interval = new long[frames];
             long[] availability = new long[frames]; int availableSamples = 0;
+            long[] firstCall = new long[frames], acquireCalls = new long[frames];
+            java.util.Map<String, Integer> firstResults = new java.util.TreeMap<>();
             long[] presentedAt = new long[swapImages.length]; int[] uses = new int[swapImages.length];
             String timelinePath = System.getProperty("bench.timeline");
             FileTimeClock clock = timelinePath == null ? null : new FileTimeClock();
@@ -124,7 +130,19 @@ final class SwapchainBenchmark {
                     timers.collect(slot);
                     long t1 = System.nanoTime();
                     if (clock != null && at >= 0) timeline[at * TIMELINE_COLUMNS.length + 1] = clock.now();
-                    int result = vkAcquireNextImageKHR(context.device, swapchain, 5_000_000_000L, acquired[slot], 0, index);
+                    int result;
+                    if (acquireMode.equals("blocking")) result = vkAcquireNextImageKHR(context.device, swapchain, 5_000_000_000L, acquired[slot], 0, index);
+                    else {
+                        // Timeout 0 never waits: VK_NOT_READY means no image is acquirable yet (the semaphore is then left unsignaled).
+                        result = vkAcquireNextImageKHR(context.device, swapchain, 0, acquired[slot], 0, index);
+                        long probed = System.nanoTime(); int calls = 1;
+                        if (at >= 0) { firstCall[at] = probed - t1; firstResults.merge(resultName(result), 1, Integer::sum); }
+                        while (result == VK_NOT_READY || result == VK_TIMEOUT) {
+                            result = vkAcquireNextImageKHR(context.device, swapchain, acquireMode.equals("spin") ? 0 : 5_000_000_000L, acquired[slot], 0, index);
+                            calls++;
+                        }
+                        if (at >= 0) acquireCalls[at] = calls;
+                    }
                     long t2 = System.nanoTime();
                     if (clock != null && at >= 0) timeline[at * TIMELINE_COLUMNS.length + 2] = clock.now();
                     if (result == VK_ERROR_OUT_OF_DATE_KHR) throw new AssertionError("Swapchain out of date (window resized/minimized during the run)");
@@ -175,6 +193,13 @@ final class SwapchainBenchmark {
                     + stats("recordSubmit", submit, frames) + " " + stats("queuePresent", present, frames));
             System.out.println("SWAPCHAIN_BENCH_PACING " + stats("presentInterval", Arrays.copyOfRange(interval, 1, frames), frames - 1) + " "
                     + stats("imagePresentToReacquire", availability, availableSamples) + " imageUses=" + Arrays.toString(uses) + " suboptimal=" + suboptimal + " outOfDate=" + outOfDate);
+            if (!acquireMode.equals("blocking")) {
+                long[] extra = new long[frames]; int notReady = 0;
+                for (int i = 0; i < frames; i++) if (acquireCalls[i] > 1) extra[notReady++] = acquire[i] - firstCall[i];
+                System.out.println("SWAPCHAIN_BENCH_ACQUIRE mode=" + acquireMode + " firstCallResults=" + firstResults + " " + stats("firstCall", firstCall, frames)
+                        + " notReadyFrames=" + notReady + " " + stats("afterNotReady", extra, notReady) + " callsPerAcquire(mean)="
+                        + String.format("%.1f", Arrays.stream(acquireCalls).average().orElse(0)));
+            }
             timers.report(System.out::println);
             timers.close();
             if (clock != null) {
@@ -221,6 +246,12 @@ final class SwapchainBenchmark {
         long[] sorted = Arrays.copyOf(nanos, count); Arrays.sort(sorted);
         double mean = Arrays.stream(sorted).average().orElse(0) / 1e6;
         return String.format("%s=%.3f/%.3f/%.3f/%.3f", name, mean, sorted[count / 2] / 1e6, sorted[Math.min(count - 1, (int) (count * .99))] / 1e6, sorted[count - 1] / 1e6);
+    }
+    private static String resultName(int result) {
+        return switch (result) {
+            case VK_SUCCESS -> "SUCCESS"; case VK_NOT_READY -> "NOT_READY"; case VK_TIMEOUT -> "TIMEOUT"; case VK_SUBOPTIMAL_KHR -> "SUBOPTIMAL";
+            default -> "RESULT_" + result;
+        };
     }
     private static String modeName(int mode) {
         return switch (mode) {

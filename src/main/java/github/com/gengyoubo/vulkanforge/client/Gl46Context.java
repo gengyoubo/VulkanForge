@@ -58,7 +58,7 @@ final class Gl46Context {
         GlCompat.configure(version == OpenGLVersion.DEFAULT ? 6 : version.minor);
     }
 
-    /** Render thread, current context. Null when the GL 4.6 terrain renderer can run, else the reason. */
+    /** Render thread, current context. Null when the selected terrain renderer can run, else the reason. */
     static String terrainUnsupported() {
         if (requested == OpenGLVersion.DEFAULT) return "Default OpenGL uses vanilla terrain";
         var caps = GL.getCapabilities();

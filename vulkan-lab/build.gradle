@@ -23,6 +23,7 @@ application { mainClass = 'github.com.gengyoubo.vulkanforge.lab.LabMain' }
 tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
 tasks.withType(JavaExec).configureEach {
     if (rootProject.hasProperty('vulkan13Smoke')) systemProperty 'vulkanforge.vulkanVersion', '1.3'
+    if (rootProject.hasProperty('vulkanVersion')) systemProperty 'vulkanforge.vulkanVersion', rootProject.property('vulkanVersion')
     // e.g. -PnvidiaExtensions=VK_NV_mesh_shader: same comma list the config screen hands the backend.
     if (rootProject.hasProperty('nvidiaExtensions')) systemProperty 'vulkanforge.nvidiaExtensions', rootProject.property('nvidiaExtensions')
 }
@@ -90,6 +91,40 @@ tasks.register('smokeResources', JavaExec) {
     if (rootProject.hasProperty('validationSmoke')) systemProperty 'vulkanforge.requireValidation', 'true'
 }
 
+['1.2', '1.3', '1.4'].each { api ->
+    def checks = []
+    ['World', 'Bridge', 'Resources', 'Shared'].each { check ->
+        def taskName = 'smokeVk' + api.replace('.', '') + check
+        checks.add(taskName)
+        tasks.register(taskName, JavaExec) {
+            dependsOn 'fatJar', 'testClasses'
+            classpath = sourceSets.test.runtimeClasspath
+            mainClass = check == 'Shared' ? 'github.com.gengyoubo.vulkanforge.lab.SharedOffscreenSmoke' : check == 'Resources' ? 'github.com.gengyoubo.vulkanforge.lab.ResourceSmoke' : 'dev.vulkanforge.lab.' + check + 'SmokeTest'
+            if (check in ['World', 'Bridge']) args tasks.named('fatJar', Jar).get().archiveFile.get().asFile.absolutePath
+            systemProperty 'vulkanforge.vulkanVersion', api
+            def reports = rootProject.file('build/reports/offscreen-versions/vk-' + api)
+            systemProperty 'vulkanforge.smokeReportDir', reports.absolutePath
+            def captured = new ByteArrayOutputStream()
+            standardOutput = captured
+            errorOutput = captured
+            ignoreExitValue = true
+            doFirst {
+                reports.mkdirs(); captured.reset()
+                new File(reports, check.toLowerCase() + '-result.txt').text = 'STATUS=RUNNING\n'
+            }
+            doLast {
+                def output = captured.toString('UTF-8')
+                def successful = executionResult.get().exitValue == 0
+                new File(reports, check.toLowerCase() + '-result.txt').text = output + (successful ? '\nSTATUS=OK\n' : '\nSTATUS=FAILED\n')
+                if (!successful) throw new GradleException('Vulkan ' + api + ' offscreen ' + check + ' failed; see ' + reports)
+                logger.lifecycle('Vulkan ' + api + ' offscreen ' + check + ': OK')
+            }
+        }
+    }
+    tasks.register('smokeVk' + api.replace('.', '')) { dependsOn checks }
+}
+tasks.register('smokeVulkanOffscreen') { dependsOn 'smokeVk12', 'smokeVk13', 'smokeVk14' }
+
 tasks.register('benchmarkBindings', JavaExec) {
     dependsOn 'testClasses'
     classpath = sourceSets.test.runtimeClasspath
@@ -113,6 +148,14 @@ tasks.register('benchmarkOffscreen', JavaExec) {
     mainClass = 'github.com.gengyoubo.vulkanforge.lab.OffscreenBenchmark'
     systemProperty 'vulkanforge.disableValidation', 'true'
     rootProject.properties.findAll { it.key.startsWith('bench.') || it.key.startsWith('vulkanforge.') }.each { systemProperty it.key, it.value }
+}
+
+tasks.register('exportBenchmarkScene', JavaExec) {
+    dependsOn 'testClasses'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.lab.BenchmarkSceneExport'
+    args rootProject.file('build/reports/offscreen-performance/scene.bin').absolutePath
+    rootProject.properties.findAll { it.key.startsWith('bench.') }.each { systemProperty it.key, it.value }
 }
 
 // For trace/capture-present-trace.ps1, which runs elevated (WPR) and must not run Gradle there: java @build/trace/bench.args ...

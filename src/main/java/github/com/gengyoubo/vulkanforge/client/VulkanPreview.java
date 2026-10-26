@@ -60,21 +60,21 @@ final class VulkanPreview {
         if (reason == null) {
             GlStateCache.initialise();
             try { gl = new Gl46Terrain(); }
-            catch (RuntimeException error) { VulkanForge.LOGGER.error("Could not create the OpenGL 4.6 terrain renderer", error); reason = error.getMessage(); }
+            catch (RuntimeException error) { VulkanForge.LOGGER.error("Could not create the OpenGL terrain renderer", error); reason = error.getMessage(); }
         }
         if (gl == null) {
-            VulkanForge.LOGGER.warn("OpenGL 4.6 terrain unavailable: {}", reason);
+            VulkanForge.LOGGER.warn("OpenGL terrain unavailable: {}", reason);
             Gl46Context.report("TERRAIN_UNAVAILABLE=" + reason);
-            notifyPlayer(Component.translatable("vulkanforge.gl46.unavailable", String.valueOf(reason)));
+            notifyPlayer(Component.translatable("vulkanforge.gl46.unavailable", VulkanForgeConfig.startup().openGLVersion().label, String.valueOf(reason)));
             return;
         }
         enabled = true; direct = false; sink = gl;
         uploaded = lastLogged = 0;
         if (!Boolean.getBoolean("vulkanforge.gl46.noEntities")) {
             try { glEntities = new Gl46Entities(); }
-            catch (RuntimeException error) { VulkanForge.LOGGER.error("GL 4.6 entity pass unavailable; entities stay on vanilla", error); Gl46Context.report("ENTITY_UNAVAILABLE=" + error); }
+            catch (RuntimeException error) { VulkanForge.LOGGER.error("OpenGL entity pass unavailable; entities stay on vanilla", error); Gl46Context.report("ENTITY_UNAVAILABLE=" + error); }
         }
-        VulkanForge.LOGGER.info("Terrain transport: in-context OpenGL 4.6 (compute culling + multi-draw indirect count)");
+        VulkanForge.LOGGER.info("Terrain transport: in-context OpenGL {} ({})", VulkanForgeConfig.startup().openGLVersion().label, GlCompat.paths());
         WORLD.invalidate();
     }
     private static void notifyPlayer(Component message) {
@@ -133,7 +133,7 @@ final class VulkanPreview {
     private static void glFailed(RuntimeException error) {
         VulkanForge.LOGGER.error("OpenGL 4.6 terrain failed; vanilla terrain rendering resumes", error);
         Gl46Context.report("TERRAIN_FAILED=" + error);
-        notifyPlayer(Component.translatable("vulkanforge.gl46.failed"));
+        notifyPlayer(Component.translatable("vulkanforge.gl46.failed", VulkanForgeConfig.startup().openGLVersion().label));
         close();
     }
 
@@ -372,8 +372,8 @@ final class VulkanPreview {
             if (minecraft.level == null) { WORLD.leave(sink); return; }
             graphics.fill(4, 4, 222, 27, 0xc0111828);
             graphics.drawString(minecraft.font, gl.frames() > 0 && uploadedEpoch == WORLD.epoch()
-                    ? Component.translatable("vulkanforge.gl46.status", gl.sections(), gl.frames())
-                    : Component.translatable("vulkanforge.gl46.waiting"), 7, 7, 0xffaaddff);
+                    ? Component.translatable("vulkanforge.gl46.status", VulkanForgeConfig.startup().openGLVersion().label, gl.sections(), gl.frames())
+                    : Component.translatable("vulkanforge.gl46.waiting", VulkanForgeConfig.startup().openGLVersion().label), 7, 7, 0xffaaddff);
             graphics.drawString(minecraft.font, Component.translatable("vulkanforge.gl46.controls"), 7, 17, 0xffa0aabb);
             return;
         }

@@ -12,7 +12,8 @@ import static org.lwjgl.opengl.GL46C.*;
 
 /**
  * GL 4.6 programs from build-time SPIR-V (glShaderBinary + glSpecializeShader); a driver that rejects the binary, or
- * -Dvulkanforge.gl46.glsl=true, gets the same GLSL 4.60 source compiled at runtime instead.
+ * -Dvulkanforge.gl46.glsl=true, gets GLSL source compiled at runtime instead. GL 4.3-4.5 use GLSL 4.30
+ * and a divisor-one integer vertex attribute for baseInstance, requiring no draw-parameters extension.
  */
 final class Gl46Programs {
     private static final String ROOT = "/assets/vulkanforge/shaders/gl46/";

@@ -20,7 +20,7 @@ public final class OffscreenBenchmark {
         float spin = Float.parseFloat(System.getProperty("bench.spin", "0"));
         org.lwjgl.system.Configuration.STACK_SIZE.set(1024);
         if (!glfwInit()) throw new AssertionError("GLFW init failed");
-        Path output = Path.of("build/offscreen-benchmark").toAbsolutePath(); Files.createDirectories(output);
+        Path output = Path.of(System.getProperty("bench.output", "build/offscreen-benchmark")).toAbsolutePath(); Files.createDirectories(output);
         // Hidden GL context only for the shared-target lease (semaphore wait/signal); nothing is drawn or shown.
         glfwDefaultWindowHints(); glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
         long hidden = glfwCreateWindow(64, 64, "Hidden GL", 0, 0);
@@ -34,26 +34,36 @@ public final class OffscreenBenchmark {
         var probe = new BenchmarkScene.Probe(backend);
         float yaw = 0;
         for (int i = 0; i < warmup; i++) { if (spin != 0) send.accept(BenchmarkScene.camera(yaw += spin, width, height)); frame(backend, width, height); }
+        int runs = Integer.getInteger("bench.runs", 1);
+        double minimumSeconds = Double.parseDouble(System.getProperty("bench.seconds", "0"));
+        for (int run = 1; run <= runs; run++) {
         probe.drain();
         long submitted0 = backend.worldStats()[1], fence0 = probe.fenceWaitNanos(), glNanos0 = SharedPresentImage.groupNanos;
         probe.mark();
+        long epochStart = System.currentTimeMillis();
         long cpuNanos = 0, start = System.nanoTime();
-        for (int i = 0; i < frames; i++) {
+        int measuredFrames = 0;
+        do {
             long begin = System.nanoTime();
             if (spin != 0) send.accept(BenchmarkScene.camera(yaw += spin, width, height));
             frame(backend, width, height);
             cpuNanos += System.nanoTime() - begin;
-        }
+            measuredFrames++;
+        } while (measuredFrames < frames || System.nanoTime() - start < minimumSeconds * 1e9);
         probe.drain();
         double seconds = (System.nanoTime() - start) / 1e9;
+        long epochEnd = System.currentTimeMillis();
         long completed = backend.worldStats()[1] - submitted0;
-        if (completed != frames) throw new AssertionError("Completed " + completed + " of " + frames + " frames (terrain not ready?)");
-        double fenceMs = (probe.fenceWaitNanos() - fence0) / 1e6 / frames, glMs = (SharedPresentImage.groupNanos - glNanos0) / 1e6 / frames;
-        double cpuMs = cpuNanos / 1e6 / frames - fenceMs;
+        if (completed != measuredFrames) throw new AssertionError("Completed " + completed + " of " + measuredFrames + " frames (terrain not ready?)");
+        double fenceMs = (probe.fenceWaitNanos() - fence0) / 1e6 / measuredFrames, glMs = (SharedPresentImage.groupNanos - glNanos0) / 1e6 / measuredFrames;
+        double cpuMs = cpuNanos / 1e6 / measuredFrames - fenceMs;
         Object[] gpu = probe.gpu(); double gpuMs = (double) gpu[0];
         System.out.printf("OFFSCREEN_BENCH %dx%d frames=%d seconds=%.3f OFFSCREEN_FPS=%.1f frameMs=%.3f CPU_FRAME_MS=%.3f fenceWaitMs=%.3f glHandoffMs=%.3f GPU_RENDER_MS=%s gpuBusy=%s%s%n",
-                width, height, frames, seconds, frames / seconds, seconds * 1000 / frames, cpuMs, fenceMs, glMs,
-                Double.isNaN(gpuMs) ? "n/a" : String.format("%.3f", gpuMs), Double.isNaN(gpuMs) ? "n/a" : String.format("%.0f%%", gpuMs * frames / seconds / 10), gpu[1]);
+                width, height, measuredFrames, seconds, measuredFrames / seconds, seconds * 1000 / measuredFrames, cpuMs, fenceMs, glMs,
+                Double.isNaN(gpuMs) ? "n/a" : String.format("%.3f", gpuMs), Double.isNaN(gpuMs) ? "n/a" : String.format("%.0f%%", gpuMs * measuredFrames / seconds / 10), gpu[1]);
+        System.out.printf(java.util.Locale.ROOT, "BENCH_RESULT API=VK%s run=%d width=%d height=%d frames=%d seconds=%.6f FPS=%.3f GPU_MS=%.6f START_MS=%d END_MS=%d%n",
+                System.getProperty("vulkanforge.vulkanVersion", "1.4"), run, width, height, measuredFrames, seconds, measuredFrames / seconds, gpuMs, epochStart, epochEnd);
+        }
         backend.closeWorld();
         backend.close();
         glfwDestroyWindow(hidden); glfwTerminate();
