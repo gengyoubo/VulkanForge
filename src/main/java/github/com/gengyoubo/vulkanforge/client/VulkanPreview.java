@@ -25,6 +25,8 @@ final class VulkanPreview {
     private static long lastLogged;
     private static long uploadedEpoch;
     private static boolean inset;
+    private static net.minecraftforge.client.event.RenderLevelStageEvent captureEvent;
+    private static boolean prepared,preparingAllowed;
     private static final WorldCapture WORLD = new WorldCapture();
     private static final TerrainPresenter PRESENTER = new TerrainPresenter();
 
@@ -52,8 +54,8 @@ final class VulkanPreview {
         boolean composited = false;
         if (direct && !NativeMainWindow.worldVisible()) { uploadedEpoch = 0; EntityDraws.armSky(false); return; }
         try {
-            WORLD.update(event, sink);
-            if (direct) renderShared(); else upload();
+            if(!prepared){WORLD.update(event, sink);if (direct) renderShared(); else upload();}
+            prepared=false;preparingAllowed=false;
             if (!inset && uploadedEpoch != 0 && uploadedEpoch == WORLD.epoch()) {
                 if (direct && sharedTexture != null) {
                     PRESENTER.draw(sharedTexture.getId(), sharedDepth);
@@ -74,6 +76,7 @@ final class VulkanPreview {
     }
     /** P11, AFTER_LEVEL: GameRenderer next clears depth and draws the held items, arms and screen effects. */
     static boolean guiEnabled() { return enabled && direct && !inset; }
+    static boolean nativeTerrain(){return enabled&&direct&&!inset&&!Boolean.getBoolean("vulkanforge.legacyComposite");}
     static void handBegin() { ordered(GuiDraws::beginHand); }
     /** Before GUI clear or present: composite a still-open hand window into the main target. */
     static void beforeSwap() {
@@ -103,12 +106,16 @@ final class VulkanPreview {
     /** ViewportEvent.ComputeFogColor: LevelRenderer is about to clear and draw the sky. */
     static void skyBegin() { if (enabled && direct) EntityDraws.openSky(); }
     /** AFTER_SKY: captured sky waits for this frame's terrain submit. */
-    static void skyEnd() { EntityDraws.closeSky(); }
+    static void skyEnd(net.minecraftforge.client.event.RenderLevelStageEvent event) { EntityDraws.closeSky();captureEvent=event;prepared=false;preparingAllowed=true; }
+    static void prepareTerrain(){
+        if(!preparingAllowed||prepared||!nativeTerrain()||sink==null||captureEvent==null||!NativeMainWindow.worldVisible())return;
+        WORLD.update(captureEvent,sink);renderShared();prepared=true;
+    }
 
     /** AFTER_BLOCK_ENTITIES: replay captured entity/block-entity draws in Vulkan and composite them with depth. */
-    static void entities() { overlay(EntityDraws.Window.ENTITIES, null); }
+    static void entities() { overlay(EntityDraws.Window.ENTITIES, EntityDraws.Window.EFFECTS); }
     /** AFTER_TRIPWIRE_BLOCKS: the next thing vanilla draws is ParticleEngine.render (P9). */
-    static void particlesBegin() { EntityDraws.open(EntityDraws.Window.PARTICLES); }
+    static void particlesBegin() { overlay(EntityDraws.Window.EFFECTS,EntityDraws.Window.PARTICLES); }
     /** AFTER_PARTICLES: composite particles, then capture rain/snow until AFTER_WEATHER. */
     static void particlesEnd() { overlay(EntityDraws.Window.PARTICLES, EntityDraws.Window.WEATHER); }
     static void weather() { overlay(EntityDraws.Window.WEATHER, null); }
@@ -123,6 +130,7 @@ final class VulkanPreview {
 
     /** AFTER_TRANSLUCENT_BLOCKS: after GL entities and the (partially skipped) vanilla translucent layer. */
     static void translucent() {
+        EntityDraws.flushCurrent();
         if (!translucentPending) return;
         translucentPending = false;
         try { PRESENTER.drawTranslucent(sharedTranslucent, sharedTranslucentDepth); translucentComposites++; }
@@ -153,7 +161,7 @@ final class VulkanPreview {
     static int saveWorldFrame(java.nio.file.Path path) throws java.io.IOException {
         RenderSystem.assertOnRenderThread();
         // A diagnostic read acquires a fresh GL lease; normal terrain rendering never downloads pixels.
-        if (direct) renderShared();
+        if (direct) renderShared(false);
         if ((direct ? sharedTexture == null : texture == null) || worldEpoch() == 0) throw new IllegalStateException("No Vulkan world frame available");
         int previous = org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL11.GL_TEXTURE_BINDING_2D);
         try (var image = new com.mojang.blaze3d.platform.NativeImage(frameWidth, frameHeight, false)) {
@@ -164,9 +172,12 @@ final class VulkanPreview {
     }
 
     private static void renderShared() {
+        renderShared(!inset && !Boolean.getBoolean("vulkanforge.legacyComposite"));
+    }
+    private static void renderShared(boolean nativeMode) {
         if (!NativeMainWindow.worldVisible()) { uploadedEpoch = 0; return; }
         var target = Minecraft.getInstance().getMainRenderTarget();
-        int id = NativeMainWindow.renderWorld(target.viewWidth, target.viewHeight, EntityDraws.takeSky());
+        int id = NativeMainWindow.renderWorld(target.viewWidth, target.viewHeight, EntityDraws.takeSky(),nativeMode);
         long[] stats = NativeMainWindow.worldStats();
         if (id == 0) { uploadedEpoch = 0; return; }
         uploadedEpoch = stats[0];

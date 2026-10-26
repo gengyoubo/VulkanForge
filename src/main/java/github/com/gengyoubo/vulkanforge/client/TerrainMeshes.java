@@ -21,6 +21,10 @@ public final class TerrainMeshes {
     private static final byte[] EMPTY = new byte[0];
     private static final long CACHE_LIMIT = 128L * 1024 * 1024;
     private static final Map<VertexBuffer, byte[]> uploads = new IdentityHashMap<>();
+    private record Deferred(byte[] vertices,byte[] indices,int indexSize,int indexCount){}
+    private static final Map<VertexBuffer,Deferred> deferred=new IdentityHashMap<>();
+    private static final BufferBuilder fallbackBuilder=new BufferBuilder(262144);
+    private static long skippedGlUploads,restoredGlUploads,skippedGlBytes;
     private static final Map<ChunkRenderDispatcher.RenderChunk, Snapshot> ready = new ConcurrentHashMap<>();
     private static volatile Set<ChunkRenderDispatcher.RenderChunk> members = Set.of();
     private static ClientLevel level;
@@ -36,20 +40,21 @@ public final class TerrainMeshes {
 
     /** ViewArea constructor: the cache follows the actual render distance and the dimension's complete vertical range. */
     public static synchronized void area(ViewArea area) {
-        uploads.clear(); ready.clear(); bytes = 0;
+        uploads.clear(); deferred.clear(); ready.clear(); bytes = 0;
         level = Minecraft.getInstance().level;
         currentArea = area;
         members = Set.copyOf(Arrays.asList(area.chunks));
     }
     public static synchronized void released(ViewArea area) {
         if (currentArea != area) return;
-        uploads.clear(); ready.clear(); bytes = 0; members = Set.of(); level = null; currentArea = null;
+        uploads.clear(); deferred.clear(); ready.clear(); bytes = 0; members = Set.of(); level = null; currentArea = null;
     }
 
     /** RenderChunk.setOrigin/releaseBuffers: pooled chunk objects must never carry geometry to a different section. */
     public static void moved(ChunkRenderDispatcher.RenderChunk chunk) {
         ready.remove(chunk);
         for (RenderType type : LAYERS) {
+            deferred.remove(chunk.getBuffer(type));
             byte[] old = uploads.remove(chunk.getBuffer(type));
             if (old != null) bytes -= old.length;
         }
@@ -61,6 +66,7 @@ public final class TerrainMeshes {
         var state = rendered.drawState();
         if (state.indexOnly()) indexUpdates++; // Vanilla transparency resort changes no positions, colors, UVs or lighting.
         else {
+            deferred.remove(buffer);
             byte[] old = uploads.remove(buffer); if (old != null) bytes -= old.length;
             long expanded = (long) state.vertexCount() / 4 * 6 * WorldProtocol.STRIDE;
             if (!buffer.isInvalid() && state.format() == DefaultVertexFormat.BLOCK && state.mode() == VertexFormat.Mode.QUADS
@@ -70,7 +76,29 @@ public final class TerrainMeshes {
                 uploads.put(buffer, copy); bytes += copy.length; copies++;
             }
         }
+        byte[] raw=uploads.get(buffer);
+        if(raw!=null&&VulkanPreview.nativeTerrain()){
+            byte[] indices=null;
+            if(!state.sequentialIndex()){ByteBuffer source=rendered.indexBuffer().duplicate();indices=new byte[state.indexCount()*state.indexType().bytes];source.get(indices);}
+            deferred.put(buffer,new Deferred(raw,indices,state.indexType().bytes,state.indexCount()));
+            skippedGlUploads++;skippedGlBytes+=state.indexOnly()?rendered.indexBuffer().remaining():raw.length;
+            rendered.release();return;
+        }
+        ensureGl(buffer);
         buffer.upload(rendered);
+    }
+    /** Only an actual GL fallback materializes the vanilla VBO. The ordinary Vulkan route never uploads it. */
+    static void ensureGl(VertexBuffer buffer){
+        Deferred mesh=deferred.remove(buffer);if(mesh==null||buffer.isInvalid())return;
+        int stride=DefaultVertexFormat.BLOCK.getVertexSize();
+        if(mesh.indices==null){fallbackBuilder.begin(VertexFormat.Mode.QUADS,DefaultVertexFormat.BLOCK);fallbackBuilder.putBulkData(ByteBuffer.wrap(mesh.vertices));}
+        else {
+            fallbackBuilder.begin(VertexFormat.Mode.TRIANGLES,DefaultVertexFormat.BLOCK);
+            ByteBuffer indices=ByteBuffer.wrap(mesh.indices).order(java.nio.ByteOrder.LITTLE_ENDIAN),vertices=ByteBuffer.allocate(mesh.indexCount*stride);
+            for(int i=0;i<mesh.indexCount;i++){int index=mesh.indexSize==2?Short.toUnsignedInt(indices.getShort()):indices.getInt();vertices.put(mesh.vertices,index*stride,stride);}
+            fallbackBuilder.putBulkData(vertices.flip());
+        }
+        buffer.bind();buffer.upload(fallbackBuilder.end());VertexBuffer.unbind();restoredGlUploads++;
     }
 
     /** RebuildTask's successful compiled.set only: failed/cancelled/partially uploaded builds cannot become Vulkan geometry. */
@@ -92,5 +120,5 @@ public final class TerrainMeshes {
 
     static Collection<Snapshot> snapshots(ClientLevel expected) { return level == expected ? ready.values() : List.of(); }
     static boolean available(ClientLevel expected) { return level == expected && !members.isEmpty(); }
-    static long[] stats() { return new long[]{copies, commits, missed, indexUpdates, bytes, members.size(), ready.size()}; }
+    static long[] stats() { return new long[]{copies, commits, missed, indexUpdates, bytes, members.size(), ready.size(),skippedGlUploads,restoredGlUploads,skippedGlBytes}; }
 }

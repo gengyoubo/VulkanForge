@@ -20,16 +20,22 @@ final class EntityTextures {
         int flags, version, requestedVersion, sentVersion, width, height;
         byte[] rgba;
         long lastUsed, nextCheck;
+        long sourceVersion, requestedSourceVersion;
     }
     private static final Map<Integer, Entry> entries = new HashMap<>();
     private static long uploads, revalidations, glyphUploads, glyphPatches;
     private EntityTextures() { }
+    static void deleted(int id){Entry entry=entries.remove(id);if(entry!=null)entry.readback.close();}
 
     /** True when the backend already holds this texture; otherwise schedules a readback. */
     static boolean ready(int id) {
         if (id <= 0) return false;
         Entry entry = entries.computeIfAbsent(id, key -> new Entry());
         entry.lastUsed = System.nanoTime();
+        long version=CpuTextures.version(id);
+        if(version>0&&(!entry.sent||entry.sourceVersion!=version||entry.version!=entry.sentVersion)){
+            entry.flags=flags(id);publish(id,entry,CpuTextures.snapshot(id));
+        }
         return entry.sent && entry.version == entry.sentVersion;
     }
 
@@ -50,9 +56,30 @@ final class EntityTextures {
             var snapshot = entry.readback.poll();
             if (snapshot == null) { inFlight++; continue; }
             entry.pending = false;
-            if (entry.requestedVersion != entry.version) { entry.nextCheck = 0; continue; }
+            if (entry.requestedVersion != entry.version || (CpuTextures.version(item.getKey())>0&&entry.requestedSourceVersion!=CpuTextures.version(item.getKey()))) { entry.nextCheck = 0; continue; }
+            publish(item.getKey(),entry,snapshot);
+        }
+        for (var item : entries.entrySet()) {
+            if (inFlight >= MAX_READBACKS) break;
+            Entry entry = item.getValue();
+            if (entry.pending || entry.failed || now < entry.nextCheck || (entry.sent && now - entry.lastUsed > RECENT_NANOS)) continue;
+            if(CpuTextures.version(item.getKey())>0){
+                entry.flags=flags(item.getKey());publish(item.getKey(),entry,CpuTextures.snapshot(item.getKey()));entry.nextCheck=now+REVALIDATE_NANOS;continue;
+            }
+            try {
+                entry.flags = flags(item.getKey());
+                entry.readback.request(item.getKey());
+                entry.requestedVersion = entry.version;entry.requestedSourceVersion=CpuTextures.version(item.getKey());
+                entry.pending = true; entry.nextCheck = now + REVALIDATE_NANOS; inFlight++;
+            } catch (RuntimeException error) {
+                entry.failed = true;
+                VulkanForge.LOGGER.warn("Entity texture {} cannot be mirrored to Vulkan; its draws stay on OpenGL: {}", item.getKey(), error.getMessage());
+            }
+        }
+    }
+    private static void publish(int id,Entry entry,TextureCapture.Snapshot snapshot){
             boolean changed = !entry.sent || entry.width != snapshot.width() || entry.height != snapshot.height() || !Arrays.equals(entry.rgba, snapshot.rgba());
-            if (!changed) { entry.sentVersion = entry.version; continue; }
+            if (!changed) { entry.sentVersion = entry.version;entry.sourceVersion=CpuTextures.version(id);return; }
             boolean sent;
             if (entry.sent && entry.width == snapshot.width() && entry.height == snapshot.height()) {
                 int left = entry.width, top = entry.height, right = 0, bottom = 0;
@@ -65,27 +92,13 @@ final class EntityTextures {
                 int width = right - left, height = bottom - top;
                 byte[] patch = new byte[width * height * 4];
                 for (int y = 0; y < height; y++) System.arraycopy(snapshot.rgba(), ((top + y) * entry.width + left) * 4, patch, y * width * 4, width * 4);
-                sent = NativeMainWindow.entityTexturePatch(new Object[]{item.getKey(), left, top, width, height, patch});
-            } else sent = NativeMainWindow.entityTexture(new Object[]{item.getKey(), snapshot.width(), snapshot.height(), entry.flags, snapshot.rgba()});
+                sent = NativeMainWindow.entityTexturePatch(new Object[]{id, left, top, width, height, patch});
+            } else sent = NativeMainWindow.entityTexture(new Object[]{id, snapshot.width(), snapshot.height(), entry.flags, snapshot.rgba()});
             if (sent) {
                 if (entry.sent) { revalidations++; if (entry.version > 0) glyphPatches++; }
                 entry.sent = true; entry.sentVersion = entry.version; entry.width = snapshot.width(); entry.height = snapshot.height(); entry.rgba = snapshot.rgba(); uploads++;
+                entry.sourceVersion=CpuTextures.version(id);
             } else entry.nextCheck = 0;
-        }
-        for (var item : entries.entrySet()) {
-            if (inFlight >= MAX_READBACKS) break;
-            Entry entry = item.getValue();
-            if (entry.pending || entry.failed || now < entry.nextCheck || (entry.sent && now - entry.lastUsed > RECENT_NANOS)) continue;
-            try {
-                entry.flags = flags(item.getKey());
-                entry.readback.request(item.getKey());
-                entry.requestedVersion = entry.version;
-                entry.pending = true; entry.nextCheck = now + REVALIDATE_NANOS; inFlight++;
-            } catch (RuntimeException error) {
-                entry.failed = true;
-                VulkanForge.LOGGER.warn("Entity texture {} cannot be mirrored to Vulkan; its draws stay on OpenGL: {}", item.getKey(), error.getMessage());
-            }
-        }
     }
 
     private static int flags(int texture) {

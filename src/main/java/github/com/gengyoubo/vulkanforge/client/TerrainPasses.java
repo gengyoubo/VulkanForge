@@ -15,11 +15,14 @@ public final class TerrainPasses {
         VulkanPreview.markDirty(x, y, z);
     }
     public static VertexBuffer buffer(ChunkRenderDispatcher.RenderChunk chunk, RenderType type) {
+        VulkanPreview.prepareTerrain();
         layer = type;
         replace = (type == RenderType.solid() || type == RenderType.cutout() || type == RenderType.cutoutMipped())
                 ? VulkanPreview.replacesSection(chunk.getOrigin())
                 : type == RenderType.translucent() && VulkanPreview.replacesTranslucent(chunk.getOrigin());
-        return chunk.getBuffer(type);
+        VertexBuffer buffer=chunk.getBuffer(type);
+        if(!replace)TerrainMeshes.ensureGl(buffer);
+        return buffer;
     }
     public static void draw(VertexBuffer buffer) {
         if (replace) {

@@ -39,6 +39,9 @@ final class ShaderCompiler {
             source = new String(in.readAllBytes(), StandardCharsets.UTF_8);
         } catch (IOException e) { throw new IllegalStateException(e); }
         source = expandIncludes(source, resource);
+        return moduleSource(context,source,resource,kind);
+    }
+    static long moduleSource(VulkanContext context,String source,String resource,int kind){
         long compiler = shaderc_compiler_initialize();
         if (compiler == 0) throw new IllegalStateException("shaderc compiler initialization failed");
         long options = 0, result = 0;

@@ -14,7 +14,7 @@ import static org.lwjgl.opengl.GL30.GL_DRAW_FRAMEBUFFER_BINDING;
 
 /** Holds immutable hand/GUI packets until present; unsupported draws replay the pending stages on GL in their original order. */
 public final class GuiDraws {
-    private record Draw(VertexFormat format, Object[] packet, State state) { }
+    private record Draw(VertexFormat format, Object[] packet, State state, Object[] replay) { }
     private static final List<Draw> pending = new ArrayList<>();
     private static final List<Draw> held = new ArrayList<>();
     private static final Map<VertexFormat, BufferBuilder> replayBuilders = new IdentityHashMap<>();
@@ -54,7 +54,7 @@ public final class GuiDraws {
         } else if (active && (mask & GL_DEPTH_BUFFER_BIT) != 0 && !fallback) {
             // Capture the second clear (HUD -> screen), preserving item/icon depth ordering.
             if (glIsEnabled(GL_SCISSOR_TEST) || !glGetBoolean(GL_DEPTH_WRITEMASK) || mask != GL_DEPTH_BUFFER_BIT) fail();
-            else pending.add(new Draw(null, new Object[]{null, rect(false)}, null));
+            else pending.add(new Draw(null, new Object[]{null, rect(false)}, null,null));
         }
         RenderSystem.clear(mask, onMac);
     }
@@ -70,7 +70,8 @@ public final class GuiDraws {
             reasons.merge(shader + (glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING) != target.frameBufferId ? ":framebuffer" : ":shader/state/texture"), 1L, Long::sum);
             fail(); BufferUploader.drawWithShader(original); return; }
         packet = Arrays.copyOf(packet, 5); packet[4] = rect(glIsEnabled(GL_SCISSOR_TEST));
-        pending.add(new Draw(original.drawState().format(), packet, new State()));
+        Object[] replay=packet.clone();byte[] originalVertices=new byte[original.vertexBuffer().remaining()];original.vertexBuffer().duplicate().get(originalVertices);replay[2]=originalVertices;
+        pending.add(new Draw(original.drawState().format(), packet, new State(),replay));
         original.release(); // BufferSource may clear/reuse its builder at the very next GuiGraphics.flush.
     }
 
@@ -94,7 +95,7 @@ public final class GuiDraws {
             if (!held.isEmpty()) {
                 // A GL GUI fallback must include the deferred hand before its GUI depth clear.
                 GlStateManager._disableScissorTest(); RenderSystem.depthMask(true); RenderSystem.clear(GL_DEPTH_BUFFER_BIT, Minecraft.ON_OSX);
-                replay.addAll(held); held.clear(); replay.add(new Draw(null, null, null));
+                replay.addAll(held); held.clear(); replay.add(new Draw(null, null, null,null));
             }
             replay.addAll(pending);
             for (Draw draw : replay) {
@@ -103,7 +104,7 @@ public final class GuiDraws {
                 VertexBuffer buffer = buffers.computeIfAbsent(draw.format, key -> new VertexBuffer(VertexBuffer.Usage.DYNAMIC));
                 BufferBuilder builder = replayBuilders.computeIfAbsent(draw.format, key -> new BufferBuilder(4096));
                 builder.begin(VertexFormat.Mode.TRIANGLES, draw.format);
-                builder.putBulkData(triangles(draw.packet, draw.format.getVertexSize()));
+                builder.putBulkData(triangles(draw.replay, draw.format.getVertexSize()));
                 buffer.bind(); buffer.upload(builder.end());
                 float[] uniforms = (float[]) draw.packet[1];
                 buffer.drawWithShader(new Matrix4f().set(uniforms, 16), new Matrix4f().set(uniforms, 0), draw.state.shader);
@@ -146,6 +147,7 @@ public final class GuiDraws {
     private static final class State {
         final Object blendCache = ShaderBlendState.save();
         final ShaderInstance shader = RenderSystem.getShader();
+        final Matrix4f textureMatrix=new Matrix4f(RenderSystem.getTextureMatrix());
         final float[] color = RenderSystem.getShaderColor().clone(), fogColor = RenderSystem.getShaderFogColor().clone();
         final float fogStart = RenderSystem.getShaderFogStart(), fogEnd = RenderSystem.getShaderFogEnd();
         final com.mojang.blaze3d.shaders.FogShape fogShape = RenderSystem.getShaderFogShape();
@@ -167,6 +169,7 @@ public final class GuiDraws {
         void restore() {
             ShaderBlendState.restore(blendCache);
             RenderSystem.setShader(() -> shader);
+            RenderSystem.setTextureMatrix(textureMatrix);
             RenderSystem.setShaderColor(color[0], color[1], color[2], color[3]);
             RenderSystem.setShaderFogStart(fogStart); RenderSystem.setShaderFogEnd(fogEnd); RenderSystem.setShaderFogColor(fogColor[0], fogColor[1], fogColor[2], fogColor[3]); RenderSystem.setShaderFogShape(fogShape);
             if (light0 != null && light1 != null) RenderSystem.setShaderLights(light0, light1);

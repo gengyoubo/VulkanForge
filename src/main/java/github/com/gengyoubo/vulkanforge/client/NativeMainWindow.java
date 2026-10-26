@@ -25,6 +25,7 @@ public final class NativeMainWindow {
     private static boolean revealed;
     private static Method present, beginFrame, setVsync, frames, generations, capture, close, earlyAcquires, lateAcquires;
     private static Method hand, handPasses;
+    private static Method nativeComposite;
     private static Method renderWorld, renderWorldWithSky, worldStats, finishWorldFrame, closeWorld, renderOverlay, finishOverlay, entityTexture, entityTexturePatch, gui, guiPasses, optimizationStats, uploadStats, tryWorldCommand, memoryStats, guiBindingStats;
     private static Consumer<Object[]> worldCommands;
 
@@ -52,7 +53,8 @@ public final class NativeMainWindow {
             frames = type.getMethod("frames"); generations = type.getMethod("generations");
             capture = type.getMethod("captureNext", String.class); close = type.getMethod("close");
             renderWorld = type.getMethod("renderWorld", int.class, int.class); worldStats = type.getMethod("worldStats");
-            renderWorldWithSky = type.getMethod("renderWorldWithSky", int.class, int.class, Object[].class);
+            renderWorldWithSky = type.getMethod("renderWorldWithSky", int.class, int.class, Object[].class, boolean.class);
+            nativeComposite=type.getMethod("nativeComposite",int.class,int.class,int.class,int.class,Object[].class);
             finishWorldFrame = type.getMethod("finishWorldFrame"); closeWorld = type.getMethod("closeWorld");
             renderOverlay = type.getMethod("renderOverlay", Object[].class, boolean.class); finishOverlay = type.getMethod("finishOverlay");
             memoryStats = type.getMethod("memoryStats"); guiBindingStats = type.getMethod("guiBindingStats");
@@ -155,8 +157,20 @@ public final class NativeMainWindow {
     static int renderWorld(int width, int height) { return active() ? ((Number)call(renderWorld, width, height)).intValue() : 0; }
     /** P10: captured sky packets are drawn under the terrain in the same submit. */
     static int renderWorld(int width, int height, Object[] sky) {
-        if (sky.length == 0) return renderWorld(width, height);
-        return active() ? ((Number)call(renderWorldWithSky, width, height, (Object) sky)).intValue() : 0;
+        return renderWorld(width,height,sky,true);
+    }
+    static int renderWorld(int width,int height,Object[] sky,boolean nativeMode){return active()?((Number)call(renderWorldWithSky,width,height,(Object)sky,nativeMode)).intValue():0;}
+    static boolean nativeComposite(int kind,Object[] packets){
+        if(!active())return false;
+        if(kind==2&&packets.length>0&&((Object[])packets[0]).length>5){
+            java.util.Map<Integer,java.util.List<Object>> groups=new java.util.LinkedHashMap<>();java.util.Map<Integer,int[]> targets=new java.util.HashMap<>();
+            for(Object value:packets){Object[] packet=(Object[])value;int[] target=(int[])packet[5];groups.computeIfAbsent(target[0],key->new java.util.ArrayList<>()).add(packet);targets.put(target[0],target);}
+            for(var entry:groups.entrySet()){int[] target=targets.get(entry.getKey());if(!(Boolean)call(nativeComposite,target[0],target[1],target[2],kind,(Object)entry.getValue().toArray()))return false;}
+            return true;
+        }
+        int[] viewport=new int[4];org.lwjgl.opengl.GL11.glGetIntegerv(org.lwjgl.opengl.GL11.GL_VIEWPORT,viewport);
+        int framebuffer=org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL30.GL_DRAW_FRAMEBUFFER_BINDING);
+        return (Boolean)call(nativeComposite,framebuffer,viewport[2],viewport[3],kind,(Object)packets);
     }
     static boolean worldVisible() { return active() && GLFW.glfwGetWindowAttrib(mainWindow, GLFW.GLFW_ICONIFIED) == 0; }
     static long[] worldStats() { return active() ? (long[])call(worldStats) : new long[25]; }
@@ -190,7 +204,7 @@ public final class NativeMainWindow {
         catch (Throwable error) { LOGGER.error("Could not close Vulkan main-window resources", cause(error)); }
         finally {
             backend = null; present = beginFrame = setVsync = frames = generations = capture = close = earlyAcquires = lateAcquires = null;
-            hand = handPasses = null;
+            hand = handPasses = nativeComposite = null;
             renderWorld = renderWorldWithSky = worldStats = finishWorldFrame = closeWorld = renderOverlay = finishOverlay = entityTexture = entityTexturePatch = gui = guiPasses = optimizationStats = uploadStats = tryWorldCommand = memoryStats = guiBindingStats = null; worldCommands = null;
             try { if (loader != null) loader.close(); } catch (Exception error) { LOGGER.warn("Could not close backend loader", error); }
             loader = null;

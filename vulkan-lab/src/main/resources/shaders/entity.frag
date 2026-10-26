@@ -15,7 +15,12 @@ layout(location = 0) out vec4 outColor;
 void main() {
     int variant = int(draw.fog.w + 0.5);
     vec4 color = texture(Sampler0, texCoord0);
-    if (variant == 7) {
+    if(variant==8){
+        color*=draw.colorModulator;if(color.a<0.1)discard;
+        color.rgb*= (1.0-smoothstep(draw.fog.x,draw.fog.y,vertexDistance))*draw.light0.w;
+    } else if(variant==9){color=texture(Sampler0,clamp(texCoord0,vec2(0.0),vec2(1.0)))*vertexColor*draw.colorModulator;
+    } else if(variant==10){if(color.a==0.0)discard;color=vec4(vertexColor.rgb*draw.colorModulator.rgb,draw.colorModulator.a);
+    } else if (variant == 7) {
         color = vec4(color.r) * vertexColor * draw.colorModulator * lightMapColor;
         if (color.a < 0.1) discard;
     } else if (variant <= 1) {
@@ -31,7 +36,7 @@ void main() {
         color *= vertexColor * draw.colorModulator * lightMapColor;
         if (variant == 2 && color.a < 0.1) discard;
     }
-    if (vertexDistance > draw.fog.x) {
+    if (variant!=8&&vertexDistance > draw.fog.x) {
         float fogValue = vertexDistance < draw.fog.y ? smoothstep(draw.fog.x, draw.fog.y, vertexDistance) : 1.0;
         color.rgb = mix(color.rgb, draw.fogColor.rgb, fogValue * draw.fogColor.a);
     }

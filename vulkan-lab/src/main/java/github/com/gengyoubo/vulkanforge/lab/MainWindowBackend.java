@@ -139,9 +139,17 @@ public final class MainWindowBackend implements AutoCloseable {
     public int renderWorld(int width, int height) { return world().render(width, height); }
     /** P10: like renderWorld, drawing the captured sky packets (EntityPass Object[]s) under the terrain. */
     public int renderWorldWithSky(int width, int height, Object[] sky) {
+        return renderWorldWithSky(width,height,sky,false);
+    }
+    public int renderWorldWithSky(int width, int height, Object[] sky, boolean nativeMode) {
         var list = new java.util.ArrayList<Object[]>(sky.length);
         for (Object packet : sky) list.add((Object[]) packet);
-        return world().render(width, height, list);
+        return world().render(width, height, list, nativeMode);
+    }
+    public boolean nativeComposite(int framebuffer,int width,int height,int kind,Object[] packets){
+        if(world==null)return false;
+        var list=new java.util.ArrayList<Object[]>();for(Object packet:packets)list.add((Object[])packet);
+        return world.composeNative(framebuffer,width,height,kind,list);
     }
     /** Captured GUI packets, consumed exactly once by the next present (including skipped/minimized frames). */
     public void gui(Object[] packets) {

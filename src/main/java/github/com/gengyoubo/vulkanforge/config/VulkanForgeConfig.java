@@ -10,15 +10,15 @@ import net.minecraftforge.common.ForgeConfigSpec;
  */
 public final class VulkanForgeConfig {
     public enum Backend { VULKAN, OPENGL }
-
+    //推荐1.3
     public enum VulkanVersion {
-        V1_0("1.0"), V1_1("1.1"), V1_2("1.2"), V1_3("1.3"), V1_4("1.4");
+        V1_2("1.2"), V1_3("1.3"), V1_4("1.4");
         public final String label;
         VulkanVersion(String label) { this.label = label; }
     }
-
+    //推荐4.5
     public enum OpenGLVersion {
-        DEFAULT("default"), GL_4_2("4.2"), GL_4_3("4.3"), GL_4_4("4.4"), GL_4_5("4.5"), GL_4_6("4.6");
+        DEFAULT("default"), GL_4_3("4.3"), GL_4_4("4.4"), GL_4_5("4.5"), GL_4_6("4.6");
         public final String label;
         OpenGLVersion(String label) { this.label = label; }
     }

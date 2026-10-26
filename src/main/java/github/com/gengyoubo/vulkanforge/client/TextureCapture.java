@@ -19,8 +19,10 @@ final class TextureCapture {
     static final class Readback implements AutoCloseable {
         private int buffer, capacity, width, height;
         private long fence;
+        private Snapshot cpu;
         void request(int texture) {
-            if (fence != 0) return;
+            if (fence != 0||cpu!=null) return;
+            cpu=CpuTextures.snapshot(texture);if(cpu!=null)return;
             if (texture <= 0) throw new IllegalStateException("Required Minecraft texture has not been initialized");
             int bound = glGetInteger(GL_TEXTURE_BINDING_2D), previous = glGetInteger(GL_PIXEL_PACK_BUFFER_BINDING);
             int alignment = glGetInteger(GL_PACK_ALIGNMENT), rowLength = glGetInteger(GL_PACK_ROW_LENGTH);
@@ -44,6 +46,7 @@ final class TextureCapture {
             }
         }
         Snapshot poll() {
+            if(cpu!=null){Snapshot result=cpu;cpu=null;return result;}
             if (fence == 0) return null;
             int result = glClientWaitSync(fence, 0, 0L);
             if (result == GL_TIMEOUT_EXPIRED) return null;
@@ -61,6 +64,7 @@ final class TextureCapture {
             }
         }
         @Override public void close() {
+            cpu=null;
             if (fence != 0) { glDeleteSync(fence); fence = 0; }
             if (buffer != 0) { glDeleteBuffers(buffer); buffer = 0; capacity = 0; }
         }

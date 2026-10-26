@@ -37,7 +37,7 @@ public final class EntityDraws {
             FORMAT_POSITION_TEX = 5, FORMAT_POSITION_TEX_COLOR = 6, FORMAT_CLOUDS = 7, FORMAT_POSITION_COLOR_TEX = 8,
             MODE_QUADS = 0, MODE_TRIANGLES = 1, WHITE_TEXTURE = 0;
     /** Overlay passes per frame; the backend allows 16 (SharedWorldRenderer.MAX_OVERLAYS), one is kept spare. */
-    private static final int MAX_PASSES = 15;
+    private static final int MAX_PASSES = 60;
     private static final int BLEND = 1, DEPTH_TEST = 2, DEPTH_WRITE = 4, CULL = 8, BLEND_ADD = 16, NO_COLOR = 32;
     /** fragment variant (see entity.frag), EntityPass format, required VertexFormat, and which vanilla inputs the shader uses. */
     private record Spec(int variant, int format, VertexFormat vertexFormat, boolean lightmap, boolean fog, boolean textured) { }
@@ -66,9 +66,19 @@ public final class EntityDraws {
             Map.entry("position_color_tex", new Spec(6, FORMAT_POSITION_COLOR_TEX, DefaultVertexFormat.POSITION_COLOR_TEX, false, false, true)),
             Map.entry("rendertype_text_intensity", new Spec(7, FORMAT_TEXT, DefaultVertexFormat.POSITION_COLOR_TEX_LIGHTMAP, true, true, true)),
             Map.entry("rendertype_text_intensity_see_through", new Spec(7, FORMAT_TEXT, DefaultVertexFormat.POSITION_COLOR_TEX_LIGHTMAP, false, false, true)),
-            Map.entry("rendertype_text_see_through", new Spec(2, FORMAT_TEXT, DefaultVertexFormat.POSITION_COLOR_TEX_LIGHTMAP, false, false, true)));
+            Map.entry("rendertype_text_see_through", new Spec(2, FORMAT_TEXT, DefaultVertexFormat.POSITION_COLOR_TEX_LIGHTMAP, false, false, true)),
+            Map.entry("rendertype_glint",new Spec(8,FORMAT_POSITION_TEX,DefaultVertexFormat.POSITION_TEX,false,true,true)),
+            Map.entry("rendertype_glint_direct",new Spec(8,FORMAT_POSITION_TEX,DefaultVertexFormat.POSITION_TEX,false,true,true)),
+            Map.entry("rendertype_glint_translucent",new Spec(8,FORMAT_POSITION_TEX,DefaultVertexFormat.POSITION_TEX,false,true,true)),
+            Map.entry("rendertype_entity_glint",new Spec(8,FORMAT_POSITION_TEX,DefaultVertexFormat.POSITION_TEX,false,true,true)),
+            Map.entry("rendertype_entity_glint_direct",new Spec(8,FORMAT_POSITION_TEX,DefaultVertexFormat.POSITION_TEX,false,true,true)),
+            Map.entry("rendertype_armor_glint",new Spec(8,FORMAT_POSITION_TEX,DefaultVertexFormat.POSITION_TEX,false,true,true)),
+            Map.entry("rendertype_armor_entity_glint",new Spec(8,FORMAT_POSITION_TEX,DefaultVertexFormat.POSITION_TEX,false,true,true)),
+            Map.entry("rendertype_entity_shadow",new Spec(9,FORMAT_POSITION_COLOR_TEX,DefaultVertexFormat.NEW_ENTITY,false,true,true)),
+            Map.entry("rendertype_outline",new Spec(10,FORMAT_POSITION_COLOR_TEX,DefaultVertexFormat.POSITION_COLOR_TEX,false,false,true)),
+            Map.entry("rendertype_crumbling",new Spec(11,FORMAT_POSITION_COLOR_TEX,DefaultVertexFormat.BLOCK,false,false,true)));
     enum Window {
-        SKY, ENTITIES, PARTICLES, WEATHER, HAND;
+        SKY, ENTITIES, EFFECTS, PARTICLES, WEATHER, HAND;
         /** Starts from cleared depth and must keep painter's order with GL draws (splits on fallback). */
         boolean ordered() { return ordinal() >= HAND.ordinal(); }
     }
@@ -129,11 +139,12 @@ public final class EntityDraws {
     /** Flushes {@code window} if it is the open one (RenderGuiEvent.Post, ScreenEvent.Render.Post, swap). */
     static void closeOrdered(Window window) { if (open == window) flush(window, presenter); }
     static Window openWindow() { return open; }
+    static void flushCurrent(){if(open!=null&&open!=Window.SKY){Window window=open;flush(window,presenter);if(passes<MAX_PASSES)open=window;}}
     static boolean frameActive() { return frameActive; }
     static void lateHand(int draws) { windowDraws[Window.HAND.ordinal()] += draws; windowComposites[Window.HAND.ordinal()]++; }
     /** GL is about to draw something it must draw itself: keep painter's order by compositing what was captured before it. */
     private static void split() {
-        if (open == null || !open.ordered() || packets.isEmpty() || !RenderSystem.isOnRenderThread()) return;
+        if (open == null || (!open.ordered()&&!VulkanPreview.nativeTerrain()) || open==Window.SKY || packets.isEmpty() || !RenderSystem.isOnRenderThread()) return;
         Window window = open;
         flush(window, presenter);
         splits++;
@@ -147,6 +158,9 @@ public final class EntityDraws {
         if (open != window) return;
         open = null;
         if (packets.isEmpty()) return;
+        if(NativeMainWindow.nativeComposite(2,packets.toArray())){
+            packets.clear();passes++;composites++;windowComposites[window.ordinal()]++;return;
+        }
         int[] textures = passes < MAX_PASSES ? NativeMainWindow.renderOverlay(packets.toArray(), window.ordered()) : null;
         packets.clear();
         if (textures == null) return;
@@ -177,7 +191,7 @@ public final class EntityDraws {
         if (state.indexOnly()) { reject(shader); return false; }
         Object[] packet = packet(shader, state.format(), state.mode(), state.sequentialIndex(), RenderSystem.getModelViewMatrix(), RenderSystem.getProjectionMatrix());
         if (packet == null) return false;
-        add(packet, state.mode(), state.vertexCount(), copy(rendered.vertexBuffer()), state.sequentialIndex() ? null : copy(rendered.indexBuffer()),
+        add(packet, state.mode(), state.vertexCount(), vertices(rendered,packet), state.sequentialIndex() ? null : copy(rendered.indexBuffer()),
                 state.indexCount(), state.indexType().bytes, shader);
         rendered.release();
         return true;
@@ -192,7 +206,7 @@ public final class EntityDraws {
         int[] header = (int[]) result[0];
         header[H_VERTICES] = state.vertexCount(); header[H_MODE] = state.mode() == VertexFormat.Mode.QUADS ? MODE_QUADS : MODE_TRIANGLES;
         header[H_INDICES] = state.indexCount(); header[H_INDEX_SIZE] = state.indexType().bytes;
-        result[2] = copy(rendered.vertexBuffer()); result[3] = state.sequentialIndex() ? null : copy(rendered.indexBuffer());
+        result[2] = vertices(rendered,result); result[3] = state.sequentialIndex() ? null : copy(rendered.indexBuffer());
         captured++; capturedShaders.merge(shader.getName(), 1L, Long::sum);
         return result;
     }
@@ -226,9 +240,11 @@ public final class EntityDraws {
         boolean mirrored = texture == WHITE_TEXTURE || EntityTextures.ready(texture);
         mirrored &= overlay == WHITE_TEXTURE || EntityTextures.ready(overlay);
         if (!mirrored) { textureFallbacks++; return null; }
-        int[] header = new int[HEADER];
+        if((flags&(1024|2048))!=0&&!GuiDraws.active()&&!VulkanPreview.nativeTerrain())return null;
+        int[] header = new int[HEADER+2];
         header[H_FORMAT] = spec.format(); header[H_VARIANT] = spec.variant(); header[H_FLAGS] = flags;
         header[H_TEXTURE] = texture; header[H_OVERLAY] = overlay;
+        header[9]=Float.floatToRawIntBits(glGetFloat(GL_POLYGON_OFFSET_FACTOR));header[10]=Float.floatToRawIntBits(glGetFloat(GL_POLYGON_OFFSET_UNITS));
         float[] uniforms = new float[64];
         projection.get(uniforms, 0);
         modelView.get(uniforms, 16);
@@ -245,7 +261,9 @@ public final class EntityDraws {
         // Vanilla shaders without linear_fog get a fog start beyond any distance.
         uniforms[60] = spec.fog() ? RenderSystem.getShaderFogStart() : 1e30f; uniforms[61] = spec.fog() ? RenderSystem.getShaderFogEnd() : 2e30f;
         uniforms[62] = RenderSystem.getShaderFogShape().getIndex(); uniforms[63] = spec.variant();
-        return new Object[]{header, uniforms, null, null};
+        uniforms[51]=RenderSystem.getShaderGlintAlpha();
+        int framebuffer=glGetInteger(org.lwjgl.opengl.GL30.GL_DRAW_FRAMEBUFFER_BINDING);int[] viewport=new int[4];glGetIntegerv(GL_VIEWPORT,viewport);
+        return new Object[]{header, uniforms, null, null,null,new int[]{framebuffer,viewport[2],viewport[3]}};
     }
 
     /** Completes a packet with geometry; TRIANGLE_FAN (sky discs, sunrise) becomes an indexed triangle list (0, i, i + 1). */
@@ -279,22 +297,26 @@ public final class EntityDraws {
             boolean alphaFactors = (srcAlpha == GL_ONE || srcAlpha == GL_SRC_ALPHA) && (dstAlpha == GL_ONE_MINUS_SRC_ALPHA || dstAlpha == GL_ZERO);
             if (srcRGB == GL_SRC_ALPHA && dstRGB == GL_ONE_MINUS_SRC_ALPHA && alphaFactors) flags |= BLEND;
             else if (srcRGB == GL_SRC_ALPHA && dstRGB == GL_ONE) flags |= BLEND_ADD;
+            else if (srcRGB == GL_SRC_COLOR && dstRGB == GL_ONE) flags |= 1024;
+            else if (srcRGB == GL_DST_COLOR && dstRGB == GL_SRC_COLOR) flags |= 2048;
             else if (GuiDraws.active() && srcRGB == GL_ONE_MINUS_DST_COLOR && dstRGB == GL_ONE_MINUS_SRC_COLOR) flags |= 64;
             else if (GuiDraws.active() && srcRGB == GL_ZERO && dstRGB == GL_ONE_MINUS_SRC_COLOR) flags |= 128;
             else return -1;
         }
         if (glIsEnabled(GL_DEPTH_TEST)) {
             int func = glGetInteger(GL_DEPTH_FUNC);
-            if (func != GL_LEQUAL && func != GL_LESS) return -2;
+            if (func != GL_LEQUAL && func != GL_LESS && func!=GL_EQUAL) return -2;
             flags |= DEPTH_TEST;
             if (func == GL_LESS) flags |= 256;
+            if (func == GL_EQUAL) flags |= 512;
         }
         if (glGetBoolean(GL_DEPTH_WRITEMASK)) flags |= DEPTH_WRITE;
         if (glIsEnabled(GL_CULL_FACE)) {
             if (glGetInteger(GL_CULL_FACE_MODE) != GL_BACK || glGetInteger(GL_FRONT_FACE) != GL_CCW) return -3;
             flags |= CULL;
         }
-        if (glIsEnabled(GL_POLYGON_OFFSET_FILL) || (!GuiDraws.active() && glIsEnabled(GL_SCISSOR_TEST)) || glIsEnabled(GL_COLOR_LOGIC_OP)) return -4;
+        if(glIsEnabled(GL_POLYGON_OFFSET_FILL))flags|=4096;
+        if ((!GuiDraws.active() && glIsEnabled(GL_SCISSOR_TEST)) || glIsEnabled(GL_COLOR_LOGIC_OP)) return -4;
         try (var stack = org.lwjgl.system.MemoryStack.stackPush()) {
             var mask = stack.malloc(4); glGetBooleanv(GL_COLOR_WRITEMASK, mask);
             int written = 0;
@@ -310,5 +332,11 @@ public final class EntityDraws {
         byte[] bytes = new byte[buffer.remaining()];
         buffer.duplicate().get(bytes);
         return bytes;
+    }
+    private static byte[] vertices(BufferBuilder.RenderedBuffer rendered,Object[] packet){
+        var state=rendered.drawState();byte[] raw=copy(rendered.vertexBuffer());int variant=((int[])packet[0])[H_VARIANT];
+        if((variant==9||variant==11)&&state.format().getVertexSize()!=24){byte[] packed=new byte[state.vertexCount()*24];for(int i=0;i<state.vertexCount();i++)System.arraycopy(raw,i*state.format().getVertexSize(),packed,i*24,24);return packed;}
+        if(variant==8){var buffer=ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN);var matrix=RenderSystem.getTextureMatrix();var uv=new org.joml.Vector4f();for(int i=0;i<state.vertexCount();i++){int at=i*20+12;uv.set(buffer.getFloat(at),buffer.getFloat(at+4),0,1).mul(matrix);buffer.putFloat(at,uv.x).putFloat(at+4,uv.y);}}
+        return raw;
     }
 }

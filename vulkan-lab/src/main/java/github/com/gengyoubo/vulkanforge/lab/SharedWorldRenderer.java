@@ -21,6 +21,7 @@ final class SharedWorldRenderer implements AutoCloseable {
         VkCommandBuffer command;
         long fence;
         boolean used, pending;
+        boolean nativeOwned, nativeTargetLeased;
         long serial;
         // P7-P9 overlay passes (entities, particles, weather): one color/depth pair reused by every pass of a frame. GL releases
         // it right after each composite, so each pass is its own Vulkan wait -> render -> signal -> GL lease cycle.
@@ -47,9 +48,12 @@ final class SharedWorldRenderer implements AutoCloseable {
     private long pool, triangleLayout, trianglePipeline, frames, terrainFrames, sectionDraws;
     private final long started = System.nanoTime();
     /** Overlay passes allowed per frame; each owns a command buffer, fence and EntityPass ring set per slot. */
-    static final int MAX_OVERLAYS = 16; // world windows plus order-preserving hand/HUD/screen splits (P11)
+    static final int MAX_OVERLAYS = 64;
     private int width, height, generations, reading = -1, overlayReading = -1;
     private EntityPass entities;
+    private DepthComposite composite;
+    private int nativeReading = -1;
+    private long nativeComposites, nativeEntityPasses;
     private long overlayPasses, skyDraws, handoffGroups, handoffImages;
     private int depthTexture, translucentTexture, translucentDepthTexture;
     private long translucentSectionDraws;
@@ -67,6 +71,7 @@ final class SharedWorldRenderer implements AutoCloseable {
             world.retireUsing(retire);
             // Per slot: one ring set per overlay pass plus one for the sky drawn inside the terrain submit.
             entities = new EntityPass(context, SLOT_COUNT * (MAX_OVERLAYS + 1), retire);
+            composite = new DepthComposite(context);
             timers = new GpuTimers(context, SLOT_COUNT, log, "TERRAIN", "TERRAIN_RELEASE", "TRIANGLE", "CULLING", "TRANSLUCENT");
             var familyCount = stack.ints(0);
             vkGetPhysicalDeviceQueueFamilyProperties(context.physical, familyCount, null);
@@ -114,7 +119,11 @@ final class SharedWorldRenderer implements AutoCloseable {
     int render(int requestedWidth, int requestedHeight) { return render(requestedWidth, requestedHeight, java.util.List.of()); }
     /** P10: {@code sky} packets (captured renderSky draws) are drawn first in the opaque pass, under terrain, with its depth. */
     int render(int requestedWidth, int requestedHeight, java.util.List<Object[]> sky) {
+        return render(requestedWidth, requestedHeight, sky, false);
+    }
+    int render(int requestedWidth, int requestedHeight, java.util.List<Object[]> sky, boolean nativeMode) {
         endRead();
+        if (!nativeMode) finishNativeLeases();
         boolean terrain = world.ready();
         if (requestedWidth <= 0 || requestedHeight <= 0 || (!terrain && world.epoch() != 0)) return 0;
         if (width != requestedWidth || height != requestedHeight) resize(requestedWidth, requestedHeight);
@@ -133,6 +142,10 @@ final class SharedWorldRenderer implements AutoCloseable {
             acquireBarrier(acquire.get(1), slot.used, slot.depth, DEPTH_STAGES, DEPTH_ACCESS, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, true);
             acquireBarrier(acquire.get(2), slot.used, slot.translucentColor, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, false);
             acquireBarrier(acquire.get(3), slot.used, slot.translucentDepth, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, true);
+            if (slot.nativeOwned) {
+                for (int k=0;k<4;k++) acquire.get(k).srcStageMask(VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT).srcAccessMask(VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)
+                        .oldLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL).srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED);
+            }
             vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(acquire));
             var color = VkRenderingAttachmentInfo.calloc(1, stack).sType$Default().imageView(slot.color.view())
                     .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL).loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
@@ -213,26 +226,44 @@ final class SharedWorldRenderer implements AutoCloseable {
             releaseBarrier(release.get(1), slot.depth, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, true);
             releaseBarrier(release.get(2), slot.translucentColor, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, false);
             releaseBarrier(release.get(3), slot.translucentDepth, DEPTH_STAGES, DEPTH_ACCESS, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, true);
+            if (nativeMode) for (int k=0;k<4;k++) release.get(k).dstStageMask(VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT).dstAccessMask(VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)
+                    .newLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL).srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED);
             vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(release));
+            boolean prepareNativeTarget = nativeMode && !slot.nativeTargetLeased;
+            if (prepareNativeTarget) {
+                var target = VkImageMemoryBarrier2.calloc(2, stack);
+                acquireBarrier(target.get(0), slot.overlayUsed, slot.overlayColor, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_IMAGE_LAYOUT_GENERAL, false);
+                acquireBarrier(target.get(1), slot.overlayUsed, slot.overlayDepth, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_IMAGE_LAYOUT_GENERAL, true);
+                vkCmdPipelineBarrier2(command,VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(target));
+                releaseBarrier(target.get(0),slot.overlayColor,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,0,VK_IMAGE_LAYOUT_GENERAL,false);
+                releaseBarrier(target.get(1),slot.overlayDepth,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,0,VK_IMAGE_LAYOUT_GENERAL,true);
+                vkCmdPipelineBarrier2(command,VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(target));
+            }
             timers.end(command, index, 1, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             check(vkEndCommandBuffer(command), "end shared world command");
             SharedPresentImage[] images = slot.images();
-            var signals = VkSemaphoreSubmitInfo.calloc(1, stack).sType$Default().semaphore(slot.color.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+            var signals = VkSemaphoreSubmitInfo.calloc(nativeMode ? prepareNativeTarget ? 1 : 0 : 1, stack);
+            if (signals.hasRemaining()) signals.get(0).sType$Default().semaphore(nativeMode ? slot.overlayColor.ready : slot.color.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             var submit = VkSubmitInfo2.calloc(1, stack).sType$Default()
                     .pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1, stack).sType$Default().commandBuffer(command)).pSignalSemaphoreInfos(signals);
-            if (slot.used) {
-                var waits = VkSemaphoreSubmitInfo.calloc(1, stack).sType$Default().semaphore(slot.color.complete)
-                        .stageMask(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | DEPTH_STAGES | VK_PIPELINE_STAGE_2_COPY_BIT);
+            if ((slot.used && !slot.nativeOwned) || (prepareNativeTarget && slot.overlayUsed)) {
+                int waitCount=(slot.used && !slot.nativeOwned?1:0)+(prepareNativeTarget && slot.overlayUsed?1:0);
+                var waits = VkSemaphoreSubmitInfo.calloc(waitCount, stack); int w=0;
+                if(slot.used && !slot.nativeOwned) waits.get(w++).sType$Default().semaphore(slot.color.complete).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+                if(prepareNativeTarget && slot.overlayUsed) waits.get(w).sType$Default().semaphore(slot.overlayColor.complete).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
                 submit.pWaitSemaphoreInfos(waits);
             }
             check(vkResetFences(context.device, slot.fence), "reset shared world fence");
             check(vkQueueSubmit2(context.queue, submit, slot.fence), "submit shared world");
-            slot.used = slot.pending = true; timers.submitted(index); frames++;
+            slot.used = slot.pending = true; slot.nativeOwned = nativeMode; timers.submitted(index); frames++;
+            if (prepareNativeTarget) slot.overlayUsed = true;
             slot.serial = frames;
             if (terrain) { terrainFrames++; sectionDraws += world.drawableSections(); translucentSectionDraws += world.translucentSections(); }
             // Keep the GL read lease open through terrain + HUD/inset sampling, and close it before final presentation.
-            reading = index;
-            int[] textures = SharedPresentImage.beginGroupGL(images); handoffGroups++; handoffImages += images.length;
+            if(nativeMode) nativeReading=index; else reading=index;
+            int[] textures = nativeMode ? new int[]{slot.color.textureGL(),slot.depth.textureGL(),slot.translucentColor.textureGL(),slot.translucentDepth.textureGL()}
+                    : SharedPresentImage.beginGroupGL(images);
+            if(!nativeMode){handoffGroups++;handoffImages+=images.length;}
             int texture = textures[0]; depthTexture = textures[1]; translucentTexture = textures[2]; translucentDepthTexture = textures[3];
             if (frames % 300 == 0) { log.accept("WORLD_RENDERED_FRAMES=" + frames + " sections=" + world.trackedSections()); timers.report(log); }
             return texture;
@@ -326,6 +357,50 @@ final class SharedWorldRenderer implements AutoCloseable {
     void entityTexturePatch(int id, int x, int y, int width, int height, byte[] rgba) { entities.texturePatch(id, x, y, width, height, rgba); }
     boolean hasEntityTexture(int id) { return entities.hasTexture(id); }
 
+    boolean nativeReady() { return nativeReading >= 0; }
+    boolean composeNative(int framebuffer, int targetWidth, int targetHeight, int kind, java.util.List<Object[]> packets) {
+        if (nativeReading < 0 || targetWidth != width || targetHeight != height) return false;
+        int index=nativeReading; Slot slot=slots[index];
+        if(slot.overlays>=MAX_OVERLAYS) throw new IllegalStateException("Native render pass budget exceeded");
+        int pass=slot.overlays++;
+        if(!slot.nativeTargetLeased){SharedPresentImage.beginGroupGL(slot.overlayColor,slot.overlayDepth);slot.nativeTargetLeased=true;}
+        boolean hasDepth=slot.overlayColor.copyTargetGL(true,framebuffer,targetWidth,targetHeight,slot.overlayDepth);
+        SharedPresentImage.endGroupGL(slot.overlayColor,slot.overlayDepth);slot.nativeTargetLeased=false;
+        try(var stack=MemoryStack.stackPush()) {
+            var command=slot.overlayCommands[pass];
+            check(vkResetCommandBuffer(command,0),"reset native composite");
+            check(vkBeginCommandBuffer(command,VkCommandBufferBeginInfo.calloc(stack).sType$Default().flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)),"begin native composite");
+            var barriers=VkImageMemoryBarrier2.calloc(2,stack);
+            acquireBarrier(barriers.get(0),true,slot.overlayColor,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,false);
+            acquireBarrier(barriers.get(1),true,slot.overlayDepth,DEPTH_STAGES,DEPTH_ACCESS,VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,true);
+            vkCmdPipelineBarrier2(command,VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barriers));
+            var color=VkRenderingAttachmentInfo.calloc(1,stack).sType$Default().imageView(slot.overlayColor.view()).imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL).loadOp(VK_ATTACHMENT_LOAD_OP_LOAD).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+            var depth=VkRenderingAttachmentInfo.calloc(stack).sType$Default().imageView(slot.overlayDepth.view()).imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL).loadOp(hasDepth?VK_ATTACHMENT_LOAD_OP_LOAD:VK_ATTACHMENT_LOAD_OP_CLEAR).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+            depth.clearValue().depthStencil().depth(1);
+            vkCmdBeginRendering(command,VkRenderingInfo.calloc(stack).sType$Default().layerCount(1).pColorAttachments(color).pDepthAttachment(depth).renderArea(r->r.extent(e->e.set(width,height))));
+            vkCmdSetViewport(command,0,VkViewport.calloc(1,stack).width(width).height(height).minDepth(0).maxDepth(1));
+            vkCmdSetScissor(command,0,VkRect2D.calloc(1,stack).extent(e->e.set(width,height)));
+            if(kind<2){composite.record(command,stack,index,kind==1);nativeComposites++;}
+            else {entities.record(command,stack,index*(MAX_OVERLAYS+1)+pass,packets,world.lightMapView(),world.lightSampler(),world.lightMapIdentity(),true);nativeEntityPasses++;overlayPasses++;}
+            vkCmdEndRendering(command);
+            releaseBarrier(barriers.get(0),slot.overlayColor,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,false);
+            releaseBarrier(barriers.get(1),slot.overlayDepth,DEPTH_STAGES,DEPTH_ACCESS,VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,true);
+            vkCmdPipelineBarrier2(command,VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barriers));
+            check(vkEndCommandBuffer(command),"end native composite");
+            var wait=VkSemaphoreSubmitInfo.calloc(1,stack).sType$Default().semaphore(slot.overlayColor.complete).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+            var signal=VkSemaphoreSubmitInfo.calloc(1,stack).sType$Default().semaphore(slot.overlayColor.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+            check(vkResetFences(context.device,slot.overlayFences[pass]),"reset native composite fence");
+            check(vkQueueSubmit2(context.queue,VkSubmitInfo2.calloc(1,stack).sType$Default().pWaitSemaphoreInfos(wait).pSignalSemaphoreInfos(signal)
+                    .pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1,stack).sType$Default().commandBuffer(command)),slot.overlayFences[pass]),"submit native composite");
+            slot.overlayPending[pass]=true;
+        }
+        SharedPresentImage.beginGroupGL(slot.overlayColor,slot.overlayDepth);slot.nativeTargetLeased=true;
+        slot.overlayColor.copyTargetGL(false,framebuffer,targetWidth,targetHeight,slot.overlayDepth);
+        handoffGroups++;handoffImages+=2;
+        return true;
+    }
+    private void finishNativeLeases(){for(Slot slot:slots)if(slot.nativeTargetLeased){SharedPresentImage.endGroupGL(slot.overlayColor,slot.overlayDepth);slot.nativeTargetLeased=false;}}
+
     /** First use per frame: from the GL owner (GENERAL) or, on a fresh image, from UNDEFINED. */
     private void acquireBarrier(VkImageMemoryBarrier2 barrier, boolean used, SharedPresentImage image, long stage, long access, int layout, boolean depth) {
         barrier.sType$Default().srcStageMask(used ? stage : VK_PIPELINE_STAGE_2_NONE).dstStageMask(stage).dstAccessMask(access)
@@ -352,6 +427,7 @@ final class SharedWorldRenderer implements AutoCloseable {
     }
 
     void endRead() {
+        nativeReading = -1;
         if (reading >= 0) { int index = reading; reading = -1; slots[index].sceneFresh = false; SharedPresentImage.endGroupGL(slots[index].images()); }
         finishOverlay();
     }
@@ -369,7 +445,7 @@ final class SharedWorldRenderer implements AutoCloseable {
     }
     private void waitAll() { for (int i = 0; i < SLOT_COUNT; i++) waitSlot(i); }
     private void resize(int width, int height) {
-        endRead(); finishGL.run(); waitAll(); destroyTargets();
+        endRead(); finishNativeLeases(); finishGL.run(); waitAll(); destroyTargets();
         this.width = width; this.height = height;
         for (Slot slot : slots) {
             slot.color = new SharedPresentImage(context, width, height, importer);
@@ -381,6 +457,7 @@ final class SharedWorldRenderer implements AutoCloseable {
             slot.sceneDepth = new GpuImage(context, width, height, VK_FORMAT_D32_SFLOAT,
                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
         }
+        for(int i=0;i<slots.length;i++) composite.sources(i,slots[i].color.view(),slots[i].depth.view(),slots[i].translucentColor.view(),slots[i].translucentDepth.view());
         log.accept("WORLD_TARGET[" + ++generations + "]=" + width + "x" + height + " slots=" + SLOT_COUNT);
     }
     long[] stats() {
@@ -401,11 +478,12 @@ final class SharedWorldRenderer implements AutoCloseable {
             if (slot.overlayColor != null) { slot.overlayColor.close(); slot.overlayColor = null; }
             if (slot.overlayDepth != null) { slot.overlayDepth.close(); slot.overlayDepth = null; }
             if (slot.sceneDepth != null) { slot.sceneDepth.close(); slot.sceneDepth = null; }
-            slot.used = slot.overlayUsed = slot.sceneFresh = slot.sceneReadable = false;
+            slot.used = slot.overlayUsed = slot.sceneFresh = slot.sceneReadable = slot.nativeOwned = slot.nativeTargetLeased = false;
         }
     }
     @Override public void close() {
-        endRead(); finishGL.run(); waitAll();
+        endRead(); finishNativeLeases(); finishGL.run(); waitAll();
+        log.accept("NATIVE_COMPOSITES="+nativeComposites+" entityPasses="+nativeEntityPasses);
         log.accept("WORLD_FINAL_FRAMES=" + frames + " terrain=" + terrainFrames + " sectionDraws=" + sectionDraws + " peakSections=" + world.peakSections());
         log.accept("WORLD_TRANSLUCENT sectionDraws=" + translucentSectionDraws + " sorts=" + world.translucentSorts());
         log.accept("WORLD_RGBA_READBACK_BYTES=0");
@@ -419,6 +497,7 @@ final class SharedWorldRenderer implements AutoCloseable {
         if (timers != null) { timers.report(log); timers.close(); timers = null; }
         if (culler != null) { culler.report(log); culler.close(); culler = null; }
         world.close(); destroyTargets();
+        if(composite!=null){composite.close();composite=null;}
         if (trianglePipeline != 0) { vkDestroyPipeline(context.device, trianglePipeline, null); trianglePipeline = 0; }
         if (triangleLayout != 0) { vkDestroyPipelineLayout(context.device, triangleLayout, null); triangleLayout = 0; }
         if (pool != 0) { vkDestroyCommandPool(context.device, pool, null); pool = 0; }

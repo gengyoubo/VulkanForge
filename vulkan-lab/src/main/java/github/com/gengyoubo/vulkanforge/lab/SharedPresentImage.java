@@ -30,7 +30,8 @@ final class SharedPresentImage implements AutoCloseable {
                     .format(format).extent(e -> e.set(width, height, 1)).mipLevels(1).arrayLayers(1)
                     .samples(VK_SAMPLE_COUNT_1_BIT).tiling(VK_IMAGE_TILING_OPTIMAL).sharingMode(VK_SHARING_MODE_EXCLUSIVE)
                     // Depth targets are also copy destinations: translucent depth starts as a copy of opaque depth.
-                    .usage((depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+                    .usage((depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+                            | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
             check(vkCreateImage(context.device, info, null, handle), "create shared presentation image"); image = handle.get(0);
             var requirements = VkMemoryRequirements.calloc(stack); vkGetImageMemoryRequirements(context.device, image, requirements);
             var dedicated = VkMemoryDedicatedAllocateInfo.calloc(stack).sType$Default().image(image);
@@ -70,7 +71,12 @@ final class SharedPresentImage implements AutoCloseable {
     int beginReadGL() { int[] result = {0, 0}; glImage.accept(result); return result[1]; }
     void endReadGL() { glImage.accept(new int[]{1}); }
     private int glTexture;
-    private int textureGL() { if (glTexture == 0) { int[] result = {2, 0}; glImage.accept(result); glTexture = result[1]; } return glTexture; }
+    int textureGL() { if (glTexture == 0) { int[] result = {2, 0}; glImage.accept(result); glTexture = result[1]; } return glTexture; }
+    boolean copyTargetGL(boolean intoVulkan, int framebuffer, int width, int height, SharedPresentImage depth) {
+        int[] command = {intoVulkan ? 5 : 6, framebuffer, width, height, depth.textureGL(), 0};
+        glImage.accept(command); return command[5] != 0;
+    }
+    void copyTextureGL(int texture,int width,int height,boolean depth){glImage.accept(new int[]{7,texture,width,height,depth?1:0});}
     /** All images share the leader's one semaphore pair; the Vulkan submit releases/acquires every group member together. */
     static int[] beginGroupGL(SharedPresentImage... images) { return groupGL(true, images); }
     static void endGroupGL(SharedPresentImage... images) { groupGL(false, images); }

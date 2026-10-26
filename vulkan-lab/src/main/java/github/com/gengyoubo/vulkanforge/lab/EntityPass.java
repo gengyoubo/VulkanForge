@@ -163,6 +163,9 @@ final class EntityPass implements AutoCloseable {
         record(command, stack, slot, packets, lightView, lightSampler, null);
     }
     void record(VkCommandBuffer command, MemoryStack stack, int slot, List<Object[]> packets, long lightView, long lightSampler, Object lightIdentity) {
+        record(command,stack,slot,packets,lightView,lightSampler,lightIdentity,false);
+    }
+    void record(VkCommandBuffer command, MemoryStack stack, int slot, List<Object[]> packets, long lightView, long lightSampler, Object lightIdentity, boolean glTarget) {
         if (packets.isEmpty()) return;
         packets = batch(packets);
         SlotResources resources = slots[slot];
@@ -228,8 +231,9 @@ final class EntityPass implements AutoCloseable {
             Texture texture = textures.get(header[H_TEXTURE]);
             if (texture == null || effectiveLight == 0) { missingTextures++; continue; }
             Texture overlay = textures.getOrDefault(header[H_OVERLAY], texture);
-            long pipeline = pipeline(header[H_FORMAT], header[H_FLAGS]);
+            long pipeline = pipeline(header[H_FORMAT], header[H_FLAGS] | (glTarget ? 1 << 20 : 0));
             if (pipeline != bound) { vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline); bound = pipeline; }
+            vkCmdSetDepthBias(command,header.length>10?Float.intBitsToFloat(header[10]):0,0,header.length>9?Float.intBitsToFloat(header[9]):0);
             long key = (long) header[H_TEXTURE] << 32 | (header[H_OVERLAY] & 0xffffffffL);
             BindingKey bindingKey = new BindingKey(texture, overlay, effectiveLight, effectiveSampler,
                     lightIdentity != null ? lightIdentity : direct ? textures.get(WHITE_TEXTURE) : effectiveLight);
@@ -257,7 +261,9 @@ final class EntityPass implements AutoCloseable {
                 else { vkUpdateDescriptorSets(context.device, writes, null); resources.textureSets.put(bindingKey, set); }
             } else bindingHits++;
             uniformData.position(i * UNIFORM_STRIDE / 4); uniformData.put((float[]) packet[1], 0, UNIFORM_FLOATS);
+            if(glTarget)for(int column=0;column<4;column++){int at=i*UNIFORM_STRIDE/4+column*4+1;uniformData.put(at,-uniformData.get(at));}
             if (direct) uniformData.put(i * UNIFORM_STRIDE / 4 + 55, 3);
+            if((header[H_FLAGS]&(1024|2048))!=0)uniformData.put(i*UNIFORM_STRIDE/4+55,3);
             dynamic.put(0, i * UNIFORM_STRIDE);
             if (pushDescriptors) vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, stack.longs(uniformSet), dynamic);
             else vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, stack.longs(set, uniformSet), dynamic);
@@ -401,9 +407,13 @@ final class EntityPass implements AutoCloseable {
                         .srcColorBlendFactor(VK_BLEND_FACTOR_ZERO).dstColorBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR)
                         .srcAlphaBlendFactor(VK_BLEND_FACTOR_ONE).dstAlphaBlendFactor(VK_BLEND_FACTOR_ZERO);
             }
+            if((flags&1024)!=0)attachment.blendEnable(true).colorBlendOp(VK_BLEND_OP_ADD).alphaBlendOp(VK_BLEND_OP_ADD)
+                    .srcColorBlendFactor(VK_BLEND_FACTOR_SRC_COLOR).dstColorBlendFactor(VK_BLEND_FACTOR_ONE).srcAlphaBlendFactor(VK_BLEND_FACTOR_ZERO).dstAlphaBlendFactor(VK_BLEND_FACTOR_ONE);
+            if((flags&2048)!=0)attachment.blendEnable(true).colorBlendOp(VK_BLEND_OP_ADD).alphaBlendOp(VK_BLEND_OP_ADD)
+                    .srcColorBlendFactor(VK_BLEND_FACTOR_DST_COLOR).dstColorBlendFactor(VK_BLEND_FACTOR_SRC_COLOR).srcAlphaBlendFactor(VK_BLEND_FACTOR_ONE).dstAlphaBlendFactor(VK_BLEND_FACTOR_ZERO);
             // Vanilla front faces are CCW on screen; the shaders' y flip keeps them CCW in Vulkan framebuffer space.
             var raster = VkPipelineRasterizationStateCreateInfo.calloc(stack).sType$Default().polygonMode(VK_POLYGON_MODE_FILL)
-                    .cullMode((flags & CULL) != 0 ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE).frontFace(VK_FRONT_FACE_COUNTER_CLOCKWISE).lineWidth(1);
+                    .cullMode((flags & CULL) != 0 ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE).frontFace((flags & (1<<20))!=0?VK_FRONT_FACE_CLOCKWISE:VK_FRONT_FACE_COUNTER_CLOCKWISE).depthBiasEnable((flags&4096)!=0).lineWidth(1);
             var info = VkGraphicsPipelineCreateInfo.calloc(1, stack).sType$Default()
                     .pNext(VkPipelineRenderingCreateInfo.calloc(stack).sType$Default().pColorAttachmentFormats(stack.ints(colorFormat))
                             .depthAttachmentFormat(VK_FORMAT_D32_SFLOAT).address())
@@ -413,9 +423,9 @@ final class EntityPass implements AutoCloseable {
                     .pRasterizationState(raster)
                     .pMultisampleState(VkPipelineMultisampleStateCreateInfo.calloc(stack).sType$Default().rasterizationSamples(VK_SAMPLE_COUNT_1_BIT))
                     .pDepthStencilState(VkPipelineDepthStencilStateCreateInfo.calloc(stack).sType$Default().depthTestEnable((flags & DEPTH_TEST) != 0)
-                            .depthWriteEnable((flags & DEPTH_WRITE) != 0).depthCompareOp((flags & DEPTH_LESS) != 0 ? VK_COMPARE_OP_LESS : VK_COMPARE_OP_LESS_OR_EQUAL))
+                            .depthWriteEnable((flags & DEPTH_WRITE) != 0).depthCompareOp((flags&512)!=0?VK_COMPARE_OP_EQUAL:(flags & DEPTH_LESS) != 0 ? VK_COMPARE_OP_LESS : VK_COMPARE_OP_LESS_OR_EQUAL))
                     .pColorBlendState(VkPipelineColorBlendStateCreateInfo.calloc(stack).sType$Default().pAttachments(attachment))
-                    .pDynamicState(VkPipelineDynamicStateCreateInfo.calloc(stack).sType$Default().pDynamicStates(stack.ints(VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR)))
+                    .pDynamicState(VkPipelineDynamicStateCreateInfo.calloc(stack).sType$Default().pDynamicStates(stack.ints(VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,VK_DYNAMIC_STATE_DEPTH_BIAS)))
                     .layout(layout).basePipelineIndex(-1);
             var handle = stack.mallocLong(1);
             check(vkCreateGraphicsPipelines(context.device, 0, info, null, handle), "entity pipeline");
