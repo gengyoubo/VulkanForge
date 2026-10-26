@@ -20,6 +20,8 @@ public final class MainWindowBackend implements AutoCloseable {
     private static final class FrameSlot {
         long fence, acquired;
         int imageIndex = -1, acquireResult;
+        /** Per-frame bookkeeping after the fence (timer readback, GUI ring) has run for the currently acquired image. */
+        boolean prepared;
         VkCommandBuffer command;
         SharedPresentImage shared;
     }
@@ -39,7 +41,31 @@ public final class MainWindowBackend implements AutoCloseable {
     private long fenceWaitNanos, maxFenceWaitNanos, presentNanos, maxPresentNanos;
     /** CPU spent recording/submitting the present command buffer, and in the GL side of the shared-source handoff (signal+flush, wait). */
     private long recordNanos, maxRecordNanos, handoffNanos, maxHandoffNanos;
-    private boolean dirty = true, vsync = true;
+    /**
+     * Off-thread acquire (default on; -Dvulkanforge.asyncAcquire=false disables). On Optimus laptops vkAcquireNextImageKHR blocks
+     * ~1.6 ms every frame regardless of load. After present(N) a worker waits for slot N+1's fence and acquires its image while
+     * Minecraft runs frame N+1 on the CPU; beginFrame only joins it. Only one thread touches the swapchain at a time and the
+     * worker never uses the queue, so no extra queue locking is needed.
+     */
+    private final java.util.concurrent.ExecutorService acquirer = "false".equalsIgnoreCase(System.getProperty("vulkanforge.asyncAcquire")) ? null
+            : java.util.concurrent.Executors.newSingleThreadExecutor(task -> { Thread thread = new Thread(task, "VulkanForge swapchain acquire"); thread.setDaemon(true); return thread; });
+    private java.util.concurrent.Future<?> pendingAcquire;
+    private long joinNanos, maxJoinNanos, asyncAcquires, deferredFrames;
+    /**
+     * Deferring only pays when the frame's CPU work (beginFrame -> present) can hide the ~1.6 ms acquire: with short frames the
+     * Optimus present path blocks ~1.8 ms if present follows the acquire too closely, which is slower than the early blocking acquire.
+     * Measured crossover ~2 ms; switch on above 2.5 ms and off below 1.5 ms (EMA of the work time).
+     */
+    private static final double DEFER_ON_MS = 2.5, DEFER_OFF_MS = 1.5;
+    private long beginFrameEnd;
+    private double workEmaMs;
+    private boolean deferred;
+    /** -Dvulkanforge.asyncAcquire=always: defer regardless of frame time (tests the worker path under light load). */
+    private final boolean alwaysDefer = "always".equalsIgnoreCase(System.getProperty("vulkanforge.asyncAcquire"));
+    /** volatile: the acquire worker may set dirty (OUT_OF_DATE) while the render thread runs beginFrame. */
+    private volatile boolean dirty = true;
+    private boolean vsync = true;
+    private int presentMode = -1;
     private String capture;
     private PrintWriter report;
     private GpuTimers timers;
@@ -118,8 +144,8 @@ public final class MainWindowBackend implements AutoCloseable {
     public long[] presentationStats() { return new long[]{directSourceFrames, copiedSourceFrames, compatibilityImages}; }
     public int generations() { return generations; }
     public long earlyAcquires() { return earlyAcquires; }
-    /** Cumulative CPU nanoseconds: {frames, fenceWait, acquire, recordSubmit, glHandoff, queuePresent}. */
-    public long[] cpuStats() { return new long[]{frames, fenceWaitNanos, acquireNanos, recordNanos, handoffNanos, presentNanos}; }
+    /** Cumulative CPU nanoseconds: {frames, fenceWait, acquire, recordSubmit, glHandoff, queuePresent, acquireWait}. fenceWait/acquire may run off-thread. */
+    public long[] cpuStats() { return new long[]{frames, fenceWaitNanos, acquireNanos, recordNanos, handoffNanos, presentNanos, joinNanos}; }
     public long lateAcquires() { return lateAcquires; }
     public boolean gpuDrivenEnabled() { return world != null && world.gpuDrivenEnabled(); }
     public long[] optimizationStats() { return world == null ? new long[4] : world.optimizationStats(); }
@@ -234,34 +260,89 @@ public final class MainWindowBackend implements AutoCloseable {
     /** Wait for a slot/image before Minecraft polls input and advances its timer. */
     public boolean beginFrame(int framebufferWidth, int framebufferHeight) {
         context.uploads.flush(); // Never carry an open upload batch across frames.
-        boolean acquired = acquire(framebufferWidth, framebufferHeight, true);
+        boolean acquired = deferredAcquire() ? beginDeferred(framebufferWidth, framebufferHeight) : acquire(framebufferWidth, framebufferHeight, true);
         if (acquired && world != null) world.prepareFrame();
+        beginFrameEnd = acquired ? System.nanoTime() : 0;
         return acquired;
     }
+    /**
+     * Without VSync there is no display pacing to wait for before input, so the image is acquired off-thread and only joined in
+     * present(), after Minecraft's CPU frame. With VSync the early blocking acquire stays: it is the frame pacer.
+     */
+    private boolean deferredAcquire() { return acquirer != null && (deferred || alwaysDefer) && presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR; }
+    private void measureWork() {
+        if (beginFrameEnd == 0) return;
+        workEmaMs = workEmaMs * .9 + (System.nanoTime() - beginFrameEnd) / 1e6 * .1; beginFrameEnd = 0;
+        deferred = deferred ? workEmaMs > DEFER_OFF_MS : workEmaMs > DEFER_ON_MS;
+    }
+    private boolean beginDeferred(int framebufferWidth, int framebufferHeight) {
+        if (framebufferWidth <= 0 || framebufferHeight <= 0) return false;
+        if ((dirty || framebufferWidth != requestedWidth || framebufferHeight != requestedHeight) && !recreate(framebufferWidth, framebufferHeight)) return false;
+        FrameSlot slot = slots[(int)(frames % slots.length)];
+        if (!slot.prepared) { waitSlotFence(slot, true); prepare(slot, true); } // The worker may wait on the same fence; vkWaitForFences needs no external sync.
+        if (slot.imageIndex < 0 && pendingAcquire == null) startAcquire();
+        return true;
+    }
     private boolean acquire(int framebufferWidth, int framebufferHeight, boolean early) {
+        joinAcquire();
         if (framebufferWidth <= 0 || framebufferHeight <= 0) return false;
         // Compare requested sizes: the surface may clamp them.
         if ((dirty || framebufferWidth != requestedWidth || framebufferHeight != requestedHeight) && !recreate(framebufferWidth, framebufferHeight)) return false;
         FrameSlot slot = slots[(int)(frames % slots.length)];
-        if (slot.imageIndex >= 0) return true;
+        if (!slot.prepared) { waitSlotFence(slot, true); prepare(slot, early); }
+        return slot.imageIndex >= 0 || acquireImage(slot, swapchain);
+    }
+    /** record: only the render thread updates the fence-wait statistics. */
+    private void waitSlotFence(FrameSlot slot, boolean record) {
+        long start = System.nanoTime();
+        check(vkWaitForFences(context.device, slot.fence, true, 5_000_000_000L), "wait presentation slot before input");
+        if (record) { long elapsed = System.nanoTime() - start; fenceWaitNanos += elapsed; maxFenceWaitNanos = Math.max(maxFenceWaitNanos, elapsed); }
+    }
+    /** Runs on the render thread or the acquire worker, never both at once (joinAcquire orders them). */
+    private boolean acquireImage(FrameSlot slot, long chain) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            long start = System.nanoTime();
-            check(vkWaitForFences(context.device, slot.fence, true, 5_000_000_000L), "wait presentation slot before input");
-            long elapsed = System.nanoTime() - start; fenceWaitNanos += elapsed; maxFenceWaitNanos = Math.max(maxFenceWaitNanos, elapsed);
-            timers.collect((int)(frames % slots.length));
-            if (gui != null) gui.prepare(frames);
-            var index = stack.ints(0); start = System.nanoTime();
-            int result = vkAcquireNextImageKHR(context.device, swapchain, 5_000_000_000L, slot.acquired, 0, index);
-            elapsed = System.nanoTime() - start; acquireNanos += elapsed; maxAcquireNanos = Math.max(maxAcquireNanos, elapsed);
+            var index = stack.ints(0); long start = System.nanoTime();
+            int result = vkAcquireNextImageKHR(context.device, chain, 5_000_000_000L, slot.acquired, 0, index);
+            long elapsed = System.nanoTime() - start; acquireNanos += elapsed; maxAcquireNanos = Math.max(maxAcquireNanos, elapsed);
             if (result == VK_ERROR_OUT_OF_DATE_KHR) { dirty = true; return false; }
             if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) check(result, "acquire main-window swapchain");
             slot.imageIndex = index.get(0); slot.acquireResult = result;
-            if (early) earlyAcquires++; else lateAcquires++;
             return true;
+        }
+    }
+    private void prepare(FrameSlot slot, boolean early) {
+        timers.collect((int)(frames % slots.length));
+        if (gui != null) gui.prepare(frames);
+        slot.prepared = true;
+        if (early) earlyAcquires++; else lateAcquires++;
+    }
+    /** After present(N): fence wait + acquire for frame N+1 overlap Minecraft's CPU work instead of blocking beginFrame. */
+    private void startAcquire() {
+        if (!deferredAcquire() || dirty || swapchain == 0) return;
+        FrameSlot slot = slots[(int)(frames % slots.length)];
+        if (slot.imageIndex >= 0) return;
+        long chain = swapchain;
+        // The acquire semaphore may still have the slot's previous submit waiting on it; the fence proves that wait executed.
+        pendingAcquire = acquirer.submit(() -> { waitSlotFence(slot, false); if (acquireImage(slot, chain)) asyncAcquires++; });
+    }
+    /** Every swapchain/slot user on the render thread joins first; Future.get also publishes the worker's writes. */
+    private void joinAcquire() {
+        if (pendingAcquire == null) return;
+        long start = System.nanoTime();
+        try { pendingAcquire.get(); }
+        catch (java.util.concurrent.ExecutionException error) {
+            if (error.getCause() instanceof RuntimeException runtime) throw runtime;
+            throw new IllegalStateException("Swapchain acquire failed", error.getCause());
+        } catch (InterruptedException error) { Thread.currentThread().interrupt(); throw new IllegalStateException(error); }
+        finally {
+            pendingAcquire = null;
+            long elapsed = System.nanoTime() - start; joinNanos += elapsed; maxJoinNanos = Math.max(maxJoinNanos, elapsed);
         }
     }
 
     public void present(int sourceFramebuffer, int sourceWidth, int sourceHeight, int framebufferWidth, int framebufferHeight) throws IOException {
+        measureWork();
+        if (deferredAcquire()) deferredFrames++;
         finishWorldFrame();
         var packets = guiPackets; guiPackets = java.util.List.of();
         var held = handPackets; handPackets = java.util.List.of();
@@ -350,7 +431,7 @@ public final class MainWindowBackend implements AutoCloseable {
                 check(vkQueueSubmit2(context.queue, submit, fence), "submit main-window presentation");
                 timers.submitted(timerSlot);
                 long recordEnd = System.nanoTime(); recordNanos += recordEnd - recordStart; maxRecordNanos = Math.max(maxRecordNanos, recordEnd - recordStart);
-                slot.imageIndex = -1;
+                slot.imageIndex = -1; slot.prepared = false;
                 submitted = true;
                 if (directSource != null) directSource.acquireGL();
                 handoff += System.nanoTime() - recordEnd; handoffNanos += handoff; maxHandoffNanos = Math.max(maxHandoffNanos, handoff);
@@ -377,6 +458,7 @@ public final class MainWindowBackend implements AutoCloseable {
             }
             if (frames == 1 || frames % 300 == 0) { log("PRESENTED_FRAMES=" + frames); timers.report(this::log); }
         }
+        startAcquire();
     }
 
     /** Only a non-shared source needs a second exported color image. Allocate it on its first compatibility frame. */
@@ -410,6 +492,7 @@ public final class MainWindowBackend implements AutoCloseable {
     }
 
     private boolean recreate(int requestedWidth, int requestedHeight) {
+        joinAcquire();
         try (MemoryStack stack = MemoryStack.stackPush()) {
             var caps = VkSurfaceCapabilitiesKHR.calloc(stack);
             check(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(context.physical, context.surface, caps), "main-window surface capabilities");
@@ -462,7 +545,7 @@ public final class MainWindowBackend implements AutoCloseable {
                         .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
                 check(vkCreateImageView(context.device, view, null, handle), "GUI swapchain view"); views[i] = handle.get(0);
             }
-            generations++; dirty = false;
+            generations++; dirty = false; presentMode = mode;
             log("SWAPCHAIN[" + generations + "]=" + width + "x" + height + " format=" + format + " mode=" + mode
                     + " (" + (mode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "IMMEDIATE" : "FIFO") + ") images=" + images.length);
             return true;
@@ -479,13 +562,14 @@ public final class MainWindowBackend implements AutoCloseable {
 
     /** A frame that acquired an image but never reached the queue leaves its acquire semaphore pending and its GL handoff half done. */
     private void abandon(FrameSlot slot) {
+        joinAcquire();
         abandonedFrames++; dirty = true;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             // Consume the pending acquire signal on the queue so the semaphore and fence can be destroyed legally.
             check(vkResetFences(context.device, slot.fence), "reset abandoned frame fence");
             check(vkQueueSubmit(context.queue, VkSubmitInfo.calloc(stack).sType$Default().pWaitSemaphores(stack.longs(slot.acquired))
                     .pWaitDstStageMask(stack.ints(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)), slot.fence), "consume failed frame acquisition");
-            slot.imageIndex = -1;
+            slot.imageIndex = -1; slot.prepared = false;
             finishGL.run(); check(vkDeviceWaitIdle(context.device), "wait abandoned frame");
             vkDestroyFence(context.device, slot.fence, null); vkDestroySemaphore(context.device, slot.acquired, null);
             slot.fence = slot.acquired = 0;
@@ -496,6 +580,7 @@ public final class MainWindowBackend implements AutoCloseable {
 
     private void log(String message) { if (report != null) { report.println(message); report.flush(); } }
     private void drainAcquired() {
+        joinAcquire();
         try (MemoryStack stack = MemoryStack.stackPush()) {
             for (FrameSlot slot : slots) if (slot.imageIndex >= 0) {
                 var wait = VkSemaphoreSubmitInfo.calloc(1, stack).sType$Default().semaphore(slot.acquired).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
@@ -514,6 +599,8 @@ public final class MainWindowBackend implements AutoCloseable {
         if (swapchain != 0) { vkDestroySwapchainKHR(context.device, swapchain, null); swapchain = 0; }
     }
     @Override public void close() {
+        try { joinAcquire(); } catch (RuntimeException error) { log("ACQUIRE_ON_CLOSE_FAILED=" + error); }
+        if (acquirer != null) acquirer.shutdownNow();
         if (context.device != null) {
             closeWorld();
             if (renderTargets != null) { renderTargets.close(); renderTargets = null; }
@@ -531,6 +618,8 @@ public final class MainWindowBackend implements AutoCloseable {
             log("CPU_FENCE_WAIT_MS mean=" + fenceWaitNanos / (frames * 1_000_000.0) + " max=" + maxFenceWaitNanos / 1_000_000.0);
             log("CPU_PRESENT_MS mean=" + presentNanos / (frames * 1_000_000.0) + " max=" + maxPresentNanos / 1_000_000.0);
             log("CPU_ACQUIRE_MS mean=" + acquireNanos / (Math.max(1, earlyAcquires + lateAcquires) * 1_000_000.0) + " max=" + maxAcquireNanos / 1_000_000.0);
+            log("CPU_ACQUIRE_WAIT_MS mean=" + joinNanos / (frames * 1_000_000.0) + " max=" + maxJoinNanos / 1_000_000.0 + " asyncAcquires=" + asyncAcquires + " deferredFrames=" + deferredFrames
+                    + " (render-thread wait for the off-thread acquire)");
             log("CPU_RECORD_SUBMIT_MS mean=" + recordNanos / (frames * 1_000_000.0) + " max=" + maxRecordNanos / 1_000_000.0);
             log("CPU_GL_HANDOFF_MS mean=" + handoffNanos / (frames * 1_000_000.0) + " max=" + maxHandoffNanos / 1_000_000.0);
         }

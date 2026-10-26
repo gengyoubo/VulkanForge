@@ -72,6 +72,8 @@ tasks.register('smokePresent', JavaExec) {
     dependsOn 'testClasses'
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'github.com.gengyoubo.vulkanforge.lab.NativePresentSmoke'
+    // e.g. -Pvulkanforge.asyncAcquire=always exercises the off-thread acquire through cancellation, resize and recovery.
+    rootProject.properties.findAll { it.key.startsWith('vulkanforge.') }.each { systemProperty it.key, it.value }
     if (rootProject.hasProperty('validationSmoke')) systemProperty 'vulkanforge.requireValidation', 'true'
     if (rootProject.hasProperty('pushDescriptorSmoke')) systemProperty 'vulkanforge.preferPushDescriptors', 'true'
     if (rootProject.hasProperty('legacyGpuSmoke')) {
@@ -101,5 +103,14 @@ tasks.register('benchmarkPresent', JavaExec) {
     mainClass = 'github.com.gengyoubo.vulkanforge.lab.PresentBenchmark'
     systemProperty 'vulkanforge.disableValidation', 'true'
     // -Pbench.fullscreen=true -Pbench.frames=3000 ... are forwarded as system properties.
+    rootProject.properties.findAll { it.key.startsWith('bench.') || it.key.startsWith('vulkanforge.') }.each { systemProperty it.key, it.value }
+}
+
+// Same terrain path as the game without surface/swapchain/present: -Pbench.frames=3000 -Pbench.width=1920 -Pbench.radius=12 ...
+tasks.register('benchmarkOffscreen', JavaExec) {
+    dependsOn 'testClasses'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.lab.OffscreenBenchmark'
+    systemProperty 'vulkanforge.disableValidation', 'true'
     rootProject.properties.findAll { it.key.startsWith('bench.') || it.key.startsWith('vulkanforge.') }.each { systemProperty it.key, it.value }
 }

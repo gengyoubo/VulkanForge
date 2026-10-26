@@ -57,7 +57,8 @@ public final class PresentBenchmark {
         double seconds = presentedNanos / 1e9;
         long[] after = backend.cpuStats(); long counted = after[0] - before[0];
         if (skipped > 0) System.out.println("PRESENT_BENCH_SKIPPED=" + skipped + " (window minimized/occluded)");
-        String[] names = {"fenceWait", "acquire", "recordSubmit", "glHandoff", "queuePresent"};
+        // fenceWait/acquire run on the acquire worker unless -Dvulkanforge.asyncAcquire=false; acquireWait is the render thread's share.
+        String[] names = {"fenceWait", "acquire", "recordSubmit", "glHandoff", "queuePresent", "acquireWait"};
         StringBuilder line = new StringBuilder(String.format("PRESENT_BENCH %s %dx%d cpuMs=" + cpuMs + " frames=%d fps=%.1f frameMs=%.3f beginFrameMs=%.3f",
                 fullscreen ? "fullscreen" : "windowed", w[0], h[0], counted, counted / seconds, seconds * 1000 / counted, beginNanos / 1e6 / counted));
         for (int i = 0; i < names.length; i++) line.append(String.format(" %sMs=%.3f", names[i], (after[i + 1] - before[i + 1]) / 1e6 / counted));

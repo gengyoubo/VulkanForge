@@ -29,6 +29,7 @@ final class WorldScene implements AutoCloseable {
         final GpuBuffer vertices;
         final GpuBuffer[] indices = new GpuBuffer[TRANSLUCENT_SLOTS];
         final int quads;
+        final long upload;
         final float[] centers;
         final double[] sortedAt = new double[TRANSLUCENT_SLOTS * 3];
         final boolean[] sorted = new boolean[TRANSLUCENT_SLOTS];
@@ -39,12 +40,24 @@ final class WorldScene implements AutoCloseable {
             int[] corners = {0, 1, 2, 4}; // the four distinct quad corners among 0,1,2 / 2,3,0
             for (int quad = 0; quad < quads; quad++) for (int corner : corners) for (int axis = 0; axis < 3; axis++)
                 centers[quad * 3 + axis] += data.getFloat((quad * 6 + corner) * WorldProtocol.STRIDE + axis * 4) * .25f;
-            GpuBuffer created = new GpuBuffer(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+            // Device-local: every frame re-reads all translucent vertices, which over PCIe from host memory dominated the pass.
+            GpuBuffer created = new GpuBuffer(context, bytes.length, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
             try {
                 for (int slot = 0; slot < TRANSLUCENT_SLOTS; slot++) {
                     indices[slot] = new GpuBuffer(context, quads * 6 * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
                     var out = indices[slot].mapped.asIntBuffer(); for (int i = 0; i < quads * 6; i++) out.put(i);
                 }
+                // Last, so a failure above never frees a buffer with a recorded copy.
+                long destination = created.buffer;
+                upload = context.uploads.submit(bytes, (command, staging, offset, stack) -> {
+                    vkCmdCopyBuffer(command, staging.buffer, destination, VkBufferCopy.calloc(1, stack).srcOffset(offset).size(bytes.length));
+                    var barrier = VkBufferMemoryBarrier2.calloc(1, stack).sType$Default()
+                            .srcStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).srcAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
+                            .dstStageMask(VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT).dstAccessMask(VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT)
+                            .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                            .buffer(destination).offset(0).size(bytes.length);
+                    vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pBufferMemoryBarriers(barrier));
+                });
             }
             catch (Throwable error) { created.close(); for (GpuBuffer index : indices) if (index != null) index.close(); throw error; }
             vertices = created;
@@ -67,7 +80,8 @@ final class WorldScene implements AutoCloseable {
             sortedAt[slot * 3] = x; sortedAt[slot * 3 + 1] = y; sortedAt[slot * 3 + 2] = z; sorted[slot] = true;
             translucentSorts++;
         }
-        @Override public void close() { vertices.close(); for (GpuBuffer index : indices) if (index != null) index.close(); }
+        /** A section removed before any frame drew it may still have its copy in flight: free the buffer after the upload batch. */
+        @Override public void close() { context.uploads.retire(upload, vertices::close); for (GpuBuffer index : indices) if (index != null) index.close(); }
     }
     private final VulkanContext context;
     private final Map<Long, Section> sections = new LinkedHashMap<>();
