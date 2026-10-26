@@ -55,6 +55,17 @@ final class EntityPass implements AutoCloseable {
     private long textureLayout, uniformLayout, layout;
     private GpuBuffer quadIndices;
     private long draws, vertices, textureUploads, missingTextures, descriptorAllocations, descriptorPushes, uniformWrites, bindingHits, mergedDraws;
+    private static final boolean PROFILE = Boolean.getBoolean("vulkanforge.entityProfile");
+    private final boolean legacyBatch = Boolean.getBoolean("vulkanforge.entityLegacyBatch");
+    private long recordCalls, inputPackets, recordNanos, batchNanos, uploadedBytes, batchCopiedBytes, bufferGrowths;
+    private final long[] recordSamples=PROFILE?new long[1024]:null;
+    /** {record calls,input packets,record ns,batch ns,uploaded bytes,batch heap-copy bytes,pipelines,buffer growths,draws}. */
+    long[] performanceStats() { return new long[]{recordCalls,inputPackets,recordNanos,batchNanos,uploadedBytes,batchCopiedBytes,pipelines.size(),bufferGrowths,draws}; }
+    String recordPercentiles() {
+        if(!PROFILE||recordCalls==0)return "disabled";
+        int count=(int)Math.min(recordCalls,recordSamples.length);long[] sorted=Arrays.copyOf(recordSamples,count);Arrays.sort(sorted);
+        return String.format(Locale.ROOT,"samples=%d p50=%.6f p99=%.6f",count,sorted[(count-1)/2]/1e6,sorted[(count-1)*99/100]/1e6);
+    }
 
     EntityPass(VulkanContext context, int slotCount, Consumer<Runnable> retire) {
         this(context, slotCount, retire, VK_FORMAT_R8G8B8A8_UNORM, false);
@@ -168,14 +179,21 @@ final class EntityPass implements AutoCloseable {
         record(command,stack,slot,packets,lightView,lightSampler,lightIdentity,false);
     }
     void record(VkCommandBuffer command, MemoryStack stack, int slot, List<Object[]> packets, long lightView, long lightSampler, Object lightIdentity, boolean glTarget) {
+        long start=PROFILE?System.nanoTime():0;recordCalls++;inputPackets+=packets.size();
+        try { recordPackets(command,stack,slot,packets,lightView,lightSampler,lightIdentity,glTarget); }
+        finally {if(PROFILE){long elapsed=System.nanoTime()-start;recordNanos+=elapsed;recordSamples[(int)((recordCalls-1)%recordSamples.length)]=elapsed;}}
+    }
+    private void recordPackets(VkCommandBuffer command, MemoryStack stack, int slot, List<Object[]> packets, long lightView, long lightSampler, Object lightIdentity, boolean glTarget) {
         if (packets.isEmpty()) return;
+        long batchStart=PROFILE?System.nanoTime():0;
         packets = batch(packets);
+        if(PROFILE)batchNanos+=System.nanoTime()-batchStart;
         SlotResources resources = slots[slot];
         int vertexBytes = 0, indexBytes = 0, maxQuadIndices = 0;
         for (Object[] packet : packets) {
             if (packet[0] == null) continue; // GUI depth clear
             int[] header = (int[]) packet[0];
-            vertexBytes += ((byte[]) packet[2]).length;
+            vertexBytes += geometryBytes(packet[2]);
             if (packet[3] != null) indexBytes += (((byte[]) packet[3]).length + 3) & ~3;
             else if (header[H_MODE] == MODE_QUADS) maxQuadIndices = Math.max(maxQuadIndices, header[H_VERTICES] / 4 * 6);
         }
@@ -269,8 +287,10 @@ final class EntityPass implements AutoCloseable {
             dynamic.put(0, i * UNIFORM_STRIDE);
             if (pushDescriptors) vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, stack.longs(uniformSet), dynamic);
             else vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, stack.longs(set, uniformSet), dynamic);
-            byte[] vertexBytesOfDraw = (byte[]) packet[2];
-            offsets.put(0, vertexData.position()); vertexData.put(vertexBytesOfDraw);
+            offsets.put(0, vertexData.position());
+            if(packet[2] instanceof byte[] data) vertexData.put(data);
+            else for(byte[] data:(byte[][])packet[2])vertexData.put(data);
+            uploadedBytes+=geometryBytes(packet[2]);
             buffers.put(0, resources.vertices.buffer);
             vkCmdBindVertexBuffers(command, 0, buffers, offsets);
             if (packet[3] != null) {
@@ -299,10 +319,19 @@ final class EntityPass implements AutoCloseable {
             }
             if (end == i + 1) result.add(first);
             else {
-                Object[] combined = first.clone(); int[] header = ((int[]) first[0]).clone(); byte[] geometry = new byte[bytes]; int at = 0;
+                Object[] combined = first.clone(); int[] header = ((int[]) first[0]).clone();
+                // Keep the original byte arrays until their single copy into the mapped Vulkan buffer.
+                byte[] geometry = legacyBatch ? new byte[bytes] : null;
+                byte[][] chunks = legacyBatch ? null : new byte[end-i][]; int at = 0;
                 header[H_VERTICES] = 0;
-                for (int k = i; k < end; k++) { Object[] packet = source.get(k); byte[] data = (byte[]) packet[2]; System.arraycopy(data, 0, geometry, at, data.length); at += data.length; header[H_VERTICES] += ((int[]) packet[0])[H_VERTICES]; }
-                combined[0] = header; combined[2] = geometry; result.add(combined); mergedDraws += end - i - 1;
+                for (int k = i; k < end; k++) {
+                    Object[] packet = source.get(k); byte[] data = (byte[]) packet[2];
+                    if(legacyBatch){System.arraycopy(data,0,geometry,at,data.length);at+=data.length;}
+                    else chunks[k-i]=data;
+                    header[H_VERTICES] += ((int[]) packet[0])[H_VERTICES];
+                }
+                if(legacyBatch)batchCopiedBytes+=bytes;
+                combined[0] = header; combined[2] = legacyBatch?geometry:chunks; result.add(combined); mergedDraws += end - i - 1;
             }
             i = end;
         }
@@ -311,7 +340,9 @@ final class EntityPass implements AutoCloseable {
     private static boolean compatible(Object[] a, Object[] b) {
         if (a[0] == null || b[0] == null || a[3] != null || b[3] != null || a.length != b.length) return false;
         int[] x = (int[]) a[0], y = (int[]) b[0];
+        if(x.length!=y.length)return false;
         for (int i = 0; i <= H_MODE; i++) if (i != H_VERTICES && x[i] != y[i]) return false;
+        for(int i=HEADER;i<x.length;i++)if(x[i]!=y[i])return false; // Polygon offset is also a batch boundary.
         int unit = x[H_MODE] == MODE_QUADS ? 4 : 3;
         return x[H_VERTICES] % unit == 0 && y[H_VERTICES] % unit == 0 && Arrays.equals((float[]) a[1], (float[]) b[1])
                 && (a.length <= 4 || Arrays.equals((int[]) a[4], (int[]) b[4]));
@@ -322,7 +353,11 @@ final class EntityPass implements AutoCloseable {
         if (current != null) retire.accept(current::close);
         int capacity = 1 << 16;
         while (capacity < needed) capacity <<= 1;
-        return new GpuBuffer(context, capacity, usage);
+        bufferGrowths++;return new GpuBuffer(context, capacity, usage);
+    }
+    private static int geometryBytes(Object geometry) {
+        if(geometry instanceof byte[] data)return data.length;
+        int bytes=0;for(byte[] data:(byte[][])geometry)bytes+=data.length;return bytes;
     }
     private void ensureQuadIndices(int count) {
         if (count == 0 || (quadIndices != null && quadIndices.mapped.capacity() >= count * 4)) return;

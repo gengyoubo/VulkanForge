@@ -28,9 +28,16 @@ minecraft {
             mods { vulkanforge { source sourceSets.main } }
         }
         client {
+            ['vulkanforge.entityProfile', 'vulkanforge.entityLegacyBatch'].each { key ->
+                if (System.getProperty(key) != null) property key, System.getProperty(key)
+            }
             if (project.hasProperty('vulkan13Smoke')) property 'vulkanforge.startup', 'VULKAN:V1_3'
             property 'vulkanforge.directPresent', System.getProperty('vulkanforge.directPresent', 'true')
             property 'vulkanforge.legacyPresent', System.getProperty('vulkanforge.legacyPresent', 'false')
+            ['counterInterval', 'skipEmptyLayers', 'diffState'].each { option ->
+                def key = 'vulkanforge.gl46.' + option
+                if (System.getProperty(key) != null) property key, System.getProperty(key)
+            }
             if (project.hasProperty('validationSmoke')) property 'vulkanforge.requireValidation', 'true'
             if (project.hasProperty('pushDescriptorSmoke')) property 'vulkanforge.preferPushDescriptors', 'true'
             if (project.hasProperty('configSmoke')) {
@@ -108,6 +115,27 @@ tasks.register('offscreenBenchmarkArgs') {
     }
 }
 tasks.register('smokeGlOffscreen') { dependsOn 'smokeGl43', 'smokeGl44', 'smokeGl45', 'smokeGl46' }
+// Sampling disabled / every frame / every 60 frames, with actual GPU pixels and foreign-state restoration checks.
+['60', '1', '0'].each { interval ->
+    tasks.register('smokeTerrainTuning' + interval, JavaExec) {
+        dependsOn 'compileSmokeJava', 'processResources'
+        classpath = sourceSets.smoke.runtimeClasspath
+        mainClass = 'github.com.gengyoubo.vulkanforge.client.GlTerrainOptimizationSmoke'
+        javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+        systemProperty 'log4j.configurationFile', file('src/smoke/resources/offscreen-log4j2.xml').toURI().toString()
+        systemProperty 'vulkanforge.gl46.counterInterval', interval
+        systemProperty 'vulkanforge.gl46.diffState', 'true'
+        systemProperty 'bench.output', file('build/reports/terrain-opt-smoke/interval-' + interval).absolutePath
+    }
+}
+tasks.register('smokeTerrainTuning') { dependsOn 'smokeTerrainTuning60', 'smokeTerrainTuning1', 'smokeTerrainTuning0' }
+tasks.register('smokeEntityBatchBoundary', JavaExec) {
+    dependsOn 'compileSmokeJava', 'processResources'
+    classpath = sourceSets.smoke.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.client.GlEntityBatchBoundarySmoke'
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+    systemProperty 'log4j.configurationFile', file('src/smoke/resources/offscreen-log4j2.xml').toURI().toString()
+}
 ['4.3', '4.4', '4.5', '4.6'].each { api ->
     tasks.register('benchmarkGl' + api.replace('.', ''), JavaExec) {
         dependsOn tasks.named('compileSmokeJava'), tasks.named('processResources'), ':vulkan-lab:exportBenchmarkScene'

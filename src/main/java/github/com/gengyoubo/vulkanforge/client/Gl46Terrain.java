@@ -1,5 +1,14 @@
 package github.com.gengyoubo.vulkanforge.client;
 
+import static github.com.gengyoubo.vulkanforge.client.Gl46State.glUseProgram;
+import static github.com.gengyoubo.vulkanforge.client.Gl46State.glBindVertexArray;
+import static github.com.gengyoubo.vulkanforge.client.Gl46State.glBindSampler;
+import static github.com.gengyoubo.vulkanforge.client.Gl46State.glEnable;
+import static github.com.gengyoubo.vulkanforge.client.Gl46State.glDisable;
+import static github.com.gengyoubo.vulkanforge.client.Gl46State.glDepthMask;
+import static github.com.gengyoubo.vulkanforge.client.Gl46State.glDepthFunc;
+import static github.com.gengyoubo.vulkanforge.client.Gl46State.glBlendFuncSeparate;
+
 import static github.com.gengyoubo.vulkanforge.client.GlCompat.glBindBuffer;
 import static github.com.gengyoubo.vulkanforge.client.GlCompat.glBindBufferRange;
 import static github.com.gengyoubo.vulkanforge.client.GlCompat.glBindTextureUnit;
@@ -114,11 +123,17 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
     private static final float MAX_TURN_DEGREES = 10, MAX_MOVE_BLOCKS = 2, MAX_PROJECTION_CHANGE = .02f;
     private int pyramid, pyramidWidth, pyramidHeight, pyramidLevels, readback, readbackFrame;
     private ByteBuffer readbackMapped;
+    private final int counterInterval = Math.max(0, Integer.getInteger("vulkanforge.gl46.counterInterval", 60));
+    private final long[] counterFences = new long[READBACK_SLOTS];
+    private long counterFrames, counterCopies, counterBusyDrops, opaqueLayerCalls, emptyLayerSkips;
+    private final boolean skipEmptyLayers = Boolean.parseBoolean(System.getProperty("vulkanforge.gl46.skipEmptyLayers", "true"));
+    /** CPU residency only; never the GPU-visible count. Updated on slot replace/remove/reset. */
+    private final int[] layerSectionCounts = new int[OPAQUE_LAYERS], slotLayerMasks = new int[MAX_SECTIONS];
     private WorldProtocol.Camera previousCamera;
     private long previousEpoch;
     private float yaw, pitch, previousYaw, previousPitch;
     private final float[] projection = new float[16], previousProjection = new float[16];
-    /** {cull frames, tested, frustumVisible, occluded, layerDraws}; read back a few frames late from countBuffer. */
+    /** {sampled frames, tested, frustumVisible, occluded, layerDraws}; averages divide by samples, never by total game frames. */
     private final long[] culling = new long[5];
     private long hizBuilds, hizFrames, hizSkipped, hizNanos;
     private Gl46Buffers.Arena vertices, indices;
@@ -173,6 +188,7 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
             Gl46Context.report("TERRAIN_INIT shaders=" + (cull.spirv() && opaque.spirv() && translucent.spirv() ? "SPIRV" : "GLSL")
                     + " cull=" + path(cull) + " opaque=" + path(opaque) + " translucent=" + path(translucent) + " uboAlignment=" + uboAlignment
                     + " vertexStride=" + STRIDE);
+            Gl46Context.report("TERRAIN_TUNING counterInterval=" + counterInterval + " skipEmptyLayers=" + skipEmptyLayers + " diffState=" + Gl46State.differential());
         } catch (Throwable error) { close(); throw error; }
     }
 
@@ -303,6 +319,12 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
             for (int layer = 0; layer < OPAQUE_LAYERS; layer++) entry.putInt(52 + layer * 4, quads[layer]);
             glNamedBufferSubData(sectionBuffer, (long) slot * SECTION_BYTES, entry);
         }
+        int mask = 0;
+        for (int layer = 0; layer < OPAQUE_LAYERS; layer++) if (quads[layer] > 0) mask |= 1 << layer;
+        int oldMask = slotLayerMasks[slot];
+        for (int layer = 0; layer < OPAQUE_LAYERS; layer++)
+            layerSectionCounts[layer] += ((mask >> layer) & 1) - ((oldMask >> layer) & 1);
+        slotLayerMasks[slot] = mask;
     }
 
     private static float[] bounds(byte[]... layers) {
@@ -349,8 +371,10 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
             if (MATCH_VULKAN_RASTER) glDisable(GL_CULL_FACE); else glEnable(GL_CULL_FACE);
             glDisable(GL_BLEND);
             for (int layer = 0; layer < OPAQUE_LAYERS; layer++) {
+                if (skipEmptyLayers && layerSectionCounts[layer] == 0) { emptyLayerSkips++; continue; }
                 if (layer > 0) bindFrame(atlas, light, CUTOFF[layer], layer == 2 ? flatSampler : mipSampler);
                 glMultiDrawElementsIndirectCount(GL_TRIANGLES, GL_UNSIGNED_INT, (long) layer * MAX_SECTIONS * COMMAND_BYTES, layer * 4L, slotCount, COMMAND_BYTES);
+                opaqueLayerCalls++;
             }
             t3 = System.nanoTime();
             collectCounts();
@@ -483,10 +507,25 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
         for (int i = 0; i < 16; i++) if (Math.abs(projection[i] - previousProjection[i]) > MAX_PROJECTION_CHANGE * Math.max(1, Math.abs(previousProjection[i]))) return false;
         return true;
     }
-    /** Copies this frame's counters into a readback slot after accumulating the copy made READBACK_SLOTS frames ago. */
+    /** Sampled telemetry only. Never waits and never controls any draw's visible count. 0 disables sampling. */
     private void collectCounts() {
-        int slot = readbackFrame++ % READBACK_SLOTS;
-        if (readbackFrame > READBACK_SLOTS) {
+        pollCounts();
+        long frame = counterFrames++;
+        if (counterInterval == 0 || frame % counterInterval != 0) return;
+        int slot = readbackFrame;
+        if (counterFences[slot] != 0) { counterBusyDrops++; return; }
+        GlCompat.copyCounterReadback(countBuffer, readback, slot * 32L, COUNT_BYTES);
+        counterFences[slot] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        readbackFrame = (readbackFrame + 1) % READBACK_SLOTS; counterCopies++;
+    }
+    private void pollCounts() {
+        for (int slot = 0; slot < READBACK_SLOTS; slot++) {
+            if (counterFences[slot] == 0) continue;
+            int state = glClientWaitSync(counterFences[slot], 0, 0);
+            if (state == GL_WAIT_FAILED) throw new IllegalStateException("Counter fence poll failed");
+            if (state != GL_ALREADY_SIGNALED && state != GL_CONDITION_SATISFIED) continue;
+            GlCompat.refreshCounterReadback(readback, slot * 32L, COUNT_BYTES);
+            glDeleteSync(counterFences[slot]); counterFences[slot] = 0;
             int at = slot * 32;
             culling[0]++;
             culling[1] += Integer.toUnsignedLong(readbackMapped.getInt(at + 12));
@@ -494,8 +533,13 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
             culling[3] += Integer.toUnsignedLong(readbackMapped.getInt(at + 20));
             for (int layer = 0; layer < OPAQUE_LAYERS; layer++) culling[4] += Integer.toUnsignedLong(readbackMapped.getInt(at + layer * 4));
         }
-        glCopyNamedBufferSubData(countBuffer, readback, 0, slot * 32L, COUNT_BYTES);
     }
+    private void discardCounts() {
+        for (int slot = 0; slot < READBACK_SLOTS; slot++) if (counterFences[slot] != 0) { glDeleteSync(counterFences[slot]); counterFences[slot] = 0; }
+        readbackFrame = 0; counterFrames = 0;
+    }
+    /** {render attempts, copies, collected samples, busy drops, indirect calls, empty-layer skips}. */
+    long[] submissionStats() { return new long[]{frameCount, counterCopies, culling[0], counterBusyDrops, opaqueLayerCalls, emptyLayerSkips}; }
 
     /**
      * AFTER_CUTOUT_BLOCKS: every opaque terrain layer (GL 4.6 and vanilla's remaining sections) is in the main depth buffer and
@@ -711,6 +755,7 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
     }
 
     private void clear() {
+        discardCounts(); Arrays.fill(slotLayerMasks, 0); Arrays.fill(layerSectionCounts, 0);
         cpuSections.clear();
         for (Section section : sections.values()) release(section);
         if (uploads != null) uploads.flush();
@@ -720,6 +765,9 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
     }
 
     @Override public void close() {
+        if (readbackMapped != null) pollCounts();
+        discardCounts();
+        Gl46Context.report("TERRAIN_SUBMISSIONS=" + Arrays.toString(submissionStats()));
         if (cpuCommands != null) { MemoryUtil.memFree(cpuCommands); cpuCommands = null; }
         cpuSections.clear();
         if (vertices != null) Gl46Context.report("TERRAIN_CLOSE frames=" + frameCount + " translucentFrames=" + translucentFrames

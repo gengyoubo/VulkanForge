@@ -23,6 +23,7 @@ dependencies {
 application { mainClass = 'github.com.gengyoubo.vulkanforge.lab.LabMain' }
 tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
 tasks.withType(JavaExec).configureEach {
+    if(System.getProperty('vulkanforge.entityProfile')!=null)systemProperty 'vulkanforge.entityProfile',System.getProperty('vulkanforge.entityProfile')
     if (rootProject.hasProperty('vulkan13Smoke')) systemProperty 'vulkanforge.vulkanVersion', '1.3'
     if (rootProject.hasProperty('vulkanVersion')) systemProperty 'vulkanforge.vulkanVersion', rootProject.property('vulkanVersion')
     // e.g. -PnvidiaExtensions=VK_NV_mesh_shader: same comma list the config screen hands the backend.

@@ -114,8 +114,13 @@ final class BenchmarkScene {
         private final Object[] timers;
         private final java.lang.reflect.Method waitAll;
         private final java.lang.reflect.Field fenceWait, samples, total;
+        private final AsyncUploads uploads;
+        private final java.lang.reflect.Field pendingBytes;
         private final long[][] samples0 = new long[2][]; private final double[][] total0 = new double[2][];
         Probe(MainWindowBackend backend) throws ReflectiveOperationException {
+            var contextField=MainWindowBackend.class.getDeclaredField("context");contextField.setAccessible(true);
+            var context=(VulkanContext)contextField.get(backend);uploads=context.uploads;
+            pendingBytes=AsyncUploads.class.getDeclaredField("pendingBytes");pendingBytes.setAccessible(true);
             var worldField = MainWindowBackend.class.getDeclaredField("world"); worldField.setAccessible(true);
             world = worldField.get(backend);
             waitAll = SharedWorldRenderer.class.getDeclaredMethod("waitAll"); waitAll.setAccessible(true);
@@ -129,6 +134,12 @@ final class BenchmarkScene {
         /** Waits both world frame slots' fences, so every submitted world frame has completed on the GPU. */
         void drain() throws ReflectiveOperationException { if (world != null) waitAll.invoke(world); }
         long fenceWaitNanos() throws ReflectiveOperationException { return world == null ? 0 : fenceWait.getLong(world); }
+        long pendingUploadBytes() throws IllegalAccessException {return pendingBytes.getLong(uploads);}
+        /** Outside timed intervals only: refresh completed upload accounting without waiting on the GPU. */
+        void reportUploads(String phase) throws IllegalAccessException {
+            uploads.poll();
+            System.out.println("TAIL_"+phase+"_UPLOAD_CHECKPOINT pendingBytes="+pendingUploadBytes()+" stats="+java.util.Arrays.toString(uploads.stats()));
+        }
         /** Starts the GPU timestamp window. */
         void mark() throws ReflectiveOperationException {
             for (int i = 0; i < timers.length; i++) if (timers[i] != null) { samples0[i] = ((long[]) samples.get(timers[i])).clone(); total0[i] = ((double[]) total.get(timers[i])).clone(); }

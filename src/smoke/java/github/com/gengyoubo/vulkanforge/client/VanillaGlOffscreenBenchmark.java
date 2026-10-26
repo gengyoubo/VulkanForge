@@ -117,7 +117,7 @@ public final class VanillaGlOffscreenBenchmark {
     }
     // Standalone runtimes have no Forge registry lifecycle. Expand vanilla moj_import files before ShaderInstance's
     // preprocessor reaches Forge's import-location hook; the shader bodies and native compile/link/draw code are unchanged.
-    private static String expand(URL url,Set<String> included,boolean nested) throws IOException {
+    static String expand(URL url,Set<String> included,boolean nested) throws IOException {
         if(!included.add(url.toString())) return "";
         String source;
         try(InputStream in=url.openStream()) {source=new String(in.readAllBytes(),java.nio.charset.StandardCharsets.UTF_8);}

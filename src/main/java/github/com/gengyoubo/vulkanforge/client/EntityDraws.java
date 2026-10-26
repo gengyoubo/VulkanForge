@@ -98,6 +98,10 @@ public final class EntityDraws {
     private static final Map<String, Long> capturedShaders = new TreeMap<>(), fallbackShaders = new TreeMap<>(), fallbackStates = new TreeMap<>();
     private static final String[] STATE_REASONS = {"", "blend", "depth-func", "cull-mode", "offset/scissor/logic-op", "color-mask", "lightmap"};
     private static final float[] matrix3 = new float[9];
+    private static final boolean PROFILE = Boolean.getBoolean("vulkanforge.entityProfile");
+    private static long captureCalls, captureNanos, geometryCopies, copiedBytes, copyNanos, convertedBytes, stateNanos, packetNanos;
+    private static final long[] frameCapture = PROFILE ? new long[300] : null;
+    private static long profileFrame, lastCaptureNanos;
     private EntityDraws() { }
 
     /** RenderType.end() (entities, block entities, item pickups inside the particle window). */
@@ -129,6 +133,13 @@ public final class EntityDraws {
     static Object[] takeSky() { Object[] result = sky.toArray(); sky.clear(); if (result.length > 0) windowComposites[Window.SKY.ordinal()]++; return result; }
     /** After this frame's Vulkan terrain composite; {@code lightmapTexture} is the lightmap WorldCapture mirrors. Opens ENTITIES. */
     static void beginFrame(int lightmapTexture, TerrainPresenter compositor) {
+        if(PROFILE) {
+            frameCapture[(int)(profileFrame++%frameCapture.length)]=captureNanos-lastCaptureNanos;lastCaptureNanos=captureNanos;
+            if(profileFrame%frameCapture.length==0) {
+                long[] sorted=frameCapture.clone();Arrays.sort(sorted);
+                github.com.gengyoubo.vulkanforge.VulkanForge.LOGGER.info("ENTITY_WORLD_CAPTURE_MS p50={} p99={} cumulative{calls,ns,copies,bytes,copyNs,convertedBytes,stateNs,packetNs}={}",sorted[149]/1e6,sorted[296]/1e6,Arrays.toString(performanceStats()));
+            }
+        }
         packets.clear(); lightmap = lightmapTexture; frameActive = !disabled; presenter = compositor; passes = 0;
         open(Window.ENTITIES);
     }
@@ -179,6 +190,8 @@ public final class EntityDraws {
     /** Preview restart: allow capture again. */
     static void reset() { cancel(); armSky(false); disabled = false; }
     static long[] stats() { return new long[]{captured, unsupported, stateFallbacks, textureFallbacks, composites, splits}; }
+    /** {capture calls,capture ns,copies,bytes,copy ns,converted bytes,state ns,packet ns}; timers opt-in. */
+    static long[] performanceStats() { return new long[]{captureCalls,captureNanos,geometryCopies,copiedBytes,copyNanos,convertedBytes,stateNanos,packetNanos}; }
     /** {draws captured, passes (overlay composites, or terrain submits carrying sky)} for one window. */
     static long[] stats(Window window) { return new long[]{windowDraws[window.ordinal()], windowComposites[window.ordinal()]}; }
     static Map<String, Long> capturedShaders() { return Collections.unmodifiableMap(capturedShaders); }
@@ -187,6 +200,11 @@ public final class EntityDraws {
     static Map<String, Long> fallbackStates() { return Collections.unmodifiableMap(fallbackStates); }
 
     private static boolean capture(BufferBuilder.RenderedBuffer rendered) {
+        long start=PROFILE?System.nanoTime():0;captureCalls++;
+        try { return capturePacket(rendered); }
+        finally { if(PROFILE)captureNanos+=System.nanoTime()-start; }
+    }
+    private static boolean capturePacket(BufferBuilder.RenderedBuffer rendered) {
         var shader = RenderSystem.getShader();
         BufferBuilder.DrawState state = rendered.drawState();
         if (state.indexOnly()) { reject(shader); return false; }
@@ -219,6 +237,11 @@ public final class EntityDraws {
 
     /** Header + uniforms for a supported draw in the current GL/RenderSystem state, or null (counted) when GL must draw it. */
     private static Object[] packet(ShaderInstance shader, VertexFormat format, VertexFormat.Mode mode, boolean sequential, Matrix4f modelView, Matrix4f projection) {
+        long start=PROFILE?System.nanoTime():0;
+        try{return buildPacket(shader,format,mode,sequential,modelView,projection);}
+        finally{if(PROFILE)packetNanos+=System.nanoTime()-start;}
+    }
+    private static Object[] buildPacket(ShaderInstance shader, VertexFormat format, VertexFormat.Mode mode, boolean sequential, Matrix4f modelView, Matrix4f projection) {
         // Overlay windows can only be replayed while this frame still has passes left; the sky rides the terrain submit.
         if (!GuiDraws.active() && open != Window.SKY && passes >= MAX_PASSES) return null;
         Spec spec = shader == null ? null : SHADERS.get(shader.getName());
@@ -245,7 +268,7 @@ public final class EntityDraws {
         int[] header = new int[HEADER+2];
         header[H_FORMAT] = spec.format(); header[H_VARIANT] = spec.variant(); header[H_FLAGS] = flags;
         header[H_TEXTURE] = texture; header[H_OVERLAY] = overlay;
-        header[9]=Float.floatToRawIntBits(glGetFloat(GL_POLYGON_OFFSET_FACTOR));header[10]=Float.floatToRawIntBits(glGetFloat(GL_POLYGON_OFFSET_UNITS));
+        if((flags&4096)!=0){header[9]=Float.floatToRawIntBits(glGetFloat(GL_POLYGON_OFFSET_FACTOR));header[10]=Float.floatToRawIntBits(glGetFloat(GL_POLYGON_OFFSET_UNITS));}
         float[] uniforms = new float[64];
         projection.get(uniforms, 0);
         modelView.get(uniforms, 16);
@@ -287,6 +310,10 @@ public final class EntityDraws {
 
     /** Pipeline flags for the current GL state, or a negative STATE_REASONS index when Vulkan cannot reproduce it. */
     private static int glState() {
+        long start=PROFILE?System.nanoTime():0;
+        try{return readGlState();}finally{if(PROFILE)stateNanos+=System.nanoTime()-start;}
+    }
+    private static int readGlState() {
         int flags = 0;
         if (glIsEnabled(GL_BLEND)) {
             if (glGetInteger(org.lwjgl.opengl.GL20.GL_BLEND_EQUATION_RGB) != GL_FUNC_ADD || glGetInteger(org.lwjgl.opengl.GL20.GL_BLEND_EQUATION_ALPHA) != GL_FUNC_ADD) return -1;
@@ -330,13 +357,23 @@ public final class EntityDraws {
     }
 
     private static byte[] copy(ByteBuffer buffer) {
+        long start=PROFILE?System.nanoTime():0;
         byte[] bytes = new byte[buffer.remaining()];
         buffer.duplicate().get(bytes);
+        geometryCopies++;copiedBytes+=bytes.length;
+        if(PROFILE)copyNanos+=System.nanoTime()-start;
         return bytes;
     }
     private static byte[] vertices(BufferBuilder.RenderedBuffer rendered,Object[] packet){
-        var state=rendered.drawState();byte[] raw=copy(rendered.vertexBuffer());int variant=((int[])packet[0])[H_VARIANT];
-        if((variant==9||variant==11)&&state.format().getVertexSize()!=24){byte[] packed=new byte[state.vertexCount()*24];for(int i=0;i<state.vertexCount();i++)System.arraycopy(raw,i*state.format().getVertexSize(),packed,i*24,24);return packed;}
+        var state=rendered.drawState();int variant=((int[])packet[0])[H_VARIANT];
+        if((variant==9||variant==11)&&state.format().getVertexSize()!=24){
+            long start=PROFILE?System.nanoTime():0;
+            ByteBuffer source=rendered.vertexBuffer();byte[] packed=new byte[state.vertexCount()*24];int base=source.position(),stride=state.format().getVertexSize();
+            for(int i=0;i<state.vertexCount();i++)source.get(base+i*stride,packed,i*24,24);
+            geometryCopies++;copiedBytes+=packed.length;convertedBytes+=packed.length;if(PROFILE)copyNanos+=System.nanoTime()-start;
+            return packed;
+        }
+        byte[] raw=copy(rendered.vertexBuffer());
         if(variant==8){var buffer=ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN);var matrix=RenderSystem.getTextureMatrix();var uv=new org.joml.Vector4f();for(int i=0;i<state.vertexCount();i++){int at=i*20+12;uv.set(buffer.getFloat(at),buffer.getFloat(at+4),0,1).mul(matrix);buffer.putFloat(at,uv.x).putFloat(at+4,uv.y);}}
         return raw;
     }

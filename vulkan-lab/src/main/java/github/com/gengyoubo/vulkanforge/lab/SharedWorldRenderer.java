@@ -46,6 +46,7 @@ final class SharedWorldRenderer implements AutoCloseable {
     private final Slot[] slots = {new Slot(), new Slot()};
     private final WorldScene world;
     private GpuTimers timers;
+    private GpuTimers entityTimers;
     private GpuCuller culler;
     private record Retired(long serial, Runnable close) { }
     private final java.util.ArrayDeque<Retired> retired = new java.util.ArrayDeque<>();
@@ -85,6 +86,7 @@ final class SharedWorldRenderer implements AutoCloseable {
             composite = new DepthComposite(context);
             post = new NativePost(context, SLOT_COUNT * MAX_OVERLAYS);
             timers = new GpuTimers(context, SLOT_COUNT, log, "TERRAIN", "TERRAIN_RELEASE", "TRIANGLE", "CULLING", "TRANSLUCENT");
+            if(Boolean.getBoolean("vulkanforge.entityProfile"))entityTimers=new GpuTimers(context,SLOT_COUNT*(MAX_OVERLAYS+1),log,"ENTITY_OVERLAY");
             var familyCount = stack.ints(0);
             vkGetPhysicalDeviceQueueFamilyProperties(context.physical, familyCount, null);
             var families = VkQueueFamilyProperties.calloc(familyCount.get(0), stack);
@@ -339,11 +341,15 @@ final class SharedWorldRenderer implements AutoCloseable {
                     .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL).loadOp(clearDepth ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD)
                     .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
             depth.clearValue().depthStencil().depth(1);
+            int entitySlot=index*(MAX_OVERLAYS+1)+pass;
+            if(entityTimers!=null)entityTimers.begin(command,entitySlot);
             vkCmdBeginRendering(command, VkRenderingInfo.calloc(stack).sType$Default().layerCount(1).pColorAttachments(color).pDepthAttachment(depth)
                     .renderArea(r -> r.offset(o -> o.set(0, 0)).extent(e -> e.set(width, height))));
             vkCmdSetViewport(command, 0, VkViewport.calloc(1, stack).width(width).height(height).minDepth(0).maxDepth(1));
             vkCmdSetScissor(command, 0, VkRect2D.calloc(1, stack).offset(o -> o.set(0, 0)).extent(e -> e.set(width, height)));
-            entities.record(command, stack, index * (MAX_OVERLAYS + 1) + pass, packets, world.lightMapView(), world.lightSampler(), world.lightMapIdentity());
+            if(entityTimers!=null)entityTimers.start(command,entitySlot,0,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+            entities.record(command, stack, entitySlot, packets, world.lightMapView(), world.lightSampler(), world.lightMapIdentity());
+            if(entityTimers!=null)entityTimers.end(command,entitySlot,0,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             vkCmdEndRendering(command);
             var release = VkImageMemoryBarrier2.calloc(2, stack);
             releaseBarrier(release.get(0), slot.overlayColor, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, false);
@@ -360,6 +366,7 @@ final class SharedWorldRenderer implements AutoCloseable {
             }
             check(vkResetFences(context.device, slot.overlayFences[pass]), "reset overlay fence");
             context.uploads.flush(); check(vkQueueSubmit2(context.queue, submit, slot.overlayFences[pass]), "submit overlay"); submits++;
+            if(entityTimers!=null)entityTimers.submitted(entitySlot);
             slot.overlayUsed = slot.overlayPending[pass] = true; overlayPasses++;
             overlayReading = index;
             handoffGroups++; handoffImages += 2;
@@ -402,11 +409,18 @@ final class SharedWorldRenderer implements AutoCloseable {
             var color=VkRenderingAttachmentInfo.calloc(1,stack).sType$Default().imageView(targetColor.view()).imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL).loadOp(VK_ATTACHMENT_LOAD_OP_LOAD).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
             var depth=VkRenderingAttachmentInfo.calloc(stack).sType$Default().imageView(targetDepth.view()).imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL).loadOp(hasDepth?VK_ATTACHMENT_LOAD_OP_LOAD:VK_ATTACHMENT_LOAD_OP_CLEAR).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
             depth.clearValue().depthStencil().depth(1);
+            int entitySlot=index*(MAX_OVERLAYS+1)+pass;
+            if(kind>=2&&entityTimers!=null)entityTimers.begin(command,entitySlot);
             vkCmdBeginRendering(command,VkRenderingInfo.calloc(stack).sType$Default().layerCount(1).pColorAttachments(color).pDepthAttachment(depth).renderArea(r->r.extent(e->e.set(targetWidth,targetHeight))));
             vkCmdSetViewport(command,0,VkViewport.calloc(1,stack).width(targetWidth).height(targetHeight).minDepth(0).maxDepth(1));
             vkCmdSetScissor(command,0,VkRect2D.calloc(1,stack).extent(e->e.set(targetWidth,targetHeight)));
             if(kind<2){composite.record(command,stack,index,kind==1);nativeComposites++;}
-            else {entities.record(command,stack,index*(MAX_OVERLAYS+1)+pass,packets,world.lightMapView(),world.lightSampler(),world.lightMapIdentity(),true);nativeEntityPasses++;overlayPasses++;}
+            else {
+                if(entityTimers!=null)entityTimers.start(command,entitySlot,0,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+                entities.record(command,stack,entitySlot,packets,world.lightMapView(),world.lightSampler(),world.lightMapIdentity(),true);
+                if(entityTimers!=null)entityTimers.end(command,entitySlot,0,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+                nativeEntityPasses++;overlayPasses++;
+            }
             vkCmdEndRendering(command);
             releaseBarrier(barriers.get(0),targetColor,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,false);
             releaseBarrier(barriers.get(1),targetDepth,DEPTH_STAGES,DEPTH_ACCESS,VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,true);
@@ -417,6 +431,7 @@ final class SharedWorldRenderer implements AutoCloseable {
             check(vkResetFences(context.device,slot.overlayFences[pass]),"reset native composite fence");
             context.uploads.flush(); check(vkQueueSubmit2(context.queue,VkSubmitInfo2.calloc(1,stack).sType$Default().pWaitSemaphoreInfos(wait).pSignalSemaphoreInfos(signal)
                     .pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1,stack).sType$Default().commandBuffer(command)),slot.overlayFences[pass]),"submit native composite");
+            if(kind>=2&&entityTimers!=null)entityTimers.submitted(index*(MAX_OVERLAYS+1)+pass);
             slot.overlayPending[pass]=true; submits++;
         }
         if (target != null) target.acquireGL();
@@ -569,6 +584,7 @@ final class SharedWorldRenderer implements AutoCloseable {
                 long elapsed = System.nanoTime() - start; fenceWaitNanos += elapsed; maxFenceWaitNanos = Math.max(maxFenceWaitNanos, elapsed);
             }
         }
+        if(entityTimers!=null)for(int k=0;k<MAX_OVERLAYS;k++)entityTimers.collect(index*(MAX_OVERLAYS+1)+k);
         if (!slot.pending) return;
         slot.pending = false; timers.collect(index);
         if (culler != null) culler.collect(index);
@@ -624,10 +640,13 @@ final class SharedWorldRenderer implements AutoCloseable {
         if (entities != null) {
             long[] entity = entities.stats();
             log.accept("WORLD_BINDINGS=" + java.util.Arrays.toString(entities.bindingStats()));
+            log.accept("ENTITY_PERFORMANCE {calls,packets,recordNs,batchNs,uploadBytes,batchHeapCopyBytes,pipelines,growths,draws}="+java.util.Arrays.toString(entities.performanceStats()));
+            log.accept("ENTITY_RECORD_CPU_MS "+entities.recordPercentiles());
             log.accept("WORLD_OVERLAYS passes=" + overlayPasses + " skyDraws=" + skyDraws + " draws=" + entity[0] + " vertices=" + entity[1] + " textures=" + entity[2] + " uploads=" + entity[3] + " missingTextures=" + entity[4]);
             entities.close(); entities = null;
         }
         if (timers != null) { timers.report(log); timers.close(); timers = null; }
+        if(entityTimers!=null){entityTimers.report(log);entityTimers.close();entityTimers=null;}
         if (culler != null) { culler.report(log); culler.close(); culler = null; }
         world.close(); destroyTargets();
         if(composite!=null){composite.close();composite=null;}

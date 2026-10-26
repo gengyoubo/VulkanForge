@@ -66,6 +66,13 @@ public final class GlOffscreenBenchmark {
                     } else terrain.send(command);
                 }
                 report.add("SCENE sections=" + sections + " opaqueVertices=" + vertices + " translucentVertices=" + translucentVertices);
+                if(Boolean.getBoolean("bench.trustedState")) {
+                    RenderSystem.disableCull();RenderSystem.enableCull();RenderSystem.disableDepthTest();RenderSystem.enableDepthTest();
+                    RenderSystem.depthFunc(GL_LESS);RenderSystem.depthFunc(GL_LEQUAL);RenderSystem.depthMask(true);RenderSystem.disableBlend();RenderSystem.blendFuncSeparate(GL_ONE,GL_ZERO,GL_ONE,GL_ZERO);
+                    for(int unit=0;unit<3;unit++){RenderSystem.activeTexture(GL_TEXTURE0+unit);RenderSystem.bindTexture(atlas);RenderSystem.bindTexture(0);}RenderSystem.activeTexture(GL_TEXTURE0);
+                    if(!GlStateCache.initialise())throw new AssertionError("Benchmark state cache not coherent");
+                    report.add("BENCH_STATE_CACHE_TRUSTED=true");
+                }
                 for (int i = 0; i < warmup; i++) frame(terrain, atlas, light);
                 glFinish();
                 if (Boolean.getBoolean("bench.audit")) dev.vulkanforge.bench.Workload.audit(directory.resolve("workload.txt"),terrain.auditOpaqueDraws(),terrain.auditTranslucentDraws());
@@ -95,6 +102,8 @@ public final class GlOffscreenBenchmark {
                     report.add(line); System.out.println(line);
                 }
                 glDeleteQueries(queries);
+                report.add("SUBMISSION_STATS="+diagnostics(terrain,Gl46Terrain.class,"submissionStats"));
+                report.add("STATE_RESTORE_STATS="+diagnostics(null,Gl46State.class,"stats"));
             }
             glDeleteTextures(atlas); glDeleteTextures(light); glDeleteTextures(color); glDeleteTextures(depth); glDeleteFramebuffers(target);
             if (MATCHED) for(int i=0;i<2;i++) {
@@ -109,6 +118,11 @@ public final class GlOffscreenBenchmark {
             Files.write(directory.resolve("benchmark.txt"), report);
             if (hidden != 0) glfwDestroyWindow(hidden); glfwTerminate();
         }
+    }
+    private static String diagnostics(Object instance,Class<?> type,String name) {
+        try {var method=type.getDeclaredMethod(name);method.setAccessible(true);return Arrays.toString((long[])method.invoke(instance));}
+        catch(NoSuchMethodException legacy) {return "LEGACY";}
+        catch(ReflectiveOperationException error) {throw new IllegalStateException(error);}
     }
     private static void frame(Gl46Terrain terrain, int atlas, int light) {
         int slot=targetFrame++%2;

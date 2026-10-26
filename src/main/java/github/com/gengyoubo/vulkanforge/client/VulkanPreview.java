@@ -409,6 +409,7 @@ final class VulkanPreview {
 
     static void close() {
         RenderSystem.assertOnRenderThread();
+        if(Boolean.getBoolean("vulkanforge.entityProfile"))VulkanForge.LOGGER.info("ENTITY_CAPTURE {{calls,captureNs,copies,bytes,copyNs,convertedBytes,stateNs,packetNs}}={} fallbacks={}",java.util.Arrays.toString(EntityDraws.performanceStats()),java.util.Arrays.toString(EntityDraws.stats()));
         enabled = false;
         if (bridge != null) { bridge.close(); bridge = null; }
         if (texture != null) { Minecraft.getInstance().getTextureManager().release(TEXTURE); texture.close(); texture = null; }

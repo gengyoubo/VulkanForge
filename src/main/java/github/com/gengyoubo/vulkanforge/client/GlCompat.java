@@ -80,6 +80,22 @@ final class GlCompat {
             int old = bind(destination); try { glGetBufferSubData(GL_COPY_WRITE_BUFFER, to, bytes); } finally { restore(old); }
         }
     }
+    /** Counter copies remain asynchronous even on GL 4.3's CPU-mirror fallback. */
+    static void copyCounterReadback(int source, int destination, long offset, long size) {
+        if (dsa()) org.lwjgl.opengl.GL45C.glCopyNamedBufferSubData(source, destination, 0, offset, size);
+        else {
+            int read = glGetInteger(GL_COPY_READ_BUFFER_BINDING), write = bind(destination);
+            try { glBindBuffer(GL_COPY_READ_BUFFER, source); glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, offset, size); }
+            finally { glBindBuffer(GL_COPY_READ_BUFFER, read); restore(write); }
+        }
+    }
+    /** Called only after the copy fence signals; coherent persistent mappings need no glGetBufferSubData. */
+    static void refreshCounterReadback(int buffer, long offset, int size) {
+        Mirror mirror = mirrors.get(buffer);
+        if (mirror == null) return;
+        ByteBuffer bytes = mirror.bytes().duplicate(); bytes.position(Math.toIntExact(offset)).limit(Math.toIntExact(offset) + size);
+        int old = bind(buffer); try { glGetBufferSubData(GL_COPY_WRITE_BUFFER, offset, bytes); } finally { restore(old); }
+    }
     static void glClearNamedBufferData(int buffer, int internal, int format, int type, ByteBuffer value) {
         if (dsa()) org.lwjgl.opengl.GL45C.glClearNamedBufferData(buffer, internal, format, type, value);
         else { int old = bind(buffer); try { glClearBufferData(GL_COPY_WRITE_BUFFER, internal, format, type, value); } finally { restore(old); } }
@@ -147,6 +163,7 @@ final class GlCompat {
         try { glTexStorage2D(GL_TEXTURE_2D, levels, format, width, height); } finally { glBindTexture(GL_TEXTURE_2D, old); }
     }
     static void glBindTextureUnit(int unit, int texture) {
+        Gl46State.textureBound(unit, texture);
         if (dsa()) { org.lwjgl.opengl.GL45C.glBindTextureUnit(unit, texture); return; }
         int active = glGetInteger(GL_ACTIVE_TEXTURE); glActiveTexture(GL_TEXTURE0 + unit);
         glBindTexture(GL_TEXTURE_2D, texture); glActiveTexture(active);

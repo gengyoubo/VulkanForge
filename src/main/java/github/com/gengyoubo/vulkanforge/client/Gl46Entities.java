@@ -1,5 +1,11 @@
 package github.com.gengyoubo.vulkanforge.client;
 
+import static github.com.gengyoubo.vulkanforge.client.Gl46State.glUseProgram;
+import static github.com.gengyoubo.vulkanforge.client.Gl46State.glBindVertexArray;
+import static github.com.gengyoubo.vulkanforge.client.Gl46State.glDepthMask;
+import static github.com.gengyoubo.vulkanforge.client.Gl46State.glDepthFunc;
+import static github.com.gengyoubo.vulkanforge.client.Gl46State.glBlendFuncSeparate;
+
 import static github.com.gengyoubo.vulkanforge.client.GlCompat.glBindBuffer;
 import static github.com.gengyoubo.vulkanforge.client.GlCompat.glBindTextureUnit;
 import static github.com.gengyoubo.vulkanforge.client.GlCompat.glCreateBuffers;
@@ -261,7 +267,9 @@ final class Gl46Entities implements AutoCloseable {
     }
 
     /** Vanilla draws something itself next: everything captured before it is drawn first. */
-    private void split() { if (!pending.isEmpty()) { splits++; flush(); } }
+    private void split() {
+        if (!pending.isEmpty() || (blockEntities != null && blockEntities.pendingCommands() > 0)) { splits++; flush(); }
+    }
 
     private void flush() {
         if (pending.isEmpty() && (blockEntities == null || blockEntities.pendingCommands() == 0)) return;

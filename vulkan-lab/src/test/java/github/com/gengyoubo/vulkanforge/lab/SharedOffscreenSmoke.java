@@ -46,7 +46,35 @@ public final class SharedOffscreenSmoke {
                             glBindTexture(GL_TEXTURE_2D, texture); glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
                             int at = (size / 2 * size + size / 2) * 4;
                             red |= (pixels.get(at) & 255) > 240 && (pixels.get(at + 1) & 255) < 10 && (pixels.get(at + 2) & 255) < 10;
-                        } finally { MemoryUtil.memFree(pixels); backend.finishWorldFrame(); }
+                        } finally { MemoryUtil.memFree(pixels); }
+                        if(i<3) {
+                            Object[] left=GuiPassSmoke.quad(EntityPass.FORMAT_POSITION_COLOR,4,EntityPass.DEPTH_TEST|EntityPass.DEPTH_WRITE,0,0xff00ff00,-.2f);
+                            Object[] right=GuiPassSmoke.quad(EntityPass.FORMAT_POSITION_COLOR,4,EntityPass.DEPTH_TEST|EntityPass.DEPTH_WRITE,0,0xff00ff00,-.2f);
+                            for(Object[] packet:new Object[][]{left,right}) {
+                                ByteBuffer data=ByteBuffer.wrap((byte[])packet[2]).order(ByteOrder.LITTLE_ENDIAN);
+                                for(int v=0;v<4;v++)data.putFloat(v*16,data.getFloat(v*16)*.5f+(packet==left?-.45f:.45f));
+                                if(i==1) {
+                                    int[] header=java.util.Arrays.copyOf((int[])packet[0],11);packet[0]=header;
+                                    header[EntityPass.H_FLAGS]|=4096;header[10]=Float.floatToRawIntBits(packet==left?-1:1);
+                                } else if(i==2) {
+                                    int[] header=(int[])packet[0];header[EntityPass.H_INDICES]=6;header[EntityPass.H_INDEX_SIZE]=2;
+                                    ByteBuffer indices=ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);for(int v:new int[]{0,1,2,2,3,0})indices.putShort((short)v);packet[3]=indices.array();
+                                }
+                            }
+                            long beforeDraws=backend.worldStats()[19];
+                            int[] overlay=backend.renderOverlay(new Object[]{left,right});
+                            if(overlay==null)throw new AssertionError("Entity overlay missing");
+                            if(backend.worldStats()[19]-beforeDraws!=(i==0?1:2))throw new AssertionError("Entity batch boundary or indexed path changed");
+                            ByteBuffer entityPixels=MemoryUtil.memAlloc(size*size*4);
+                            try {
+                                glBindTexture(GL_TEXTURE_2D,overlay[0]);glGetTexImage(GL_TEXTURE_2D,0,GL_RGBA,GL_UNSIGNED_BYTE,entityPixels);
+                                for(int x:new int[]{size/4,size*3/4}) {
+                                    int at=(size/2*size+x)*4;
+                                    if((entityPixels.get(at+1)&255)!=255||(entityPixels.get(at)&255)!=0)throw new AssertionError("Merged entity overlay pixels");
+                                }
+                            } finally {MemoryUtil.memFree(entityPixels);backend.finishOverlay();}
+                        }
+                        backend.finishWorldFrame();
                     }
                     if (!red) throw new AssertionError("Shared red pixels missing at " + size);
                     System.out.println("PASS shared image pixels, semaphore round trips and resize " + size + "x" + size);
@@ -58,6 +86,8 @@ public final class SharedOffscreenSmoke {
             if (!log.contains("FINAL_PRESENTED_FRAMES=0") || !log.contains("VALIDATION_ERRORS=0") || log.contains("SURFACE_CREATED=true"))
                 throw new AssertionError("Offscreen shutdown or no-surface contract failed");
             System.out.println("PASS SURFACE=NONE SWAPCHAIN=NONE PRESENTED_FRAMES=0 SHARED_FRAMES=96 clean shutdown");
+            if(Boolean.getBoolean("vulkanforge.entityProfile")&&!log.contains("GPU_ENTITY_OVERLAY_MS samples=9"))throw new AssertionError("Entity GPU timer samples missing");
+            System.out.println("PASS merged/indexed entity overlay pixels, polygon-offset boundaries, frame-slot reuse and profiling timestamps");
         } finally { if (hidden != 0) glfwDestroyWindow(hidden); glfwTerminate(); }
     }
 }

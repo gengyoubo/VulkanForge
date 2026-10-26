@@ -49,15 +49,29 @@ final class GlStateCache {
 
     /** Current state: cache reads when trusted (and, with -Dvulkanforge.gl46.verifyState, checked against GL), else glGet. */
     static Snapshot snapshot() {
+        if (VERIFY) return boundarySnapshot();
         if (!trusted) return query();
         Snapshot cached;
         try { cached = read(); } catch (IllegalAccessException error) { throw new IllegalStateException(error); }
-        if (VERIFY) {
-            String mismatch = compare(cached, query());
-            if (mismatch != null) throw new IllegalStateException("GL state cache out of sync: " + mismatch);
-            verified++;
-        }
         return cached;
+    }
+
+    /** Authoritative pass boundary for differential restoration: foreign raw GL calls cannot poison the saved state. */
+    static Snapshot boundarySnapshot() {
+        Snapshot actual = query();
+        if (trusted) {
+            try {
+                Snapshot cached = read();
+                if (!cached.equals(actual)) invalidate("raw GL/cache mismatch: cache=" + cached + " gl=" + actual);
+                else verified++;
+            } catch (IllegalAccessException | RuntimeException error) { invalidate("cache read failed: " + error.getClass().getSimpleName()); }
+        }
+        return actual;
+    }
+    static Snapshot actualSnapshot() { return query(); }
+    private static void invalidate(String reason) {
+        trusted = false; problem = reason;
+        Gl46Context.report("STATE_CACHE=INVALIDATED " + reason + " (using real GL snapshots)");
     }
 
     private static void resolve() throws ReflectiveOperationException {

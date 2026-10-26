@@ -34,9 +34,19 @@ public final class OffscreenBenchmark {
         else dev.vulkanforge.bench.Workload.load(Path.of(sceneFile), send);
 
         var probe = new BenchmarkScene.Probe(backend);
+        boolean profileTail=Boolean.getBoolean("bench.tail");
+        FrameTailSamples warmupTail=profileTail?new FrameTailSamples():null;
+        if(profileTail)probe.reportUploads("LOAD");
         float yaw = 0;
-        for (int i = 0; i < warmup; i++) { if (spin != 0) send.accept(BenchmarkScene.camera(yaw += spin, width, height)); frame(backend, width, height); }
+        for (int i = 0; i < warmup; i++) {
+            long fence=profileTail?probe.fenceWaitNanos():0,gl=SharedPresentImage.groupNanos,begin=System.nanoTime();
+            if (spin != 0) send.accept(BenchmarkScene.camera(yaw += spin, width, height));frame(backend, width, height);
+            long elapsed=System.nanoTime()-begin;
+            if(profileTail)warmupTail.add(elapsed,probe.fenceWaitNanos()-fence,SharedPresentImage.groupNanos-gl,probe.pendingUploadBytes());
+        }
+        if(profileTail)warmupTail.report("WARMUP");
         probe.drain();
+        if(profileTail)probe.reportUploads("AFTER_WARMUP");
         if (Boolean.getBoolean("bench.audit")) BenchmarkDrawAudit.write(backend, output.resolve("workload.txt"));
         int runs = Integer.getInteger("bench.runs", 1);
         double minimumSeconds = Double.parseDouble(System.getProperty("bench.seconds", "0"));
@@ -44,14 +54,17 @@ public final class OffscreenBenchmark {
         probe.drain();
         long submitted0 = backend.worldStats()[1], fence0 = probe.fenceWaitNanos(), glNanos0 = SharedPresentImage.groupNanos;
         probe.mark();
+        FrameTailSamples steadyTail=profileTail?new FrameTailSamples():null;
         long epochStart = System.currentTimeMillis();
         long cpuNanos = 0, start = System.nanoTime();
         int measuredFrames = 0;
         do {
+            long fence=profileTail?probe.fenceWaitNanos():0,gl=SharedPresentImage.groupNanos;
             long begin = System.nanoTime();
             if (spin != 0) send.accept(BenchmarkScene.camera(yaw += spin, width, height));
             frame(backend, width, height);
-            cpuNanos += System.nanoTime() - begin;
+            long elapsed=System.nanoTime()-begin;cpuNanos += elapsed;
+            if(profileTail)steadyTail.add(elapsed,probe.fenceWaitNanos()-fence,SharedPresentImage.groupNanos-gl,probe.pendingUploadBytes());
             measuredFrames++;
         } while (measuredFrames < frames || System.nanoTime() - start < minimumSeconds * 1e9);
         probe.drain();
@@ -67,6 +80,7 @@ public final class OffscreenBenchmark {
                 Double.isNaN(gpuMs) ? "n/a" : String.format("%.3f", gpuMs), Double.isNaN(gpuMs) ? "n/a" : String.format("%.0f%%", gpuMs * measuredFrames / seconds / 10), gpu[1]);
         System.out.printf(java.util.Locale.ROOT, "BENCH_RESULT API=VK%s run=%d width=%d height=%d frames=%d seconds=%.6f FPS=%.3f GPU_MS=%.6f START_MS=%d END_MS=%d%n",
                 System.getProperty("vulkanforge.vulkanVersion", "1.4"), run, width, height, measuredFrames, seconds, measuredFrames / seconds, gpuMs, epochStart, epochEnd);
+        if(profileTail) {steadyTail.report("STEADY");probe.reportUploads("AFTER_RUN_"+run);}
         }
         backend.closeWorld();
         backend.close();

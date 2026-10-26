@@ -1,5 +1,8 @@
 package github.com.gengyoubo.vulkanforge.client;
 
+import static github.com.gengyoubo.vulkanforge.client.Gl46State.glUseProgram;
+import static github.com.gengyoubo.vulkanforge.client.Gl46State.glBindVertexArray;
+
 import static github.com.gengyoubo.vulkanforge.client.GlCompat.glCreateVertexArrays;
 import static github.com.gengyoubo.vulkanforge.client.GlCompat.glDeleteVertexArrays;
 import static github.com.gengyoubo.vulkanforge.client.GlCompat.glEnableVertexArrayAttrib;
