@@ -21,7 +21,7 @@ final class Gl46Programs {
     record Program(int id, boolean spirv) { }
 
     static Program load(String... stages) {
-        if (!Boolean.getBoolean("vulkanforge.gl46.glsl")) {
+        if (GlCompat.core46() && !Boolean.getBoolean("vulkanforge.gl46.glsl")) {
             try { return new Program(link(stages, true), true); }
             catch (RuntimeException error) { Gl46Context.report("SPIRV_REJECTED " + String.join("+", stages) + ": " + error.getMessage()); }
         }
@@ -65,7 +65,15 @@ final class Gl46Programs {
     private static int source(String name) {
         int shader = glCreateShader(type(name));
         try {
-            glShaderSource(shader, new String(resource(name), StandardCharsets.UTF_8));
+            String source = new String(resource(name), StandardCharsets.UTF_8);
+            if (!GlCompat.core46()) {
+                source = source.replace("#version 460 core", "#version 430 core");
+                if (name.endsWith(".vert")) {
+                    source = source.replace("gl_BaseInstance + gl_InstanceID", "compatInstance").replace("gl_BaseInstance", "compatInstance");
+                    source = source.replace("void main()", "layout(location = 15) in int compatInstance;\nvoid main()");
+                }
+            }
+            glShaderSource(shader, source);
             glCompileShader(shader);
             check(shader, name);
             return shader;

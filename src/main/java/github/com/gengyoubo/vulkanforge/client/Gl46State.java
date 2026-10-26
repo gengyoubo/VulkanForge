@@ -1,5 +1,7 @@
 package github.com.gengyoubo.vulkanforge.client;
 
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glBindTextureUnit;
+
 import com.mojang.blaze3d.vertex.BufferUploader;
 import static org.lwjgl.opengl.GL46C.*;
 

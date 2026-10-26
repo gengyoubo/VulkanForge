@@ -1,5 +1,31 @@
 package github.com.gengyoubo.vulkanforge.client;
 
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glBindBuffer;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glBindBufferRange;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glBindTextureUnit;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glClearNamedBufferData;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glClearNamedBufferSubData;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glCopyNamedBufferSubData;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glCreateBuffers;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glCreateSamplers;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glCreateTextures;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glCreateVertexArrays;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glDeleteVertexArrays;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glDispatchCompute;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glEnableVertexArrayAttrib;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glMapNamedBufferRange;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glMultiDrawElementsIndirect;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glMultiDrawElementsIndirectCount;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glNamedBufferStorage;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glNamedBufferSubData;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glTextureStorage2D;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glUnmapNamedBuffer;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glVertexArrayAttribBinding;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glVertexArrayAttribFormat;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glVertexArrayAttribIFormat;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glVertexArrayElementBuffer;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glVertexArrayVertexBuffer;
+
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
 import dev.vulkanforge.bridge.WorldProtocol;

@@ -12,9 +12,9 @@ record DeviceCapabilities(boolean timeline, boolean indirectCount, boolean multi
     static DeviceCapabilities query(VkPhysicalDevice device, MemoryStack stack, int apiVersion, boolean pushExtension) {
         boolean core14 = apiVersion >= org.lwjgl.vulkan.VK14.VK_API_VERSION_1_4;
         var f14 = core14 ? VkPhysicalDeviceVulkan14Features.calloc(stack).sType$Default() : null;
-        var f13 = VkPhysicalDeviceVulkan13Features.calloc(stack).sType$Default();
+        var f13 = apiVersion >= org.lwjgl.vulkan.VK13.VK_API_VERSION_1_3 ? VkPhysicalDeviceVulkan13Features.calloc(stack).sType$Default() : null;
         if (f14 != null) f13.pNext(f14.address());
-        var f12 = VkPhysicalDeviceVulkan12Features.calloc(stack).sType$Default().pNext(f13.address());
+        var f12 = VkPhysicalDeviceVulkan12Features.calloc(stack).sType$Default().pNext(f13 == null ? 0 : f13.address());
         var f11 = VkPhysicalDeviceVulkan11Features.calloc(stack).sType$Default().pNext(f12.address());
         var features = VkPhysicalDeviceFeatures2.calloc(stack).sType$Default().pNext(f11.address());
         vkGetPhysicalDeviceFeatures2(device, features);

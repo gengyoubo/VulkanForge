@@ -1,5 +1,8 @@
 package github.com.gengyoubo.vulkanforge.lab;
 
+import static github.com.gengyoubo.vulkanforge.lab.VulkanCommands.vkCmdPipelineBarrier2;
+import static github.com.gengyoubo.vulkanforge.lab.VulkanCommands.vkQueueSubmit2;
+
 import org.lwjgl.system.*;
 import org.lwjgl.vulkan.*;
 import java.io.*;
@@ -47,7 +50,8 @@ public final class MainWindowBackend implements AutoCloseable {
      * Minecraft runs frame N+1 on the CPU; beginFrame only joins it. Only one thread touches the swapchain at a time and the
      * worker never uses the queue, so no extra queue locking is needed.
      */
-    private final java.util.concurrent.ExecutorService acquirer = "false".equalsIgnoreCase(System.getProperty("vulkanforge.asyncAcquire")) ? null
+    private final java.util.concurrent.ExecutorService acquirer = "false".equalsIgnoreCase(System.getProperty("vulkanforge.asyncAcquire"))
+            || "late".equalsIgnoreCase(System.getProperty("vulkanforge.asyncAcquire")) ? null
             : java.util.concurrent.Executors.newSingleThreadExecutor(task -> { Thread thread = new Thread(task, "VulkanForge swapchain acquire"); thread.setDaemon(true); return thread; });
     private java.util.concurrent.Future<?> pendingAcquire;
     private long joinNanos, maxJoinNanos, asyncAcquires, deferredFrames;
@@ -62,6 +66,8 @@ public final class MainWindowBackend implements AutoCloseable {
     private boolean deferred;
     /** -Dvulkanforge.asyncAcquire=always: defer regardless of frame time (tests the worker path under light load). */
     private final boolean alwaysDefer = "always".equalsIgnoreCase(System.getProperty("vulkanforge.asyncAcquire"));
+    /** -Dvulkanforge.asyncAcquire=late: no worker; beginFrame only waits the slot fence and present() acquires on the render thread. */
+    private final boolean lateAcquire = "late".equalsIgnoreCase(System.getProperty("vulkanforge.asyncAcquire"));
     /** volatile: the acquire worker may set dirty (OUT_OF_DATE) while the render thread runs beginFrame. */
     private volatile boolean dirty = true;
     private boolean vsync = true;
@@ -118,6 +124,7 @@ public final class MainWindowBackend implements AutoCloseable {
             log("BACKEND=WIN32_VULKAN_SWAPCHAIN_GPU_INTEROP");
             log("GL_BINDINGS=HOST_CALLBACKS");
             log("FRAMES_IN_FLIGHT=" + FRAMES_IN_FLIGHT);
+            log("ACQUIRE_MODE=" + (lateAcquire ? "LATE" : acquirer == null ? "EARLY" : alwaysDefer ? "ASYNC_ALWAYS" : "ADAPTIVE"));
         } catch (Throwable error) { close(); throw error; }
     }
 
@@ -289,7 +296,8 @@ public final class MainWindowBackend implements AutoCloseable {
         // Compare requested sizes: the surface may clamp them.
         if ((dirty || framebufferWidth != requestedWidth || framebufferHeight != requestedHeight) && !recreate(framebufferWidth, framebufferHeight)) return false;
         FrameSlot slot = slots[(int)(frames % slots.length)];
-        if (!slot.prepared) { waitSlotFence(slot, true); prepare(slot, early); }
+        if (!slot.prepared) { waitSlotFence(slot, true); prepare(slot, early && !lateAcquire); }
+        if (early && lateAcquire) return true;
         return slot.imageIndex >= 0 || acquireImage(slot, swapchain);
     }
     /** record: only the render thread updates the fence-wait statistics. */

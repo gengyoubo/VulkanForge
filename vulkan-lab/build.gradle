@@ -114,3 +114,14 @@ tasks.register('benchmarkOffscreen', JavaExec) {
     systemProperty 'vulkanforge.disableValidation', 'true'
     rootProject.properties.findAll { it.key.startsWith('bench.') || it.key.startsWith('vulkanforge.') }.each { systemProperty it.key, it.value }
 }
+
+// For trace/capture-present-trace.ps1, which runs elevated (WPR) and must not run Gradle there: java @build/trace/bench.args ...
+tasks.register('traceArgs') {
+    dependsOn 'testClasses'
+    def args = layout.buildDirectory.file('trace/bench.args')
+    outputs.file args
+    doLast {
+        def file = args.get().asFile; file.parentFile.mkdirs()
+        file.text = '-cp "' + sourceSets.test.runtimeClasspath.asPath.replace(File.separator, '/') + '"\n-Dvulkanforge.disableValidation=true\n'
+    }
+}

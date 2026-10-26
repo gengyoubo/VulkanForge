@@ -1,5 +1,14 @@
 package github.com.gengyoubo.vulkanforge.client;
 
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glCreateVertexArrays;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glDeleteVertexArrays;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glEnableVertexArrayAttrib;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glMultiDrawElementsIndirect;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glVertexArrayAttribBinding;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glVertexArrayAttribFormat;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glVertexArrayElementBuffer;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glVertexArrayVertexBuffer;
+
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.BufferBuilder;
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;

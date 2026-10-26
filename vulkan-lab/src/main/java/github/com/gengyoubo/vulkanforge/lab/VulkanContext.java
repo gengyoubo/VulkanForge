@@ -15,6 +15,7 @@ import static org.lwjgl.vulkan.KHRSurface.*;
 import static org.lwjgl.vulkan.KHRSwapchain.*;
 import static org.lwjgl.vulkan.VK10.*;
 import static org.lwjgl.vulkan.VK11.*;
+import static org.lwjgl.vulkan.VK12.VK_API_VERSION_1_2;
 import static org.lwjgl.vulkan.VK13.VK_API_VERSION_1_3;
 import static org.lwjgl.vulkan.VK14.VK_API_VERSION_1_4;
 
@@ -48,16 +49,17 @@ final class VulkanContext implements AutoCloseable {
     /** nvidiaExtensions: comma-separated VK_NV_* names selected in the config; blank for none. */
     VulkanContext(int apiVersion, String nvidiaExtensions) {
         this.requestedNvidia = NvidiaExtensions.parse(nvidiaExtensions);
-        if (apiVersion != VK_API_VERSION_1_3 && apiVersion != VK_API_VERSION_1_4)
+        if (apiVersion != VK_API_VERSION_1_2 && apiVersion != VK_API_VERSION_1_3 && apiVersion != VK_API_VERSION_1_4)
             throw new IllegalArgumentException("Unsupported Vulkan API version: " + version(apiVersion));
         this.apiVersion = apiVersion;
     }
 
     static int requestedApiVersion() {
         return switch (System.getProperty("vulkanforge.vulkanVersion", "1.4")) {
+            case "1.2" -> VK_API_VERSION_1_2;
             case "1.3" -> VK_API_VERSION_1_3;
             case "1.4" -> VK_API_VERSION_1_4;
-            default -> throw new IllegalArgumentException("vulkanforge.vulkanVersion must be 1.3 or 1.4");
+            default -> throw new IllegalArgumentException("vulkanforge.vulkanVersion must be 1.2, 1.3 or 1.4");
         };
     }
 
@@ -133,17 +135,27 @@ final class VulkanContext implements AutoCloseable {
 
             VkDeviceQueueCreateInfo.Buffer queueInfo = VkDeviceQueueCreateInfo.calloc(1, stack)
                     .sType$Default().queueFamilyIndex(queueFamily).pQueuePriorities(stack.floats(1.0f));
-            // Dynamic rendering and synchronization2 are core in both supported API versions.
-            VkPhysicalDeviceVulkan13Features enabled = VkPhysicalDeviceVulkan13Features.calloc(stack).sType$Default()
-                    .dynamicRendering(true).synchronization2(true);
+            // Vulkan 1.2 uses extension feature structures, never the promoted Vulkan 1.3 structure.
+            long renderingFeatures;
+            if (apiVersion >= VK_API_VERSION_1_3) {
+                var enabled = VkPhysicalDeviceVulkan13Features.calloc(stack).sType$Default().dynamicRendering(true).synchronization2(true);
+                if (apiVersion >= VK_API_VERSION_1_4)
+                    enabled.pNext(VkPhysicalDeviceVulkan14Features.calloc(stack).sType$Default().pushDescriptor(
+                            !Boolean.getBoolean("vulkanforge.disablePushDescriptors")).address());
+                renderingFeatures = enabled.address();
+            } else {
+                var sync = VkPhysicalDeviceSynchronization2FeaturesKHR.calloc(stack).sType$Default().synchronization2(true);
+                renderingFeatures = VkPhysicalDeviceDynamicRenderingFeaturesKHR.calloc(stack).sType$Default()
+                        .dynamicRendering(true).pNext(sync.address()).address();
+            }
             boolean pushExtension = hasDeviceExtension(physical, stack, org.lwjgl.vulkan.KHRPushDescriptor.VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
             capabilities = DeviceCapabilities.query(physical, stack, apiVersion, pushExtension);
             pushDescriptors = capabilities.pushDescriptor() && capabilities.maxPushDescriptors() >= 3 && !Boolean.getBoolean("vulkanforge.disablePushDescriptors");
             // The KHR extension has no feature bit on 1.3. Never chain a Vulkan 1.4 structure on that path.
             if (apiVersion >= VK_API_VERSION_1_4)
-                enabled.pNext(VkPhysicalDeviceVulkan14Features.calloc(stack).sType$Default().pushDescriptor(pushDescriptors).address());
+                VkPhysicalDeviceVulkan14Features.create(VkPhysicalDeviceVulkan13Features.create(renderingFeatures).pNext()).pushDescriptor(pushDescriptors);
             boolean driven = capabilities.gpuDriven() && !Boolean.getBoolean("vulkanforge.disableGpuDriven");
-            var enabled12 = VkPhysicalDeviceVulkan12Features.calloc(stack).sType$Default().pNext(enabled.address())
+            var enabled12 = VkPhysicalDeviceVulkan12Features.calloc(stack).sType$Default().pNext(renderingFeatures)
                     .timelineSemaphore(capabilities.timeline()).drawIndirectCount(driven);
             var enabled11 = VkPhysicalDeviceVulkan11Features.calloc(stack).sType$Default().pNext(enabled12.address()).shaderDrawParameters(driven);
             var core = VkPhysicalDeviceFeatures.calloc(stack).multiDrawIndirect(driven).drawIndirectFirstInstance(driven);
@@ -151,6 +163,10 @@ final class VulkanContext implements AutoCloseable {
             VkDeviceCreateInfo deviceInfo = VkDeviceCreateInfo.calloc(stack).sType$Default().pQueueCreateInfos(queueInfo)
                     .pNext(nvidia.chain(stack, enabled11.address())).pEnabledFeatures(core);
             java.util.List<String> deviceExtensions = new java.util.ArrayList<>();
+            if (apiVersion < VK_API_VERSION_1_3) {
+                deviceExtensions.add(KHRDynamicRendering.VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+                deviceExtensions.add(KHRSynchronization2.VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+            }
             if (!offscreen || interop) deviceExtensions.add(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
             if (interop) {
                 deviceExtensions.add(org.lwjgl.vulkan.KHRExternalMemoryWin32.VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
@@ -169,6 +185,7 @@ final class VulkanContext implements AutoCloseable {
             pushDescriptorCore = apiVersion >= VK_API_VERSION_1_4 && device.getCapabilities().vkCmdPushDescriptorSet != 0;
             pushDescriptors &= pushDescriptorCore || device.getCapabilities().vkCmdPushDescriptorSetKHR != 0;
             System.out.println("INSTANCE_API=" + version(app.apiVersion()));
+            System.out.println("RENDERING_COMMAND_PATH=" + (apiVersion < VK_API_VERSION_1_3 ? "KHR_1_2" : "CORE_1_3"));
             System.out.println("PUSH_DESCRIPTOR_PATH=" + (pushDescriptors ? pushDescriptorCore ? "VULKAN14_CORE" : "KHR_ALIAS" : "LEGACY"));
             System.out.println("DEVICE_CAPABILITIES=" + capabilities);
             System.out.println("GPU_DRIVEN_ENABLED=" + driven);
@@ -200,12 +217,18 @@ final class VulkanContext implements AutoCloseable {
             boolean swapchain = !offscreen && hasDeviceExtension(candidate, stack, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
             int family = findQueueFamily(candidate, stack);
             boolean dynamicRendering = false, synchronization2 = false;
-            if (props.apiVersion() >= org.lwjgl.vulkan.VK13.VK_API_VERSION_1_3) {
+            if (apiVersion >= VK_API_VERSION_1_3 && props.apiVersion() >= VK_API_VERSION_1_3) {
                 VkPhysicalDeviceVulkan13Features features13 = VkPhysicalDeviceVulkan13Features.calloc(stack).sType$Default();
                 VkPhysicalDeviceFeatures2 features = VkPhysicalDeviceFeatures2.calloc(stack).sType$Default().pNext(features13.address());
                 vkGetPhysicalDeviceFeatures2(candidate, features);
                 dynamicRendering = features13.dynamicRendering();
                 synchronization2 = features13.synchronization2();
+            } else if (hasDeviceExtension(candidate, stack, KHRDynamicRendering.VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME)
+                    && hasDeviceExtension(candidate, stack, KHRSynchronization2.VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME)) {
+                var sync = VkPhysicalDeviceSynchronization2FeaturesKHR.calloc(stack).sType$Default();
+                var rendering = VkPhysicalDeviceDynamicRenderingFeaturesKHR.calloc(stack).sType$Default().pNext(sync.address());
+                vkGetPhysicalDeviceFeatures2(candidate, VkPhysicalDeviceFeatures2.calloc(stack).sType$Default().pNext(rendering.address()));
+                dynamicRendering = rendering.dynamicRendering(); synchronization2 = sync.synchronization2();
             }
             boolean presentation = false;
             if (!offscreen && swapchain && family >= 0) {

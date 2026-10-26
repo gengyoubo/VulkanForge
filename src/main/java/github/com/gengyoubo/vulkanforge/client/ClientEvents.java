@@ -4,8 +4,6 @@ import com.mojang.blaze3d.platform.InputConstants;
 import github.com.gengyoubo.vulkanforge.VulkanForge;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.gui.components.Button;
-import net.minecraft.client.gui.screens.TitleScreen;
 import net.minecraft.network.chat.Component;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.event.RegisterKeyMappingsEvent;
@@ -36,14 +34,6 @@ public final class ClientEvents {
             while (PREVIEW.consumeClick()) VulkanPreview.toggle();
             while (TRIANGLE.consumeClick()) launchTriangle();
             while (INSET.consumeClick()) VulkanPreview.toggleInset();
-        }
-    }
-
-    @SubscribeEvent
-    public static void screenInit(ScreenEvent.Init.Post event) {
-        if (event.getScreen() instanceof TitleScreen screen) {
-            event.addListener(Button.builder(Component.translatable("vulkanforge.preview"), b -> VulkanPreview.toggle())
-                    .bounds(6, screen.height - 30, 150, 20).build());
         }
     }
 

@@ -1,5 +1,12 @@
 package github.com.gengyoubo.vulkanforge.client;
 
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glCopyNamedBufferSubData;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glCreateBuffers;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glMapNamedBufferRange;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glNamedBufferStorage;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glNamedBufferSubData;
+import static github.com.gengyoubo.vulkanforge.client.GlCompat.glUnmapNamedBuffer;
+
 import java.nio.ByteBuffer;
 import java.util.*;
 import org.lwjgl.system.MemoryUtil;
@@ -64,6 +71,7 @@ final class Gl46Buffers {
                 offset = segment * segmentSize;
             }
             cursor = offset + bytes;
+            GlCompat.written(buffer, offset, bytes);
             return offset;
         }
         /** After the GL commands reading this ring's allocations so far have been issued; a no-op unless a segment was left. */

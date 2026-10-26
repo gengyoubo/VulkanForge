@@ -1,5 +1,7 @@
 package github.com.gengyoubo.vulkanforge.lab;
 
+import static github.com.gengyoubo.vulkanforge.lab.VulkanCommands.vkCmdPipelineBarrier2;
+
 import java.util.*;
 import java.util.function.Consumer;
 import org.lwjgl.system.MemoryStack;

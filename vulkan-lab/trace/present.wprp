@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  GPU timeline for VulkanForge presentation (GPUView / WPA / trace/analyze-present-trace.py / PresentMon offline).
+  Based on WPR's built-in GPU profile (wpr -exportprofile GPU), plus DxgKrnl's Present keyword (0x8000000), Dwm-Core, Win32k
+  composition tokens and DirectComposition. Every provider uses NonPagedMemory like the built-in one: DxgKrnl logs at DPC level,
+  and without it all of its events are silently dropped (the first capture had none).
+-->
+<WindowsPerformanceRecorder Version="1.0" Author="VulkanForge">
+  <Profiles>
+    <SystemCollector Id="SystemCollector" Name="NT Kernel Logger">
+      <BufferSize Value="1024"/>
+      <Buffers Value="804"/>
+    </SystemCollector>
+    <EventCollector Id="EventCollector" Name="VulkanForge Present Collector">
+      <BufferSize Value="1024"/>
+      <Buffers Value="1024"/>
+    </EventCollector>
+
+    <SystemProvider Id="SystemProvider">
+      <Keywords>
+        <Keyword Value="ProcessThread"/>
+        <Keyword Value="Loader"/>
+        <Keyword Value="CSwitch"/>
+        <Keyword Value="ReadyThread"/>
+        <Keyword Value="DPC"/>
+        <Keyword Value="Interrupt"/>
+      </Keywords>
+    </SystemProvider>
+
+    <!-- Microsoft-Windows-DxgKrnl: built-in 0x277 + Present (0x8000000) + 0x80. -->
+    <EventProvider Id="DxgKrnl" Name="802ec45a-1e99-4b83-9920-87c98277ba9d" NonPagedMemory="true" Level="5">
+      <Keywords><Keyword Value="0x00000000080002F7"/></Keywords>
+      <CaptureStateOnStart Timeout="30"><Keyword Value="0x0000000000000277"/></CaptureStateOnStart>
+    </EventProvider>
+    <!-- The remaining GPU-profile providers, as exported from the built-in profile. -->
+    <EventProvider Id="GpuA688" Name="a688ee40-d8d9-4736-b6f9-6b74935ba3b1" NonPagedMemory="true" Level="5">
+      <Keywords><Keyword Value="0x000000000000FFFF"/></Keywords>
+      <CaptureStateOnStart Timeout="30"><Keyword Value="0x000000000000FFFF"/></CaptureStateOnStart>
+    </EventProvider>
+    <EventProvider Id="GpuB7A1" Name="b7a19fcd-15ba-41ba-a3d7-dc352d5f79ba" NonPagedMemory="true" Strict="true"/>
+    <EventProvider Id="Gpu36B6" Name="36b6f488-aad7-48c2-afe3-d4ec2c8b46fa" NonPagedMemory="true">
+      <Keywords><Keyword Value="0x0000000000010000"/></Keywords>
+    </EventProvider>
+    <EventProvider Id="GpuD499" Name="d49918cf-9489-4bf1-9d7b-014d864cf71f" NonPagedMemory="true"/>
+    <EventProvider Id="GpuE683" Name="e6835967-e0d2-41fb-bcec-58387404e25a" NonPagedMemory="true">
+      <Keywords><Keyword Value="0x0000000000000001"/></Keywords>
+    </EventProvider>
+    <EventProvider Id="DX" Name="65cd4c8a-0848-4583-92a0-31c0fbaf00c0" NonPagedMemory="true">
+      <Keywords><Keyword Value="0x000000000000002F"/></Keywords>
+    </EventProvider>
+    <!-- Microsoft-Windows-DXGI -->
+    <EventProvider Id="DXGI" Name="ca11c036-0102-4a2d-a6ad-f03cfed5d3c9" NonPagedMemory="true" Level="6">
+      <Keywords><Keyword Value="0x000000000000000F"/></Keywords>
+      <CaptureStateOnStart Timeout="30"><Keyword Value="0x000000000000000F"/></CaptureStateOnStart>
+    </EventProvider>
+    <EventProvider Id="DwmCore" Name="Microsoft-Windows-Dwm-Core" NonPagedMemory="true" Level="6">
+      <Keywords><Keyword Value="0x000000000001FFFF"/></Keywords>
+    </EventProvider>
+    <EventProvider Id="Win32k" Name="Microsoft-Windows-Win32k" NonPagedMemory="true" Level="5">
+      <Keywords><Keyword Value="0x00000000042E3000"/></Keywords>
+    </EventProvider>
+    <EventProvider Id="DirectComposition" Name="Microsoft-Windows-DirectComposition" NonPagedMemory="true" Level="5">
+      <Keywords><Keyword Value="0x0000000000000044"/></Keywords>
+    </EventProvider>
+
+    <Profile Id="VulkanForgePresent.Verbose.File" Name="VulkanForgePresent" Description="VulkanForge presentation GPU timeline" LoggingMode="File" DetailLevel="Verbose">
+      <Collectors>
+        <SystemCollectorId Value="SystemCollector">
+          <SystemProviderId Value="SystemProvider"/>
+        </SystemCollectorId>
+        <EventCollectorId Value="EventCollector">
+          <EventProviders>
+            <EventProviderId Value="DxgKrnl"/>
+            <EventProviderId Value="GpuA688"/>
+            <EventProviderId Value="GpuB7A1"/>
+            <EventProviderId Value="Gpu36B6"/>
+            <EventProviderId Value="GpuD499"/>
+            <EventProviderId Value="GpuE683"/>
+            <EventProviderId Value="DX"/>
+            <EventProviderId Value="DXGI"/>
+            <EventProviderId Value="DwmCore"/>
+            <EventProviderId Value="Win32k"/>
+            <EventProviderId Value="DirectComposition"/>
+          </EventProviders>
+        </EventCollectorId>
+      </Collectors>
+      <TraceMergeProperties>
+        <TraceMergeProperty Id="BaseVerboseTraceMergeProperties" Name="BaseTraceMergeProperties">
+          <DeletePreMergedTraceFiles Value="true"/>
+          <FileCompression Value="false"/>
+          <InjectOnly Value="false"/>
+          <SkipMerge Value="false"/>
+          <CustomEvents>
+            <CustomEvent Value="ImageId"/>
+            <CustomEvent Value="BuildInfo"/>
+            <CustomEvent Value="EventMetadata"/>
+          </CustomEvents>
+        </TraceMergeProperty>
+      </TraceMergeProperties>
+    </Profile>
+  </Profiles>
+</WindowsPerformanceRecorder>

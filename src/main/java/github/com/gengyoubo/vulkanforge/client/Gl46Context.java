@@ -24,7 +24,7 @@ final class Gl46Context {
      * Only when earlyWindowControl is off (vanilla's 3.2 request) is a too-old context replaced by an explicit request.
      */
     static long window(long legacy, OpenGLVersion version, IntSupplier width, IntSupplier height, Supplier<String> title, LongSupplier monitor) {
-        requested = version;
+        select(version);
         report("REQUESTED_GL=" + version.label);
         if (version == OpenGLVersion.DEFAULT) return legacy;
         GLFW.glfwMakeContextCurrent(legacy); GL.createCapabilities();
@@ -53,11 +53,17 @@ final class Gl46Context {
         }
     }
 
+    static void select(OpenGLVersion version) {
+        requested = version;
+        GlCompat.configure(version == OpenGLVersion.DEFAULT ? 6 : version.minor);
+    }
+
     /** Render thread, current context. Null when the GL 4.6 terrain renderer can run, else the reason. */
     static String terrainUnsupported() {
-        if (requested != OpenGLVersion.GL_4_6) return "OpenGL " + requested.label + " terrain is not implemented";
+        if (requested == OpenGLVersion.DEFAULT) return "Default OpenGL uses vanilla terrain";
         var caps = GL.getCapabilities();
-        if (!caps.OpenGL46) return "context is OpenGL " + describe() + ", 4.6 required";
+        if (!caps.OpenGL43 || !atLeast(requested)) return "context is OpenGL " + describe() + ", " + requested.label + " required";
+        report("GL_BACKEND_PATHS " + GlCompat.paths());
         return null;
     }
 
@@ -74,7 +80,9 @@ final class Gl46Context {
     static synchronized void report(String line) {
         REPORT.append(line).append('\n');
         try {
-            Path logs = FMLPaths.GAMEDIR.get().resolve("logs/vulkanforge"); Files.createDirectories(logs);
+            String offscreen = System.getProperty("vulkanforge.offscreenReportDir");
+            Path logs = offscreen == null ? FMLPaths.GAMEDIR.get().resolve("logs/vulkanforge") : Path.of(offscreen);
+            Files.createDirectories(logs);
             Files.writeString(logs.resolve("gl46-report.txt"), REPORT);
         } catch (Exception error) { LOGGER.warn("Could not write gl46-report.txt", error); }
     }

@@ -22,7 +22,7 @@ public final class VulkanForgeConfig {
     public enum Backend { VULKAN, OPENGL }
     //推荐1.3
     public enum VulkanVersion {
-        V1_2(2, false), V1_3(3, true), V1_4(4, true);
+        V1_2(2, true), V1_3(3, true), V1_4(4, true);
         public final String label;
         /** Packed VkApplicationInfo.apiVersion, passed across the isolated backend boundary as an int. */
         public final int apiVersion;
@@ -34,7 +34,7 @@ public final class VulkanForgeConfig {
     }
     //推荐4.5
     public enum OpenGLVersion {
-        DEFAULT("default", 0, 0, true), GL_4_3("4.3", 4, 3, false), GL_4_4("4.4", 4, 4, false), GL_4_5("4.5", 4, 5, false), GL_4_6("4.6", 4, 6, true);
+        DEFAULT("default", 0, 0, true), GL_4_3("4.3", 4, 3, true), GL_4_4("4.4", 4, 4, true), GL_4_5("4.5", 4, 5, true), GL_4_6("4.6", 4, 6, true);
         public final String label;
         /** Requested core context version; 0.0 keeps Minecraft's own request. */
         public final int major, minor;
@@ -73,7 +73,7 @@ public final class VulkanForgeConfig {
         builder.pop();
 
         builder.push("vulkan");
-        VULKAN_VERSION = builder.comment("Requested Vulkan API version (V1_2 .. V1_4). V1_3 and V1_4 are implemented; V1_2 keeps the vanilla OpenGL window. Only used when backend = VULKAN.")
+        VULKAN_VERSION = builder.comment("Requested Vulkan API version (V1_2 .. V1_4). V1_2 uses KHR_dynamic_rendering and KHR_synchronization2; V1_3/V1_4 use core commands. Only used when backend = VULKAN.")
                 .defineEnum("version", VulkanVersion.V1_4);
         builder.comment("NVIDIA-only device extensions. Ignored on other vendors and when backend = OPENGL.").push("nvidiaExtensions");
         for (NvidiaExtension extension : NvidiaExtension.values()) {
@@ -82,7 +82,7 @@ public final class VulkanForgeConfig {
         builder.pop(2);
 
         builder.push("opengl");
-        OPENGL_VERSION = builder.comment("Requested OpenGL core profile version. DEFAULT keeps Minecraft's own context and vanilla terrain; GL_4_6 enables the GPU-driven terrain renderer (F8). Only used when backend = OPENGL.")
+        OPENGL_VERSION = builder.comment("Requested OpenGL core profile version. DEFAULT keeps Minecraft's own context and vanilla terrain; GL_4_3 through GL_4_6 enable the GPU-driven terrain renderer (F8). Only used when backend = OPENGL.")
                 .defineEnum("version", OpenGLVersion.DEFAULT);
         builder.pop();
         SPEC = builder.build();
@@ -103,7 +103,7 @@ public final class VulkanForgeConfig {
         /** Vulkan Surface/Swapchain main window (Windows only, also gated by -Dvulkanforge.directPresent). */
         public boolean vulkanMainWindow() { return backend == Backend.VULKAN && vulkanVersion.implemented; }
         /** In-context OpenGL 4.6 terrain renderer instead of the Vulkan bridge. */
-        public boolean gl46Terrain() { return backend == Backend.OPENGL && openGLVersion == OpenGLVersion.GL_4_6; }
+        public boolean gl46Terrain() { return backend == Backend.OPENGL && openGLVersion != OpenGLVersion.DEFAULT; }
         @Override public String toString() {
             if (backend != Backend.VULKAN) return "OPENGL " + openGLVersion.label;
             return "VULKAN " + vulkanVersion.label + (nvidiaExtensions.isEmpty() ? "" : " +" + nvidiaExtensionNames());
