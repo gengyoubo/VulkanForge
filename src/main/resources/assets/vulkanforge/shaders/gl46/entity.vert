@@ -1,6 +1,6 @@
 #version 460 core
-// Port of vanilla rendertype_entity_* (NEW_ENTITY). One MultiDrawElementsIndirect per state/texture run; the Draws SSBO is
-// bound at the run's first record, so gl_DrawID selects this draw's matrices, ColorModulator, lights and fog.
+// Port of vanilla rendertype_entity_* (NEW_ENTITY). One MultiDrawElementsIndirect per state/texture run; each command's
+// baseInstance is the index of its record (matrices, ColorModulator, lights, fog) in the Draws SSBO.
 struct Draw {
     mat4 projection;
     mat4 modelView;
@@ -27,17 +27,20 @@ layout(location = 3) out vec4 overlayColor;
 layout(location = 4) out vec2 texCoord0;
 layout(location = 5) flat out int drawIndex;
 void main() {
-    Draw draw = draws[gl_DrawID];
+    Draw draw = draws[gl_BaseInstance];
     gl_Position = draw.projection * draw.modelView * vec4(Position, 1.0);
     // vanilla fog_distance(ModelViewMat, IViewRotMat * Position, FogShape)
     vec3 pos = mat3(draw.inverseViewRotation[0].xyz, draw.inverseViewRotation[1].xyz, draw.inverseViewRotation[2].xyz) * Position;
     vertexDistance = draw.fog.z < 0.5 ? length((draw.modelView * vec4(pos, 1.0)).xyz)
             : max(length((draw.modelView * vec4(pos.x, 0.0, pos.z, 1.0)).xyz), length((draw.modelView * vec4(0.0, pos.y, 0.0, 1.0)).xyz));
-    vec3 l0 = normalize(draw.light0.xyz), l1 = normalize(draw.light1.xyz);
-    float light = min(1.0, (max(0.0, dot(l0, Normal)) + max(0.0, dot(l1, Normal))) * 0.6 + 0.4);
-    vertexColor = vec4(Color.rgb * light, Color.a);
+    if (draw.fog.w > 3.5) vertexColor = Color; // rendertype_entity_shadow: unlit
+    else {
+        vec3 l0 = normalize(draw.light0.xyz), l1 = normalize(draw.light1.xyz);
+        float light = min(1.0, (max(0.0, dot(l0, Normal)) + max(0.0, dot(l1, Normal))) * 0.6 + 0.4);
+        vertexColor = vec4(Color.rgb * light, Color.a);
+    }
     lightMapColor = texelFetch(lightMap, UV2 / 16, 0);
     overlayColor = texelFetch(overlay, UV1, 0);
     texCoord0 = UV0;
-    drawIndex = gl_DrawID;
+    drawIndex = gl_BaseInstance;
 }

@@ -28,6 +28,7 @@ import java.util.concurrent.TimeUnit;
 @Mod.EventBusSubscriber(modid = VulkanForge.MOD_ID, value = Dist.CLIENT)
 public final class Gl46WorldSmoke {
     private static int stage, ticks;
+    private static long[] sortsBefore;
     private static final long START = System.nanoTime();
     private static Path report;
 
@@ -72,6 +73,18 @@ public final class Gl46WorldSmoke {
                 require(entities[0] > 0 && entities[2] > 0, "GL 4.6 entity pass captured nothing: " + java.util.Arrays.toString(entities)
                         + " fallbacks=" + VulkanPreview.gl46EntityFallbacks());
                 log("PASS GL 4.6 entities: stats=" + java.util.Arrays.toString(entities) + " fallbacks=" + VulkanPreview.gl46EntityFallbacks());
+                require(GlStateCache.trusted(), "GL state cache rejected; see gl46-report.txt STATE_CACHE");
+                if (GlStateCache.verifying()) {
+                    require(GlStateCache.verified() > 0, "State verification never ran");
+                    log("PASS GL state cache matched glGet on " + GlStateCache.verified() + " snapshots");
+                }
+                long frames = Math.max(1, stats[0]); // terrain frames: flushes per frame vary with splits
+                log(String.format("CPU entity capture %.1f us/frame (%.2f us/draw), flush %.1f us/frame (%.2f flushes/frame); terrain opaque %.1f us, translucent %.1f us per frame",
+                        entities[5] / 1e3 / frames, entities[5] / 1e3 / Math.max(1, entities[0]), entities[6] / 1e3 / frames, entities[1] / (double) frames,
+                        VulkanPreview.gl46Stats()[9] / 1e3 / Math.max(1, stats[0]), VulkanPreview.gl46Stats()[10] / 1e3 / Math.max(1, stats[0])));
+                log("CPU per frame " + VulkanPreview.gl46Timers());
+                log("CPU us/frame breakdown: opaque {snapshot, cull, draws, fence, restore}=" + perFrame(VulkanPreview.gl46Phases(), stats[0])
+                        + " entity flush {snapshot, draws, restore, fences}=" + perFrame(VulkanPreview.gl46EntityPhases(), frames));
                 screenshot(mc, "gl46.png");
                 VulkanPreview.toggle();
                 require(!VulkanPreview.gl46World(), "F8 did not turn GL 4.6 terrain off");
@@ -87,6 +100,20 @@ public final class Gl46WorldSmoke {
             } else if (stage == 5 && ++ticks > 60 && VulkanPreview.gl46Stats()[0] > 30 && VulkanPreview.gl46Covers(new BlockPos(0, 64, 0))) {
                 screenshot(mc, "gl46-restarted.png");
                 log("PASS restart after F8 off/on: stats=" + java.util.Arrays.toString(VulkanPreview.gl46Stats()));
+                sortsBefore = VulkanPreview.gl46SortStats();
+                stage = 6; ticks = 0;
+            } else if (stage == 6 && ++ticks <= 100) {
+                // Fly along the glass wall and the pool: translucent sections must keep re-sorting within budget.
+                double x = -20 + ticks * 0.4, z = 11.0 - ticks * 0.15;
+                var server = mc.getSingleplayerServer(); var uuid = mc.player.getUUID();
+                server.execute(() -> { var player = server.getPlayerList().getPlayer(uuid); player.teleportTo(server.overworld(), x, 68.0, z, 180, 18); });
+            } else if (stage == 6) {
+                long[] sorts = VulkanPreview.gl46SortStats();
+                require(sorts[0] > sortsBefore[0], "Camera flight did not re-sort any translucent quads");
+                log("PASS translucent sorting during flight: {sortedQuads, insertionSorts, fullSorts, deferredSorts} "
+                        + java.util.Arrays.toString(sortsBefore) + " -> " + java.util.Arrays.toString(sorts));
+                log("CPU per frame after flight " + VulkanPreview.gl46Timers());
+                screenshot(mc, "gl46-flight.png");
                 VulkanPreview.close();
                 require(Files.readString(mc.gameDirectory.toPath().resolve("logs/vulkanforge/gl46-report.txt")).contains("TERRAIN_CLOSE"), "Renderer did not close");
                 log("STATUS=OK"); stage = 99;
@@ -122,7 +149,14 @@ public final class Gl46WorldSmoke {
                     x == -8 || x == -4 || z == 4 || z == 8 ? Blocks.STONE_BRICKS.defaultBlockState() : Blocks.WATER.defaultBlockState(), 3);
             for (int x = -1; x <= 1; x++) for (int y = 65; y <= 66; y++) level.setBlock(new BlockPos(x, y, 7), Blocks.LIGHT_BLUE_STAINED_GLASS.defaultBlockState(), 3);
             level.setBlock(new BlockPos(3, 65, 6), Blocks.CHEST.defaultBlockState(), 3);
-            var cow = net.minecraft.world.entity.EntityType.COW.spawn(level, new BlockPos(-3, 65, 6), net.minecraft.world.entity.MobSpawnType.COMMAND);
+            // Entity density: a 10x6 herd and a row of chests behind the wall, plus a glass pane wall across several sections.
+            for (int x = -9; x <= 9; x += 2) for (int z = -3; z >= -13; z -= 2) {
+                var herd = net.minecraft.world.entity.EntityType.COW.spawn(level, new BlockPos(x, 65, z), net.minecraft.world.entity.MobSpawnType.COMMAND);
+                if (herd != null) { herd.setNoAi(true); herd.setYRot(x * 9); }
+            }
+            for (int x = -12; x <= 12; x++) level.setBlock(new BlockPos(x, 65, -15), Blocks.CHEST.defaultBlockState(), 3);
+            for (int x = -24; x <= 24; x++) for (int y = 65; y <= 67; y++) level.setBlock(new BlockPos(x, y, -18), Blocks.WHITE_STAINED_GLASS.defaultBlockState(), 3);
+            var cow =net.minecraft.world.entity.EntityType.COW.spawn(level, new BlockPos(-3, 65, 6), net.minecraft.world.entity.MobSpawnType.COMMAND);
             if (cow != null) { cow.setNoAi(true); cow.setYRot(30); }
             var player = server.getPlayerList().getPlayer(uuid);
             player.teleportTo(level, 0.5, 68.0, 11.0, 180, 18);
@@ -159,6 +193,11 @@ public final class Gl46WorldSmoke {
         return new double[]{sum / (pixels * 3.0), differing / (double) pixels};
     }
 
+    private static String perFrame(long[] nanos, long frames) {
+        StringBuilder out = new StringBuilder("[");
+        for (int i = 0; i < nanos.length; i++) out.append(i == 0 ? "" : ", ").append(String.format("%.1f", nanos[i] / 1e3 / Math.max(1, frames)));
+        return out.append(']').toString();
+    }
     private static void log(String message) throws java.io.IOException {
         VulkanForge.LOGGER.info("GL 4.6 smoke: {}", message);
         Files.writeString(report.resolve("report.txt"), message + System.lineSeparator(), StandardOpenOption.CREATE, StandardOpenOption.APPEND);

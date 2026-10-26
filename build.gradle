@@ -41,6 +41,8 @@ minecraft {
             if (project.hasProperty('gl46Smoke')) {
                 property 'vulkanforge.gl46Smoke', 'true'
                 property 'vulkanforge.startup', 'OPENGL:GL_4_6'
+                // -Pgl46Verify: compare every cached GL state snapshot with glGet (correctness run; timings are not representative).
+                if (project.hasProperty('gl46Verify')) property 'vulkanforge.gl46.verifyState', 'true'
                 mods { vulkanforge { source sourceSets.smoke } }
             }
         }

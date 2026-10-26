@@ -23,43 +23,67 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
     private static final int STRIDE = DefaultVertexFormat.BLOCK.getVertexSize();
     /** WorldCapture admits at most MAX_MESH_BYTES of triangle-expanded geometry per layer group, i.e. fewer quads than this. */
     private static final int MAX_QUADS = 1 << 16;
-    private static final int SECTION_BYTES = 64, FRAME_BYTES = 144, COMMAND_BYTES = 20, RESORT_BUDGET = 16, OPAQUE_LAYERS = 3;
+    private static final int SECTION_BYTES = 64, FRAME_BYTES = 144, COMMAND_BYTES = 20, OPAQUE_LAYERS = 3;
+    /** Re-sorted quads per frame, nearest stale sections first (at least one section per frame). */
+    private static final int QUAD_BUDGET = 32768;
+    /** Camera moves beyond this (blocks) since the last sort use a full sort instead of insertion sort on the previous order. */
+    private static final double FULL_SORT_DISTANCE = 8;
     /** Vanilla rendertype_solid / cutout_mipped / cutout discard thresholds; 0 never discards. */
     private static final float[] CUTOFF = {0, .5f, .1f};
 
     private record Section(int slot, int x, int y, int z, int firstVertex, int opaqueQuads, Translucent translucent) { }
 
-    /** Sorting rewrites only this section's quad index range. */
+    /**
+     * Sorting rewrites only this section's quad index range. {@code order} is the far-to-near quad order of the last sort; after
+     * a small camera move it is nearly sorted, so re-sorting it with insertion sort is close to linear.
+     */
     private static final class Translucent {
         final int firstVertex, firstIndex, quads;
         final float[] centers;
+        final int[] order;
         double sortedX, sortedY, sortedZ;
         boolean sorted;
         Translucent(int firstVertex, int firstIndex, byte[] bytes) {
             this.firstVertex = firstVertex; this.firstIndex = firstIndex;
             quads = bytes.length / (4 * STRIDE);
             centers = new float[quads * 3];
+            order = new int[quads];
             var data = ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN);
-            for (int quad = 0; quad < quads; quad++) for (int corner = 0; corner < 4; corner++) for (int axis = 0; axis < 3; axis++)
-                centers[quad * 3 + axis] += data.getFloat((quad * 4 + corner) * STRIDE + axis * 4) * .25f;
+            for (int quad = 0; quad < quads; quad++) {
+                order[quad] = quad;
+                for (int corner = 0; corner < 4; corner++) for (int axis = 0; axis < 3; axis++)
+                    centers[quad * 3 + axis] += data.getFloat((quad * 4 + corner) * STRIDE + axis * 4) * .25f;
+            }
         }
         int vertices() { return quads * 4; }
         int indices() { return quads * 6; }
-        boolean stale(double x, double y, double z) {
+        double moved(double x, double y, double z) {
             double dx = x - sortedX, dy = y - sortedY, dz = z - sortedZ;
-            return !sorted || dx * dx + dy * dy + dz * dz > 1;
+            return Math.sqrt(dx * dx + dy * dy + dz * dz);
+        }
+        /** Far sections change order more slowly: re-sort after max(1, distance / 8) blocks of camera movement. */
+        boolean stale(double x, double y, double z) {
+            return !sorted || moved(x, y, z) > Math.max(1, Math.sqrt(x * x + y * y + z * z) / 8);
         }
     }
+    /** Sections that have a translucent layer; drawTranslucent never walks the opaque-only ones. */
+    private final List<Section> layered = new ArrayList<>();
+    /** Reused per frame / per sort: no allocation in the translucent pass once warmed up. */
+    private long[] sectionKeys = new long[64], quadKeys = new long[1024];
+    private float[] distances = new float[1024];
+    private final List<Section> drawOrder = new ArrayList<>();
+    private long insertionSorts, fullSorts, sortedQuads, deferredSorts;
 
     private Gl46Programs.Program cull, opaque, translucent;
     private Gl46Buffers.Arena vertices, indices;
-    private Gl46Buffers.Ring staging, frames, commands;
+    private Gl46Buffers.Ring frames, commands;
+    private Gl46Buffers.Uploader uploads;
     private int sectionBuffer, drawBuffer, countBuffer, quadIndices, opaqueVao, translucentVao;
     private int mipSampler, flatSampler, lightSampler, uboAlignment, vaoVertexBuffer, vaoIndexBuffer;
     private final Map<Long, Section> sections = new HashMap<>();
     private final ArrayDeque<Integer> freeSlots = new ArrayDeque<>();
     private int slotCount, peakSections;
-    private long epoch, frameCount, translucentFrames, translucentDraws, sorts, meshes;
+    private long epoch, frameCount, translucentFrames, translucentDraws, sorts, meshes, opaqueNanos, translucentNanos;
     private WorldProtocol.Camera camera;
     private boolean receivedMesh;
     private final Set<String> checkedPasses = new HashSet<>();
@@ -71,7 +95,7 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
             translucent = Gl46Programs.load("terrain.vert", "terrain_translucent.frag");
             vertices = new Gl46Buffers.Arena("vertex", STRIDE, 1 << 18, 256L << 20);
             indices = new Gl46Buffers.Arena("index", 4, 1 << 18, 64L << 20);
-            staging = new Gl46Buffers.Ring(WorldProtocol.MAX_MESH_BYTES, 4);
+            uploads = new Gl46Buffers.Uploader(WorldProtocol.MAX_MESH_BYTES, 4);
             frames = new Gl46Buffers.Ring(64 << 10, 4);
             commands = new Gl46Buffers.Ring(2 << 20, 3);
             sectionBuffer = Gl46Buffers.immutable((long) MAX_SECTIONS * SECTION_BYTES, GL_DYNAMIC_STORAGE_BIT);
@@ -151,20 +175,22 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
         try {
             if (opaqueVertices > 0) {
                 first = vertices.allocate(opaqueVertices);
-                int at = first;
-                for (int layer = 0; layer < OPAQUE_LAYERS; layer++) if (layers[layer].length > 0) {
-                    vertices.upload(at, layers[layer], staging); at += layers[layer].length / STRIDE;
-                }
+                // solid | cutoutMipped | cutout are contiguous in the arena: one staging write, one queued copy.
+                vertices.upload(first, uploads, layers[0], layers[1], layers[2]);
             }
             Translucent sorted = null;
             if (layers[3].length > 0) {
                 translucentFirst = vertices.allocate(layers[3].length / STRIDE);
-                vertices.upload(translucentFirst, layers[3], staging);
+                vertices.upload(translucentFirst, uploads, layers[3]);
                 indexFirst = indices.allocate(layers[3].length / STRIDE / 4 * 6);
                 sorted = new Translucent(translucentFirst, indexFirst, layers[3]);
+                // Drawable at once in capture order; the budgeted sorter then orders it far-to-near.
+                writeOrder(sorted);
             }
             int slot = freeSlots.isEmpty() ? slotCount++ : freeSlots.poll();
-            sections.put(key, new Section(slot, x, y, z, Math.max(first, 0), opaqueVertices / 4, sorted));
+            Section section = new Section(slot, x, y, z, Math.max(first, 0), opaqueVertices / 4, sorted);
+            sections.put(key, section);
+            if (sorted != null) layered.add(section);
             int[] quads = new int[OPAQUE_LAYERS];
             for (int layer = 0; layer < OPAQUE_LAYERS; layer++) quads[layer] = layers[layer].length / (4 * STRIDE);
             writeSlot(slot, x, y, z, opaqueVertices > 0 ? bounds(layers[0], layers[1], layers[2]) : bounds(layers[3]), Math.max(first, 0), quads);
@@ -187,6 +213,7 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
     private void remove(long key) {
         Section old = sections.remove(key);
         if (old == null) return;
+        if (old.translucent() != null) layered.remove(old);
         release(old);
         writeSlot(old.slot(), 0, 0, 0, new float[6], 0, new int[OPAQUE_LAYERS]);
         freeSlots.add(old.slot());
@@ -229,9 +256,13 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
 
     /** Called with Minecraft's main target bound, before vanilla's solid layer; GL state is restored exactly. */
     boolean drawOpaque(int atlas, int light) {
+        uploads.flush(); // this frame's section uploads, before anything reads them
         if (!ready()) return false;
         if (slotCount == 0) { frameCount++; return true; }
-        try (Gl46State ignored = new Gl46State(); MemoryStack stack = MemoryStack.stackPush()) {
+        long start = System.nanoTime();
+        Gl46State saved = new Gl46State();
+        long t1 = System.nanoTime(), t2 = t1, t3 = t1;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
             bindFrame(atlas, light, CUTOFF[0], mipSampler);
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, drawBuffer);
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, countBuffer);
@@ -239,6 +270,7 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
             glUseProgram(cull.id());
             glDispatchCompute((slotCount + 63) / 64, 1, 1);
             glMemoryBarrier(GL_COMMAND_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+            t2 = System.nanoTime();
             glUseProgram(opaque.id());
             bindVertexArray(opaqueVao);
             glBindBuffer(GL_DRAW_INDIRECT_BUFFER, drawBuffer);
@@ -249,28 +281,43 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
                 if (layer > 0) bindFrame(atlas, light, CUTOFF[layer], layer == 2 ? flatSampler : mipSampler);
                 glMultiDrawElementsIndirectCount(GL_TRIANGLES, GL_UNSIGNED_INT, (long) layer * MAX_SECTIONS * COMMAND_BYTES, layer * 4L, slotCount, COMMAND_BYTES);
             }
+            t3 = System.nanoTime();
             frames.submit();
+        } finally {
+            long t4 = System.nanoTime();
+            saved.close();
+            long t5 = System.nanoTime();
+            phases[0] += t1 - start; phases[1] += t2 - t1; phases[2] += t3 - t2; phases[3] += t4 - t3; phases[4] += t5 - t4;
         }
+        long spent = System.nanoTime() - start;
+        opaqueNanos += spent; opaqueTimer.add(spent); opaqueTimer.frame();
         frameCount++;
         checkErrors("opaque");
         return true;
     }
 
+    /** {sortedQuads, insertionSorts, fullSorts, deferredSorts}. */
+    long[] sortStats() { return new long[]{sortedQuads, insertionSorts, fullSorts, deferredSorts}; }
+    final Gl46Timer opaqueTimer = new Gl46Timer(), translucentTimer = new Gl46Timer();
+    /** Opaque pass breakdown in ns: {state snapshot, cull dispatch, layer draws, fence, state restore}. */
+    private final long[] phases = new long[5];
+    long[] phases() { return phases.clone(); }
+
     /** AFTER_TRANSLUCENT_BLOCKS: far-to-near sections, each far-to-near quads, with vanilla's translucent blend and depth write. */
     void drawTranslucent(int atlas, int light) {
-        if (!ready()) return;
-        List<Section> ordered = new ArrayList<>();
-        for (Section section : sections.values()) if (section.translucent() != null) ordered.add(section);
-        if (ordered.isEmpty()) return;
-        ordered.sort(Comparator.comparingDouble(section -> -distanceSquared(section)));
-        int resorts = 0;
-        // Nearest stale sections spend the re-sort budget first; never-sorted sections are always sorted before use.
+        if (!ready() || layered.isEmpty()) return;
+        long start = System.nanoTime();
+        List<Section> ordered = orderSections();
+        // Nearest stale sections spend the quad budget first; a section larger than the rest of the budget waits a frame.
+        int budget = QUAD_BUDGET;
         for (int i = ordered.size() - 1; i >= 0; i--) {
             Section section = ordered.get(i); Translucent layer = section.translucent();
             double x = camera.x() - section.x(), y = camera.y() - section.y(), z = camera.z() - section.z();
-            if (!layer.sorted) sort(layer, x, y, z);
-            else if (resorts < RESORT_BUDGET && layer.stale(x, y, z)) { sort(layer, x, y, z); resorts++; }
+            if (!layer.stale(x, y, z)) continue;
+            if (budget <= 0 || (layer.quads > budget && budget < QUAD_BUDGET)) { deferredSorts++; continue; }
+            sort(layer, x, y, z); budget -= layer.quads;
         }
+        uploads.flush();
         try (Gl46State ignored = new Gl46State()) {
             bindFrame(atlas, light, 0, mipSampler);
             int offset = commands.allocate(ordered.size() * COMMAND_BYTES, 4);
@@ -292,30 +339,72 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
             glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, offset, ordered.size(), COMMAND_BYTES);
             frames.submit(); commands.submit();
         }
+        long spent = System.nanoTime() - start;
+        translucentNanos += spent; translucentTimer.add(spent); translucentTimer.frame();
         translucentFrames++; translucentDraws += ordered.size();
         checkErrors("translucent");
     }
 
+    /** Far-to-near translucent sections, sorted through packed (distance bits, index) keys in a reused array. */
+    private List<Section> orderSections() {
+        int count = layered.size();
+        if (sectionKeys.length < count) sectionKeys = new long[Integer.highestOneBit(count) * 2];
+        for (int i = 0; i < count; i++)
+            // Non-negative float bits order like the floats themselves.
+            sectionKeys[i] = (long) Float.floatToIntBits((float) distanceSquared(layered.get(i))) << 32 | i;
+        Arrays.sort(sectionKeys, 0, count);
+        drawOrder.clear();
+        for (int i = count - 1; i >= 0; i--) drawOrder.add(layered.get((int) sectionKeys[i]));
+        return drawOrder;
+    }
+
     /** x/y/z: camera relative to the section origin. Farthest quad first; indices are relative to the layer's first vertex. */
     private void sort(Translucent layer, double x, double y, double z) {
-        long[] keys = new long[layer.quads];
-        for (int quad = 0; quad < layer.quads; quad++) {
+        int quads = layer.quads;
+        if (distances.length < quads) distances = new float[Integer.highestOneBit(quads) * 2];
+        for (int quad = 0; quad < quads; quad++) {
             float dx = (float) (layer.centers[quad * 3] - x), dy = (float) (layer.centers[quad * 3 + 1] - y), dz = (float) (layer.centers[quad * 3 + 2] - z);
-            // Non-negative float bits order like the floats themselves.
-            keys[quad] = (long) Float.floatToIntBits(dx * dx + dy * dy + dz * dz) << 32 | quad;
+            distances[quad] = dx * dx + dy * dy + dz * dz;
         }
-        Arrays.sort(keys);
-        ByteBuffer order = MemoryUtil.memAlloc(layer.indices() * 4);
-        try {
-            var ints = order.asIntBuffer();
-            for (int i = layer.quads - 1; i >= 0; i--) {
-                int base = (int) keys[i] * 4;
-                ints.put(base).put(base + 1).put(base + 2).put(base + 2).put(base + 3).put(base);
+        int[] order = layer.order;
+        if (layer.sorted && layer.moved(x, y, z) <= FULL_SORT_DISTANCE) {
+            // The previous order is nearly right: descending insertion sort.
+            for (int i = 1; i < quads; i++) {
+                int quad = order[i]; float distance = distances[quad]; int j = i - 1;
+                while (j >= 0 && distances[order[j]] < distance) { order[j + 1] = order[j]; j--; }
+                order[j + 1] = quad;
             }
-            indices.upload(layer.firstIndex, order, staging);
-        } finally { MemoryUtil.memFree(order); }
+            insertionSorts++;
+        } else {
+            if (quadKeys.length < quads) quadKeys = new long[Integer.highestOneBit(quads) * 2];
+            for (int quad = 0; quad < quads; quad++) quadKeys[quad] = (long) Float.floatToIntBits(distances[quad]) << 32 | quad;
+            Arrays.sort(quadKeys, 0, quads);
+            for (int i = 0; i < quads; i++) order[i] = (int) quadKeys[quads - 1 - i];
+            fullSorts++;
+        }
+        writeOrder(layer);
         layer.sortedX = x; layer.sortedY = y; layer.sortedZ = z; layer.sorted = true;
-        sorts++;
+        sorts++; sortedQuads += quads;
+    }
+
+    /** layer.order as quad indices (0 1 2, 2 3 0 per quad), written straight into the staging ring and copied once. */
+    private void writeOrder(Translucent layer) {
+        int bytes = layer.indices() * 4;
+        int offset = uploads.reserve(bytes);
+        if (offset < 0) {
+            ByteBuffer direct = MemoryUtil.memAlloc(bytes);
+            try { putOrder(layer, direct, 0); glNamedBufferSubData(indices.buffer(), (long) layer.firstIndex * 4, direct); }
+            finally { MemoryUtil.memFree(direct); }
+            return;
+        }
+        putOrder(layer, uploads.staging.mapped, offset);
+        indices.copy(layer.firstIndex, uploads, offset, bytes);
+    }
+    private static void putOrder(Translucent layer, ByteBuffer out, int offset) {
+        for (int i = 0, at = offset; i < layer.quads; i++, at += 24) {
+            int base = layer.order[i] * 4;
+            out.putInt(at, base).putInt(at + 4, base + 1).putInt(at + 8, base + 2).putInt(at + 12, base + 2).putInt(at + 16, base + 3).putInt(at + 20, base);
+        }
     }
 
     private double distanceSquared(Section section) {
@@ -366,15 +455,17 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
         if (error != GL_NO_ERROR) throw new IllegalStateException("OpenGL error 0x" + Integer.toHexString(error) + " in GL 4.6 " + pass + " terrain pass");
     }
 
-    /** {frames, sections, slots, vertexCapacity, vertexGrows, uploadedBytes, stagingWaits, translucentDraws, sorts}. */
+    /** {frames, sections, slots, vertexCapacity, vertexGrows, uploadedBytes, stagingWaits, translucentDraws, sorts, opaqueNanos, translucentNanos}. */
     long[] stats() {
         return new long[]{frameCount, sections.size(), slotCount, vertices == null ? 0 : vertices.capacity(), vertices == null ? 0 : vertices.grows(),
-                vertices == null ? 0 : vertices.uploadedBytes() + indices.uploadedBytes(), staging == null ? 0 : staging.waits(), translucentDraws, sorts};
+                vertices == null ? 0 : vertices.uploadedBytes() + indices.uploadedBytes(), uploads == null ? 0 : uploads.staging.waits(), translucentDraws, sorts,
+                opaqueNanos, translucentNanos};
     }
 
     private void clear() {
         for (Section section : sections.values()) release(section);
-        sections.clear(); freeSlots.clear(); slotCount = 0;
+        if (uploads != null) uploads.flush();
+        sections.clear(); layered.clear(); freeSlots.clear(); slotCount = 0;
         if (sectionBuffer != 0) glClearNamedBufferData(sectionBuffer, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, (ByteBuffer) null);
         camera = null; receivedMesh = false;
     }
@@ -384,14 +475,18 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
                 + " translucentDraws=" + translucentDraws + " sorts=" + sorts + " meshes=" + meshes + " peakSections=" + peakSections
                 + " vertexCapacity=" + vertices.capacity() + " vertexGrows=" + vertices.grows() + " indexGrows=" + (indices == null ? 0 : indices.grows())
                 + " uploadedBytes=" + (vertices.uploadedBytes() + (indices == null ? 0 : indices.uploadedBytes()))
-                + " stagingWaits=" + (staging == null ? 0 : staging.waits()) + " freeRanges=" + vertices.freeRanges());
+                + " stagingWaits=" + uploads.staging.waits() + " uploads{issued,merged,direct}=" + Arrays.toString(uploads.stats()) + " freeRanges=" + vertices.freeRanges()
+                + " sortedQuads=" + sortedQuads + " insertionSorts=" + insertionSorts + " fullSorts=" + fullSorts + " deferredSorts=" + deferredSorts
+                + " opaqueNanos=" + opaqueNanos + " translucentNanos=" + translucentNanos + " opaqueCpu{" + opaqueTimer + "} translucentCpu{" + translucentTimer + "}"
+                + " rings{fences,waits,waitNanos,oversized} staging=" + Arrays.toString(uploads.staging.stats()) + " frames=" + Arrays.toString(frames.stats())
+                + " commands=" + Arrays.toString(commands.stats()));
         sections.clear(); freeSlots.clear();
         for (Gl46Programs.Program program : new Gl46Programs.Program[]{cull, opaque, translucent}) if (program != null) glDeleteProgram(program.id());
         cull = opaque = translucent = null;
-        for (AutoCloseable resource : new AutoCloseable[]{vertices, indices, staging, frames, commands}) {
+        for (AutoCloseable resource : new AutoCloseable[]{vertices, indices, uploads, frames, commands}) {
             try { if (resource != null) resource.close(); } catch (Exception ignored) { }
         }
-        vertices = indices = null; staging = frames = commands = null;
+        vertices = indices = null; uploads = null; frames = commands = null;
         for (int buffer : new int[]{sectionBuffer, drawBuffer, countBuffer, quadIndices}) if (buffer != 0) glDeleteBuffers(buffer);
         sectionBuffer = drawBuffer = countBuffer = quadIndices = 0;
         for (int vao : new int[]{opaqueVao, translucentVao}) if (vao != 0) glDeleteVertexArrays(vao);

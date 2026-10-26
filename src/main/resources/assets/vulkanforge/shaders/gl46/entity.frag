@@ -1,6 +1,7 @@
 #version 460 core
 // Variants: 0 overlay + discard before tint (entity cutout/translucent), 1 overlay, no discard (entity solid),
-// 2 lightmap tint + discard after tint (translucent_cull, armor), 3 lightmap tint, no discard (no_outline).
+// 2 lightmap tint + discard after tint (translucent_cull, armor), 3 lightmap tint, no discard (no_outline),
+// 4 entity shadow (clamped UV, unlit vertex color, no lightmap or overlay).
 struct Draw {
     mat4 projection;
     mat4 modelView;
@@ -23,8 +24,10 @@ layout(location = 0) out vec4 fragColor;
 void main() {
     vec4 colorModulator = draws[drawIndex].colorModulator, fogColor = draws[drawIndex].fogColor, fog = draws[drawIndex].fog;
     int variant = int(fog.w + 0.5);
-    vec4 color = texture(Sampler0, texCoord0);
-    if (variant <= 1) {
+    vec4 color = texture(Sampler0, variant == 4 ? clamp(texCoord0, vec2(0.0), vec2(1.0)) : texCoord0);
+    if (variant == 4) {
+        color *= vertexColor * colorModulator;
+    } else if (variant <= 1) {
         if (variant == 0 && color.a < 0.1) discard;
         color *= vertexColor * colorModulator;
         color.rgb = mix(overlayColor.rgb, color.rgb, overlayColor.a);

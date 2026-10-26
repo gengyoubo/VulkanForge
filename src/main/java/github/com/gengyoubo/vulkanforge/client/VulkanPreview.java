@@ -58,6 +58,7 @@ final class VulkanPreview {
     private static void enableGl() {
         String reason = Gl46Context.terrainUnsupported();
         if (reason == null) {
+            GlStateCache.initialise();
             try { gl = new Gl46Terrain(); }
             catch (RuntimeException error) { VulkanForge.LOGGER.error("Could not create the OpenGL 4.6 terrain renderer", error); reason = error.getMessage(); }
         }
@@ -112,7 +113,7 @@ final class VulkanPreview {
         Gl46Entities failed = glEntities; glEntities = null;
         failed.close();
     }
-    static long[] gl46EntityStats() { return glEntities != null ? glEntities.stats() : new long[5]; }
+    static long[] gl46EntityStats() { return glEntities != null ? glEntities.stats() : new long[7]; }
     static Map<String, Long> gl46EntityFallbacks() { return glEntities != null ? glEntities.fallbacks() : Map.of(); }
     private static void glFailed(RuntimeException error) {
         VulkanForge.LOGGER.error("OpenGL 4.6 terrain failed; vanilla terrain rendering resumes", error);
@@ -263,8 +264,16 @@ final class VulkanPreview {
     static boolean gl46Covers(net.minecraft.core.BlockPos origin) {
         return gl46World() && gl.frames() > 0 && uploadedEpoch == WORLD.epoch() && WORLD.covers(origin);
     }
-    /** {frames, sections, slots, vertexCapacity, vertexGrows, uploadedBytes, stagingWaits, translucentDraws, sorts}. */
-    static long[] gl46Stats() { return gl != null ? gl.stats() : new long[9]; }
+    /** See Gl46Terrain.stats(). */
+    /** Per-frame CPU percentiles of each GL 4.6 pass. */
+    static String gl46Timers() {
+        return "terrainOpaque{" + (gl != null ? gl.opaqueTimer : "-") + "} terrainTranslucent{" + (gl != null ? gl.translucentTimer : "-")
+                + "} entityCapture{" + (glEntities != null ? glEntities.captureTimer : "-") + "} entityFlush{" + (glEntities != null ? glEntities.flushTimer : "-") + "}";
+    }
+    static long[] gl46SortStats() { return gl != null ? gl.sortStats() : new long[4]; }
+    static long[] gl46Phases() { return gl != null ? gl.phases() : new long[5]; }
+    static long[] gl46EntityPhases() { return glEntities != null ? glEntities.phases() : new long[4]; }
+    static long[] gl46Stats() { return gl != null ? gl.stats() : new long[11]; }
     static long[] directWorldStats() { return directWorld() ? NativeMainWindow.worldStats() : new long[25]; }
     static int saveWorldFrame(java.nio.file.Path path) throws java.io.IOException {
         RenderSystem.assertOnRenderThread();
