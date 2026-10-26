@@ -26,7 +26,7 @@ public final class NativeMainWindow {
     private static boolean revealed;
     private static Method present, beginFrame, setVsync, frames, generations, capture, close, earlyAcquires, lateAcquires;
     private static Method hand, handPasses;
-    private static Method nativeComposite;
+    private static Method nativeComposite, nativePost;
     private static Method renderWorld, renderWorldWithSky, worldStats, finishWorldFrame, closeWorld, renderOverlay, finishOverlay, entityTexture, entityTexturePatch, gui, guiPasses, optimizationStats, uploadStats, tryWorldCommand, memoryStats, guiBindingStats;
     private static Consumer<Object[]> worldCommands;
 
@@ -64,6 +64,8 @@ public final class NativeMainWindow {
             renderWorld = type.getMethod("renderWorld", int.class, int.class); worldStats = type.getMethod("worldStats");
             renderWorldWithSky = type.getMethod("renderWorldWithSky", int.class, int.class, Object[].class, boolean.class);
             nativeComposite=type.getMethod("nativeComposite",int.class,int.class,int.class,int.class,Object[].class);
+            // Optional until the backend implements it; PostEffects falls back to vanilla post passes on false.
+            try { nativePost = type.getMethod("nativePost", Object[].class); } catch (NoSuchMethodException missing) { nativePost = null; }
             finishWorldFrame = type.getMethod("finishWorldFrame"); closeWorld = type.getMethod("closeWorld");
             renderOverlay = type.getMethod("renderOverlay", Object[].class, boolean.class); finishOverlay = type.getMethod("finishOverlay");
             memoryStats = type.getMethod("memoryStats"); guiBindingStats = type.getMethod("guiBindingStats");
@@ -181,6 +183,7 @@ public final class NativeMainWindow {
         int framebuffer=org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL30.GL_DRAW_FRAMEBUFFER_BINDING);
         return (Boolean)call(nativeComposite,framebuffer,viewport[2],viewport[3],kind,(Object)packets);
     }
+    static boolean nativePost(Object[] pass) { return active() && nativePost != null && (Boolean) call(nativePost, (Object) pass); }
     static boolean worldVisible() { return active() && GLFW.glfwGetWindowAttrib(mainWindow, GLFW.GLFW_ICONIFIED) == 0; }
     static long[] worldStats() { return active() ? (long[])call(worldStats) : new long[25]; }
     /** P7-P9: {color, depth} GL textures of one Vulkan overlay pass, or null; call finishOverlay() right after compositing. */
@@ -213,7 +216,7 @@ public final class NativeMainWindow {
         catch (Throwable error) { LOGGER.error("Could not close Vulkan main-window resources", cause(error)); }
         finally {
             backend = null; present = beginFrame = setVsync = frames = generations = capture = close = earlyAcquires = lateAcquires = null;
-            hand = handPasses = nativeComposite = null;
+            hand = handPasses = nativeComposite = nativePost = null;
             renderWorld = renderWorldWithSky = worldStats = finishWorldFrame = closeWorld = renderOverlay = finishOverlay = entityTexture = entityTexturePatch = gui = guiPasses = optimizationStats = uploadStats = tryWorldCommand = memoryStats = guiBindingStats = null; worldCommands = null;
             try { if (loader != null) loader.close(); } catch (Exception error) { LOGGER.warn("Could not close backend loader", error); }
             loader = null;
