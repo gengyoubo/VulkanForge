@@ -28,6 +28,7 @@ minecraft {
         }
         client {
             property 'vulkanforge.directPresent', System.getProperty('vulkanforge.directPresent', 'true')
+            property 'vulkanforge.legacyPresent', System.getProperty('vulkanforge.legacyPresent', 'false')
             if (project.hasProperty('validationSmoke')) property 'vulkanforge.requireValidation', 'true'
             if (project.hasProperty('pushDescriptorSmoke')) property 'vulkanforge.preferPushDescriptors', 'true'
             if (project.hasProperty('configSmoke')) {

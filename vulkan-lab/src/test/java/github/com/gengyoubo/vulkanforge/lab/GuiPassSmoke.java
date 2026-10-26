@@ -8,6 +8,7 @@ import static github.com.gengyoubo.vulkanforge.lab.EntityPass.*;
 /** Pixels read from the final swapchain, with no world renderer: painter order, alpha, scissor, depth clear and font patches. */
 final class GuiPassSmoke {
     static void run(MainWindowBackend backend, int source, Path output) throws Exception {
+        long beforeHand=backend.handPasses();long[] beforeBindings=backend.guiBindingStats();
         backend.beginFrame(640, 480);
         backend.entityTexture(new Object[]{9001, 2, 2, 0, new byte[]{-1,0,0,-1, -1,0,0,-1, -1,0,0,-1, -1,0,0,-1}});
         Object[] red = quad(FORMAT_POSITION_COLOR, 4, DEPTH_TEST | DEPTH_WRITE, 0, 0xff0000ff, -.5f);
@@ -45,12 +46,12 @@ final class GuiPassSmoke {
         image = ImageIO.read(fourth.toFile());
         near(image.getRGB(160, 240), 255, 0, 0, "Hand after GL blit");
         near(image.getRGB(480, 240), 0, 0, 255, "GUI clears hand depth");
-        if (backend.handPasses() != 1) throw new AssertionError("Hand did not draw directly into swapchain");
+        if (backend.handPasses() != beforeHand+1) throw new AssertionError("Hand did not draw directly into swapchain");
         if (backend.guiPasses() < 3) throw new AssertionError("GUI did not draw after blit");
         long[] bindings = backend.guiBindingStats();
         if (bindings[4] == 0) throw new AssertionError("Compatible adjacent GUI draws were not batched");
-        if (bindings[2] > 4) throw new AssertionError("Uniform descriptors were rewritten every frame");
-        if (backend.pushDescriptorsEnabled() && (bindings[0] > 4 || bindings[1] == 0 || bindings[2] > 4))
+        if (bindings[2]-beforeBindings[2] > 4) throw new AssertionError("Uniform descriptors were rewritten every frame");
+        if (backend.pushDescriptorsEnabled() && (bindings[0]-beforeBindings[0] > 4 || bindings[1] == 0 || bindings[2]-beforeBindings[2] > 4))
             throw new AssertionError("Vulkan 1.4 push descriptors / persistent uniform descriptors not exercised: " + java.util.Arrays.toString(bindings));
         System.out.println("GUI_BINDING_SMOKE=OK " + java.util.Arrays.toString(bindings));
         System.out.println("GUI_SWAPCHAIN_SMOKE=OK (alpha, scissor, depth, depth clear, incremental texture patch, direct hand, no world renderer)");

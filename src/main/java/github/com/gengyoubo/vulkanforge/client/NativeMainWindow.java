@@ -24,9 +24,10 @@ public final class NativeMainWindow {
     private static URLClassLoader loader;
     private static Object backend;
     private static boolean revealed;
+    private static long skippedScreenBlits;
     private static Method present, beginFrame, setVsync, frames, generations, capture, close, earlyAcquires, lateAcquires;
     private static Method hand, handPasses;
-    private static Method nativeComposite, nativePost;
+    private static Method nativeComposite, nativePost, createRenderTarget, destroyRenderTarget, renderTargetStats, presentationStats;
     private static Method renderWorld, renderWorldWithSky, worldStats, finishWorldFrame, closeWorld, renderOverlay, finishOverlay, entityTexture, entityTexturePatch, gui, guiPasses, optimizationStats, uploadStats, tryWorldCommand, memoryStats, guiBindingStats;
     private static Consumer<Object[]> worldCommands;
 
@@ -66,6 +67,13 @@ public final class NativeMainWindow {
             nativeComposite=type.getMethod("nativeComposite",int.class,int.class,int.class,int.class,Object[].class);
             // Optional until the backend implements it; PostEffects falls back to vanilla post passes on false.
             try { nativePost = type.getMethod("nativePost", Object[].class); } catch (NoSuchMethodException missing) { nativePost = null; }
+
+            nativePost=type.getMethod("nativePost",Object[].class);
+            createRenderTarget=type.getMethod("createRenderTarget",int.class,int.class,int.class);
+            destroyRenderTarget=type.getMethod("destroyRenderTarget",int.class);
+            renderTargetStats=type.getMethod("renderTargetStats");
+            presentationStats=type.getMethod("presentationStats");
+
             finishWorldFrame = type.getMethod("finishWorldFrame"); closeWorld = type.getMethod("closeWorld");
             renderOverlay = type.getMethod("renderOverlay", Object[].class, boolean.class); finishOverlay = type.getMethod("finishOverlay");
             memoryStats = type.getMethod("memoryStats"); guiBindingStats = type.getMethod("guiBindingStats");
@@ -153,6 +161,12 @@ public final class NativeMainWindow {
             LOGGER.info("Vulkan main window revealed after its first completed frame");
         }
     }
+    /** Minecraft's final blit would only draw into the hidden GL window; presentation consumes the target itself. */
+    public static void blitToScreen(com.mojang.blaze3d.pipeline.RenderTarget target, int width, int height) {
+        if (active() && target == Minecraft.getInstance().getMainRenderTarget()) { skippedScreenBlits++; return; }
+        target.blitToScreen(width, height);
+    }
+    static long skippedScreenBlits() { return skippedScreenBlits; }
 
     static long[] memoryStats() { return active() ? (long[]) call(memoryStats) : new long[5]; }
     static long[] guiBindingStats() { return active() ? (long[]) call(guiBindingStats) : new long[5]; }
@@ -174,9 +188,14 @@ public final class NativeMainWindow {
     static boolean nativeComposite(int kind,Object[] packets){
         if(!active())return false;
         if(kind==2&&packets.length>0&&((Object[])packets[0]).length>5){
-            java.util.Map<Integer,java.util.List<Object>> groups=new java.util.LinkedHashMap<>();java.util.Map<Integer,int[]> targets=new java.util.HashMap<>();
-            for(Object value:packets){Object[] packet=(Object[])value;int[] target=(int[])packet[5];groups.computeIfAbsent(target[0],key->new java.util.ArrayList<>()).add(packet);targets.put(target[0],target);}
-            for(var entry:groups.entrySet()){int[] target=targets.get(entry.getKey());if(!(Boolean)call(nativeComposite,target[0],target[1],target[2],kind,(Object)entry.getValue().toArray()))return false;}
+            // Only adjacent packets may be batched: A -> B -> A must preserve the two distinct writes to A.
+            int start=0;
+            while(start<packets.length){
+                int[] target=(int[])((Object[])packets[start])[5];int end=start+1;
+                while(end<packets.length&&java.util.Arrays.equals(target,(int[])((Object[])packets[end])[5]))end++;
+                if(!(Boolean)call(nativeComposite,target[0],target[1],target[2],kind,(Object)java.util.Arrays.copyOfRange(packets,start,end)))return false;
+                start=end;
+            }
             return true;
         }
         int[] viewport=new int[4];org.lwjgl.opengl.GL11.glGetIntegerv(org.lwjgl.opengl.GL11.GL_VIEWPORT,viewport);
@@ -184,6 +203,11 @@ public final class NativeMainWindow {
         return (Boolean)call(nativeComposite,framebuffer,viewport[2],viewport[3],kind,(Object)packets);
     }
     static boolean nativePost(Object[] pass) { return active() && nativePost != null && (Boolean) call(nativePost, (Object) pass); }
+    static boolean nativePost(Object[] packet) { return active() && (Boolean) call(nativePost, (Object) packet); }
+    static int[] createRenderTarget(int framebuffer, int width, int height) { return active() ? (int[]) call(createRenderTarget, framebuffer, width, height) : null; }
+    static void destroyRenderTarget(int framebuffer) { if (active()) call(destroyRenderTarget, framebuffer); }
+    static long[] renderTargetStats() { return active() ? (long[]) call(renderTargetStats) : new long[6]; }
+    static long[] presentationStats() { return active() ? (long[]) call(presentationStats) : new long[3]; }
     static boolean worldVisible() { return active() && GLFW.glfwGetWindowAttrib(mainWindow, GLFW.GLFW_ICONIFIED) == 0; }
     static long[] worldStats() { return active() ? (long[])call(worldStats) : new long[25]; }
     /** P7-P9: {color, depth} GL textures of one Vulkan overlay pass, or null; call finishOverlay() right after compositing. */
@@ -212,11 +236,11 @@ public final class NativeMainWindow {
     }
     private static Throwable cause(Throwable error) { return error instanceof InvocationTargetException && error.getCause() != null ? error.getCause() : error; }
     private static void releaseBackend() {
-        try { if (backend != null) { if (close != null) close.invoke(backend); else ((AutoCloseable) backend).close(); } }
+        try { NativeRenderTargets.shutdown(); if (backend != null) { if (close != null) close.invoke(backend); else ((AutoCloseable) backend).close(); } }
         catch (Throwable error) { LOGGER.error("Could not close Vulkan main-window resources", cause(error)); }
         finally {
             backend = null; present = beginFrame = setVsync = frames = generations = capture = close = earlyAcquires = lateAcquires = null;
-            hand = handPasses = nativeComposite = nativePost = null;
+            hand = handPasses = nativeComposite = nativePost = createRenderTarget = destroyRenderTarget = renderTargetStats = presentationStats = null;
             renderWorld = renderWorldWithSky = worldStats = finishWorldFrame = closeWorld = renderOverlay = finishOverlay = entityTexture = entityTexturePatch = gui = guiPasses = optimizationStats = uploadStats = tryWorldCommand = memoryStats = guiBindingStats = null; worldCommands = null;
             try { if (loader != null) loader.close(); } catch (Exception error) { LOGGER.warn("Could not close backend loader", error); }
             loader = null;

@@ -4,5 +4,6 @@
   "vulkanforge_entities": "coremods/entities.js",
   "vulkanforge_block_entities": "coremods/block_entities.js",
   "vulkanforge_textures": "coremods/textures.js",
-  "vulkanforge_post": "coremods/post.js"
+  "vulkanforge_post": "coremods/post.js",
+  "vulkanforge_render_targets": "coremods/render_targets.js"
 }

@@ -36,6 +36,7 @@ public final class NativePresentSmoke {
             visible = glfwCreateWindow(640, 480, "VulkanForge main-window presentation check", 0, 0);
             if (visible == 0 || glfwGetWindowAttrib(visible, GLFW_CLIENT_API) != GLFW_NO_API) throw new AssertionError("Visible window must be GLFW_NO_API");
             long hwnd = glfwGetWin32Window(visible); backend.attach(hwnd, GlInterop.windowInstance(hwnd));
+            SharedSourcePresentSmoke.run(backend, visible, output, failurePhase);
             texture = glGenTextures(); glBindTexture(GL_TEXTURE_2D, texture);
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 320, 240, 0, GL_RGBA, GL_UNSIGNED_BYTE, (java.nio.ByteBuffer)null);
             source = glGenFramebuffers(); glBindFramebuffer(GL_FRAMEBUFFER, source);
@@ -93,10 +94,11 @@ public final class NativePresentSmoke {
             boolean timing = backend.gpuTimingsEnabled();
             GuiPassSmoke.run(backend, source, output);
             SharedWorldSmoke.run(backend);
+            SharedTargetsSmoke.run(backend);
             backend.beginFrame(640, 480); // Closing must consume this acquired-but-unsubmitted frame.
             backend.close();
             if (backend.validationErrors() != 0) throw new AssertionError("Vulkan validation errors: " + backend.validationErrors());
-            if (timing && (backend.gpuTimingSamples(0) != backend.frames() || backend.gpuTimingSamples(1) != backend.frames()))
+            if (timing && (backend.gpuTimingSamples(0) + backend.gpuTimingSamples(2) != backend.frames() || backend.gpuTimingSamples(1) != backend.frames()))
                 throw new AssertionError("GPU samples lost or unsubmitted frames counted: " + backend.gpuTimingSamples(0) + "/" + backend.gpuTimingSamples(1));
             System.out.println("PRESENT_SMOKE=OK frames=" + backend.frames() + " generations=" + backend.generations() + " fullscreen=" + fullscreen[0] + "x" + fullscreen[1]
                     + " (RGBA orientation, fresh moving pixels, GPU interop, resize, fullscreen round trip, vsync, zero extent, GPU timestamps and failure recovery)");

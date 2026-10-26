@@ -27,12 +27,14 @@ public final class MainWindowBackend implements AutoCloseable {
     private long swapchain, pool;
     private long[] images = new long[0], views = new long[0], finished = new long[0];
     private GuiPass gui;
+    private PresentPass scenePresent;
     private final java.util.Map<Integer, Object[]> mirroredTextures = new java.util.HashMap<>();
     private java.util.List<Object[]> guiPackets = java.util.List.of();
     private java.util.List<Object[]> handPackets = java.util.List.of();
     private int width, height, format, generations, requestedWidth, requestedHeight;
     private long graphPasses, graphBarriers;
     private long frames, skippedExtents, abandonedFrames;
+    private long directSourceFrames, copiedSourceFrames, compatibilityImages;
     private long earlyAcquires, lateAcquires, cancelledAcquires, acquireNanos, maxAcquireNanos;
     private long fenceWaitNanos, maxFenceWaitNanos, presentNanos, maxPresentNanos;
     private boolean dirty = true, vsync = true;
@@ -40,6 +42,7 @@ public final class MainWindowBackend implements AutoCloseable {
     private PrintWriter report;
     private GpuTimers timers;
     private SharedWorldRenderer world;
+    private SharedRenderTargets renderTargets;
     private Function<long[], Consumer<int[]>> terrainImporter;
     private final Function<long[], Consumer<int[]>> importer;
     private final Runnable finishGL;
@@ -54,7 +57,7 @@ public final class MainWindowBackend implements AutoCloseable {
                 log("DEVICE_CAPABILITIES=" + context.capabilities);
                 log("PUSH_DESCRIPTOR_AVAILABLE=" + (context.pushDescriptors ? context.pushDescriptorCore ? "VULKAN14_CORE" : "KHR_ALIAS" : "NONE"));
                 log("ENTITY_DESCRIPTOR_MODE=" + (Boolean.getBoolean("vulkanforge.preferPushDescriptors") && context.pushDescriptors ? "PUSH" : "CACHED_SET"));
-                timers = new GpuTimers(context, FRAMES_IN_FLIGHT, this::log, "COPY", "PRESENT_PREPARE");
+                timers = new GpuTimers(context, FRAMES_IN_FLIGHT, this::log, "COPY", "PRESENT_PREPARE", "PRESENT_SCENE");
                 log("VALIDATION=" + (context.validationEnabled() ? "ENABLED" : "UNAVAILABLE"));
                 log("SYNC_VALIDATION_REQUESTED=" + "1".equals(System.getenv("VK_VALIDATION_VALIDATE_SYNC")));
                 verifyInterop(stack);
@@ -96,6 +99,8 @@ public final class MainWindowBackend implements AutoCloseable {
     public void attach(long hwnd, long hinstance) { context.attachWin32(hwnd, hinstance); log("MAIN_HWND=" + Long.toUnsignedString(hwnd)); log("SURFACE_CREATED=true"); }
     public void prepare(int width, int height) { if (width > 0 && height > 0) recreate(width, height); }
     public long frames() { return frames; }
+    /** {frames sampling existing targets, frames copying GL targets, allocated compatibility images}. */
+    public long[] presentationStats() { return new long[]{directSourceFrames, copiedSourceFrames, compatibilityImages}; }
     public int generations() { return generations; }
     public long earlyAcquires() { return earlyAcquires; }
     public long lateAcquires() { return lateAcquires; }
@@ -131,7 +136,7 @@ public final class MainWindowBackend implements AutoCloseable {
     private SharedWorldRenderer world() {
         if (world == null) {
             if (terrainImporter == null) throw new IllegalStateException("Missing host GL terrain importer");
-            world = new SharedWorldRenderer(context, terrainImporter, finishGL, this::log);
+            world = new SharedWorldRenderer(context, terrainImporter, finishGL, this::log, targets());
             for (Object[] t : mirroredTextures.values()) world.entityTexture((Integer) t[0], (Integer) t[1], (Integer) t[2], (Integer) t[3], (byte[]) t[4]);
         }
         return world;
@@ -151,6 +156,14 @@ public final class MainWindowBackend implements AutoCloseable {
         var list=new java.util.ArrayList<Object[]>();for(Object packet:packets)list.add((Object[])packet);
         return world.composeNative(framebuffer,width,height,kind,list);
     }
+    private SharedRenderTargets targets() {
+        if (renderTargets == null) renderTargets = new SharedRenderTargets(context, terrainImporter, finishGL, this::log);
+        return renderTargets;
+    }
+    public int[] createRenderTarget(int framebuffer, int width, int height) { return targets().create(framebuffer, width, height); }
+    public void destroyRenderTarget(int framebuffer) { if (renderTargets != null) renderTargets.destroy(framebuffer); }
+    public long[] renderTargetStats() { return renderTargets == null ? new long[6] : renderTargets.stats(); }
+    public boolean nativePost(Object[] packet) { return world != null && world.postNative(packet); }
     /** Captured GUI packets, consumed exactly once by the next present (including skipped/minimized frames). */
     public void gui(Object[] packets) {
         var list = new java.util.ArrayList<Object[]>(packets.length);
@@ -239,24 +252,42 @@ public final class MainWindowBackend implements AutoCloseable {
         int timerSlot = (int)(frames % slots.length);
         long fence = slot.fence, acquired = slot.acquired;
         VkCommandBuffer command = slot.command;
-        SharedPresentImage shared = slot.shared;
+        final SharedRenderTargets.Target directSource = renderTargets == null || Boolean.getBoolean("vulkanforge.legacyPresent")
+                ? null : renderTargets.get(sourceFramebuffer, sourceWidth, sourceHeight);
         try (MemoryStack stack = MemoryStack.stackPush()) {
             var index = stack.ints(slot.imageIndex);
             int acquiredResult = slot.acquireResult, image = slot.imageIndex;
             CaptureBuffer proof = null;
-            boolean submitted = false;
+            boolean submitted = false, sourceReleased = false;
             try {
-                shared.copyFromGL(sourceFramebuffer, sourceWidth, sourceHeight);
+                SharedPresentImage shared;
+                if (directSource != null) {
+                    directSource.releaseGL(); sourceReleased = true; shared = directSource.color;
+                } else {
+                    shared = compatibilitySource(slot, stack);
+                    shared.copyFromGL(sourceFramebuffer, sourceWidth, sourceHeight);
+                }
                 check(vkResetCommandBuffer(command, 0), "reset presentation command");
                 check(vkBeginCommandBuffer(command, VkCommandBufferBeginInfo.calloc(stack).sType$Default().flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)), "begin presentation command");
                 timers.begin(command, timerSlot);
                 // Imported ownership and per-pass usages generate the synchronization2 barriers.
                 var graph = new FrameGraph();
-                var source = new FrameGraph.Image("GL framebuffer", shared.image, VK_IMAGE_ASPECT_COLOR_BIT,
-                        new FrameGraph.State(VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_BLIT_BIT, 0, VK_QUEUE_FAMILY_EXTERNAL));
+                long sourceStage = directSource != null ? VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT : VK_PIPELINE_STAGE_2_BLIT_BIT;
+                long targetStage = directSource != null ? VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_2_BLIT_BIT;
+                var source = new FrameGraph.Image("Scene source", shared.image, VK_IMAGE_ASPECT_COLOR_BIT,
+                        new FrameGraph.State(VK_IMAGE_LAYOUT_GENERAL, sourceStage, 0, VK_QUEUE_FAMILY_EXTERNAL));
+                var sourceDepth = directSource == null ? null : new FrameGraph.Image("Shared scene depth", directSource.depth.image, VK_IMAGE_ASPECT_DEPTH_BIT,
+                        new FrameGraph.State(VK_IMAGE_LAYOUT_GENERAL, sourceStage, 0, VK_QUEUE_FAMILY_EXTERNAL));
                 var target = new FrameGraph.Image("Swapchain", images[image], VK_IMAGE_ASPECT_COLOR_BIT,
-                        FrameGraph.state(VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_BLIT_BIT, 0));
-                graph.pass("GL blit", () -> {
+                        FrameGraph.state(VK_IMAGE_LAYOUT_UNDEFINED, targetStage, 0));
+                if (directSource != null) graph.pass("Scene composite", () -> {
+                    timers.start(command, timerSlot, 2, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+                    scenePresent.record(command, stack, timerSlot, shared.view(), views[image], width, height);
+                    timers.end(command, timerSlot, 2, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+                }, FrameGraph.use(source, new FrameGraph.State(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sourceStage, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, context.queueFamily)),
+                        FrameGraph.use(sourceDepth, new FrameGraph.State(VK_IMAGE_LAYOUT_GENERAL, sourceStage, 0, context.queueFamily)),
+                        FrameGraph.use(target, FrameGraph.state(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, targetStage, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT)));
+                else graph.pass("GL blit", () -> {
                     var blit = VkImageBlit.calloc(1, stack).srcSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1))
                             .dstSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1));
                     blit.srcOffsets(0).set(0, height, 0); blit.srcOffsets(1).set(width, 0, 1);
@@ -279,14 +310,16 @@ public final class MainWindowBackend implements AutoCloseable {
                 }
                 // Start before the terminal graph node so PRESENT_PREPARE includes the generated release barriers.
                 graph.pass("Present timer", () -> timers.start(command, timerSlot, 1, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT));
-                graph.pass("Present", java.util.List.of("Present timer"), () -> timers.end(command, timerSlot, 1, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT),
-                        FrameGraph.use(source, new FrameGraph.State(VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_QUEUE_FAMILY_EXTERNAL)),
-                        FrameGraph.use(target, FrameGraph.state(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_NONE, 0)));
+                var sourceRelease = FrameGraph.use(source, new FrameGraph.State(VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_QUEUE_FAMILY_EXTERNAL));
+                var presentTarget = FrameGraph.use(target, FrameGraph.state(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_NONE, 0));
+                FrameGraph.Use[] terminal = directSource == null ? new FrameGraph.Use[]{sourceRelease, presentTarget}
+                        : new FrameGraph.Use[]{sourceRelease, presentTarget, FrameGraph.use(sourceDepth, new FrameGraph.State(VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_QUEUE_FAMILY_EXTERNAL))};
+                graph.pass("Present", java.util.List.of("Present timer"), () -> timers.end(command, timerSlot, 1, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT), terminal);
                 graphBarriers += graph.execute(command, stack); graphPasses += graph.schedule().size();
                 check(vkEndCommandBuffer(command), "end presentation command");
                 var waits = VkSemaphoreSubmitInfo.calloc(2, stack);
-                waits.get(0).sType$Default().semaphore(acquired).stageMask(VK_PIPELINE_STAGE_2_BLIT_BIT);
-                waits.get(1).sType$Default().semaphore(shared.complete).stageMask(VK_PIPELINE_STAGE_2_BLIT_BIT);
+                waits.get(0).sType$Default().semaphore(acquired).stageMask(targetStage);
+                waits.get(1).sType$Default().semaphore(shared.complete).stageMask(sourceStage);
                 var signals = VkSemaphoreSubmitInfo.calloc(2, stack);
                 signals.get(0).sType$Default().semaphore(finished[image]).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
                 signals.get(1).sType$Default().semaphore(shared.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
@@ -297,8 +330,14 @@ public final class MainWindowBackend implements AutoCloseable {
                 timers.submitted(timerSlot);
                 slot.imageIndex = -1;
                 submitted = true;
+                if (directSource != null) directSource.acquireGL();
             } finally {
-                if (!submitted) { if (proof != null) proof.close(); abandon(slot); }
+                if (!submitted) {
+                    try {
+                        if (proof != null) proof.close();
+                        if (sourceReleased) restoreUnsubmittedSource(directSource, stack);
+                    } finally { abandon(slot); }
+                }
             }
             long start = System.nanoTime();
             int result = vkQueuePresentKHR(context.queue, VkPresentInfoKHR.calloc(stack).sType$Default().pWaitSemaphores(stack.longs(finished[image]))
@@ -307,6 +346,7 @@ public final class MainWindowBackend implements AutoCloseable {
             if (result != VK_SUCCESS && result != VK_ERROR_OUT_OF_DATE_KHR && result != VK_SUBOPTIMAL_KHR) check(result, "vkQueuePresentKHR(main window)");
             if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR || acquiredResult == VK_SUBOPTIMAL_KHR) dirty = true;
             frames++;
+            if (directSource != null) directSourceFrames++; else copiedSourceFrames++;
             if (frames == 1) check(vkWaitForFences(context.device, fence, true, 5_000_000_000L), "wait first visible frame");
             if (proof != null) {
                 try { check(vkWaitForFences(context.device, fence, true, 5_000_000_000L), "wait swapchain capture"); proof.save(capture, width, height, format); }
@@ -314,6 +354,36 @@ public final class MainWindowBackend implements AutoCloseable {
             }
             if (frames == 1 || frames % 300 == 0) { log("PRESENTED_FRAMES=" + frames); timers.report(this::log); }
         }
+    }
+
+    /** Only a non-shared source needs a second exported color image. Allocate it on its first compatibility frame. */
+    private SharedPresentImage compatibilitySource(FrameSlot slot, MemoryStack stack) {
+        if (slot.shared != null) return slot.shared;
+        SharedPresentImage shared = new SharedPresentImage(context, width, height, importer);
+        try {
+            var command = slot.command;
+            check(vkResetCommandBuffer(command, 0), "reset compatibility initializer");
+            check(vkBeginCommandBuffer(command, VkCommandBufferBeginInfo.calloc(stack).sType$Default()), "begin compatibility initializer");
+            var barrier = VkImageMemoryBarrier2.calloc(1, stack).sType$Default().srcStageMask(VK_PIPELINE_STAGE_2_NONE).dstStageMask(VK_PIPELINE_STAGE_2_NONE)
+                    .oldLayout(VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK_IMAGE_LAYOUT_GENERAL).srcQueueFamilyIndex(context.queueFamily).dstQueueFamilyIndex(VK_QUEUE_FAMILY_EXTERNAL)
+                    .image(shared.image).subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
+            vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barrier));
+            check(vkEndCommandBuffer(command), "end compatibility initializer");
+            check(vkQueueSubmit2(context.queue, VkSubmitInfo2.calloc(1, stack).sType$Default()
+                    .pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1, stack).sType$Default().commandBuffer(command))
+                    .pSignalSemaphoreInfos(VkSemaphoreSubmitInfo.calloc(1, stack).sType$Default().semaphore(shared.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT)), 0), "initialize compatibility ownership");
+            check(vkQueueWaitIdle(context.queue), "wait compatibility initializer");
+            slot.shared = shared; compatibilityImages++;
+            return shared;
+        } catch (Throwable error) { vkQueueWaitIdle(context.queue); shared.close(); throw error; }
+    }
+
+    /** No command was submitted, so GL still owns GENERAL images. Consume its signal and restore its lease. */
+    private void restoreUnsubmittedSource(SharedRenderTargets.Target source, MemoryStack stack) {
+        check(vkQueueSubmit2(context.queue, VkSubmitInfo2.calloc(1, stack).sType$Default()
+                .pWaitSemaphoreInfos(VkSemaphoreSubmitInfo.calloc(1, stack).sType$Default().semaphore(source.color.complete).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT))
+                .pSignalSemaphoreInfos(VkSemaphoreSubmitInfo.calloc(1, stack).sType$Default().semaphore(source.color.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT)), 0), "restore unsubmitted presentation source");
+        source.acquireGL();
     }
 
     private boolean recreate(int requestedWidth, int requestedHeight) {
@@ -357,6 +427,7 @@ public final class MainWindowBackend implements AutoCloseable {
             check(vkGetSwapchainImagesKHR(context.device, swapchain, count, null), "swapchain images");
             var handles = stack.mallocLong(count.get(0)); check(vkGetSwapchainImagesKHR(context.device, swapchain, count, handles), "swapchain images");
             if (gui == null) gui = new GuiPass(context, format);
+            scenePresent = new PresentPass(context, format);
             images = new long[count.get(0)]; views = new long[images.length]; finished = new long[images.length];
             for (int i = 0; i < images.length; i++) { images[i] = handles.get(i); check(vkCreateSemaphore(context.device, VkSemaphoreCreateInfo.calloc(stack).sType$Default(), null, handle), "present image semaphore"); finished[i] = handle.get(0); }
             for (int i = 0; i < images.length; i++) {
@@ -364,22 +435,6 @@ public final class MainWindowBackend implements AutoCloseable {
                         .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
                 check(vkCreateImageView(context.device, view, null, handle), "GUI swapchain view"); views[i] = handle.get(0);
             }
-            for (FrameSlot slot : slots) slot.shared = new SharedPresentImage(context, width, height, importer);
-            VkCommandBuffer command = slots[0].command;
-            check(vkResetCommandBuffer(command, 0), "reset interop initializer");
-            check(vkBeginCommandBuffer(command, VkCommandBufferBeginInfo.calloc(stack).sType$Default()), "begin interop initializer");
-            var barrier = VkImageMemoryBarrier2.calloc(slots.length, stack);
-            var signals = stack.mallocLong(slots.length);
-            for (int i = 0; i < slots.length; i++) {
-                barrier.get(i).sType$Default().srcStageMask(VK_PIPELINE_STAGE_2_NONE).dstStageMask(VK_PIPELINE_STAGE_2_NONE)
-                        .oldLayout(VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK_IMAGE_LAYOUT_GENERAL).srcQueueFamilyIndex(context.queueFamily).dstQueueFamilyIndex(VK_QUEUE_FAMILY_EXTERNAL)
-                        .image(slots[i].shared.image).subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
-                signals.put(i, slots[i].shared.ready);
-            }
-            vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barrier));
-            check(vkEndCommandBuffer(command), "end interop initializer");
-            check(vkQueueSubmit(context.queue, VkSubmitInfo.calloc(stack).sType$Default().pCommandBuffers(stack.pointers(command.address())).pSignalSemaphores(signals), 0), "initialize GL ownership");
-            check(vkQueueWaitIdle(context.queue), "wait GL ownership initializer");
             generations++; dirty = false;
             log("SWAPCHAIN[" + generations + "]=" + width + "x" + height + " format=" + format + " mode=" + mode
                     + " (" + (mode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "IMMEDIATE" : "FIFO") + ") images=" + images.length);
@@ -423,6 +478,7 @@ public final class MainWindowBackend implements AutoCloseable {
         }
     }
     private void destroySwapchain() {
+        if (scenePresent != null) { scenePresent.close(); scenePresent = null; }
         for (FrameSlot slot : slots) if (slot.shared != null) { slot.shared.close(); slot.shared = null; }
         for (long view : views) if (view != 0) vkDestroyImageView(context.device, view, null);
         views = new long[0];
@@ -433,6 +489,7 @@ public final class MainWindowBackend implements AutoCloseable {
     @Override public void close() {
         if (context.device != null) {
             closeWorld();
+            if (renderTargets != null) { renderTargets.close(); renderTargets = null; }
             finishGL.run(); drainAcquired(); check(vkDeviceWaitIdle(context.device), "wait presentation shutdown");
             if (timers != null) { timers.collectAll(); timers.report(this::log); timers.close(); }
             if (gui != null) { log("GUI_SWAPCHAIN_PASSES=" + gui.passes()); log("HAND_SWAPCHAIN_PASSES=" + gui.handPasses()); log("GUI_BINDINGS=" + java.util.Arrays.toString(gui.bindingStats())); gui.close(); gui = null; }
@@ -451,6 +508,7 @@ public final class MainWindowBackend implements AutoCloseable {
         log("ACQUIRES_BEFORE_INPUT=" + earlyAcquires); log("ACQUIRES_AFTER_RENDER=" + lateAcquires); log("CANCELLED_ACQUIRES=" + cancelledAcquires);
         if (skippedExtents > 0 || abandonedFrames > 0) log("ZERO_EXTENT_FRAMES=" + skippedExtents + " ABANDONED_FRAMES=" + abandonedFrames);
         log("PRESENT_GRAPH passes=" + graphPasses + " imageBarriers=" + graphBarriers);
+        log("PRESENT_SOURCE=[directFrames,copiedFrames,compatibilityImages] " + java.util.Arrays.toString(presentationStats()));
         if (context.uploads != null) log("ASYNC_UPLOADS=" + java.util.Arrays.toString(context.uploads.stats()));
         if (context.memory != null) log("GPU_MEMORY=" + java.util.Arrays.toString(context.memory.stats()));
         context.close(); log("FINAL_PRESENTED_FRAMES=" + frames); log("VALIDATION_ERRORS=" + context.validationErrors());

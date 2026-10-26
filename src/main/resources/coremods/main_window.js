@@ -52,6 +52,24 @@ function initializeCoreMod() {
             'transformer': function(node) {
                 return redirect(node, [{owner: glfw, name: 'glfwSwapBuffers', desc: '(J)V', to: 'swapBuffers'}]);
             }
+        },
+        'vulkanforge_screen_blit': {
+            'target': { 'type': 'CLASS', 'name': 'net.minecraft.client.Minecraft' },
+            'transformer': function(node) {
+                var count = 0;
+                for (var m = 0; m < node.methods.size(); m++) {
+                    var method = node.methods.get(m), insns = method.instructions.toArray();
+                    for (var i = 0; i < insns.length; i++) {
+                        var insn = insns[i];
+                        if (!(insn instanceof MethodInsnNode) || insn.getOpcode() !== Opcodes.INVOKEVIRTUAL || insn.desc !== '(II)V') continue;
+                        if (insn.owner !== 'com/mojang/blaze3d/pipeline/RenderTarget' && insn.owner !== 'com/mojang/blaze3d/pipeline/MainTarget') continue;
+                        method.instructions.set(insn, new MethodInsnNode(Opcodes.INVOKESTATIC, hook, 'blitToScreen',
+                                '(Lcom/mojang/blaze3d/pipeline/RenderTarget;II)V', false)); count++;
+                    }
+                }
+                if (count !== 1) throw new Error('VulkanForge screen blit ASM expected one call, found ' + count);
+                return node;
+            }
         }
     };
 }

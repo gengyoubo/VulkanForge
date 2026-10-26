@@ -131,7 +131,7 @@ public final class GuiDraws {
         return result.flip();
     }
 
-    /** Called before the GL framebuffer is copied. Successful GUI frames never draw into a GL target. */
+    /** Called before final presentation samples the scene. Successful GUI frames never draw into a GL target. */
     static Object[] take() {
         Object[] packets = pending.stream().map(Draw::packet).toArray();
         if (packets.length > 0) { draws += pending.stream().filter(draw -> draw.format != null).count(); frames++; }

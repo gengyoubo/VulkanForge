@@ -7,7 +7,7 @@ import static github.com.gengyoubo.vulkanforge.lab.VulkanContext.check;
 import static org.lwjgl.vulkan.VK10.*;
 import static org.lwjgl.vulkan.VK13.*;
 
-/** Hand then GUI draw into the acquired swapchain image after GL blit, with independent depth and presentation-owned textures. */
+/** Hand then GUI draw after the scene pass, with independent depth and presentation-owned textures. */
 final class GuiPass implements AutoCloseable {
     private final VulkanContext context;
     private final EntityPass draws;
