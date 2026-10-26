@@ -29,6 +29,7 @@ public final class MainWindowBackend implements AutoCloseable {
     private GuiPass gui;
     private final java.util.Map<Integer, Object[]> mirroredTextures = new java.util.HashMap<>();
     private java.util.List<Object[]> guiPackets = java.util.List.of();
+    private java.util.List<Object[]> handPackets = java.util.List.of();
     private int width, height, format, generations, requestedWidth, requestedHeight;
     private long graphPasses, graphBarriers;
     private long frames, skippedExtents, abandonedFrames;
@@ -110,15 +111,22 @@ public final class MainWindowBackend implements AutoCloseable {
 
     public Consumer<Object[]> worldCommands(Function<long[], Consumer<int[]>> terrainImporter) {
         this.terrainImporter = terrainImporter;
-        return packet -> world().apply(dev.vulkanforge.bridge.WorldProtocol.unpack(packet));
+        return packet -> applyWorld(dev.vulkanforge.bridge.WorldProtocol.unpack(packet));
+    }
+    private void applyWorld(dev.vulkanforge.bridge.WorldProtocol.Command command) {
+        var renderer = world(); renderer.apply(command);
+        if (gui != null && command.epoch() == renderer.epoch() && command instanceof dev.vulkanforge.bridge.WorldProtocol.TexturePatch patch
+                && patch.target() == dev.vulkanforge.bridge.WorldProtocol.LIGHT_MAP) gui.lightmap(patch.rgba());
     }
     public boolean tryWorldCommand(Object[] packet) {
         var command = dev.vulkanforge.bridge.WorldProtocol.unpack(packet);
         int count = 0; long bytes = 0;
-        if (command instanceof dev.vulkanforge.bridge.WorldProtocol.TexturePatch patch) { count = 1; bytes = patch.rgba().length; }
+        if (command instanceof dev.vulkanforge.bridge.WorldProtocol.TexturePatch patch) {
+            count = patch.target() == dev.vulkanforge.bridge.WorldProtocol.LIGHT_MAP ? 2 : 1; bytes = (long) patch.rgba().length * count;
+        }
         if (command instanceof dev.vulkanforge.bridge.WorldProtocol.Mesh mesh && mesh.vertices().length > 0) { count = 2; bytes = mesh.vertices().length; }
         if (count > 0 && !context.uploads.available(count, bytes)) return false;
-        world().apply(command); return true;
+        applyWorld(command); return true;
     }
     private SharedWorldRenderer world() {
         if (world == null) {
@@ -144,6 +152,12 @@ public final class MainWindowBackend implements AutoCloseable {
     public long[] guiBindingStats() { return gui == null ? new long[5] : gui.bindingStats(); }
     public boolean pushDescriptorsEnabled() { return gui != null && gui.usesPushDescriptors(); }
     public long guiPasses() { return gui == null ? 0 : gui.passes(); }
+    public long handPasses() { return gui == null ? 0 : gui.handPasses(); }
+    public void hand(Object[] packets) {
+        var list = new java.util.ArrayList<Object[]>(packets.length);
+        for (Object packet : packets) list.add((Object[]) packet);
+        handPackets = list;
+    }
     public long[] worldStats() { return world == null ? new long[25] : world.stats(); }
     /** P7-P9: packets are EntityPass Object[]s; returns {color, depth} GL textures leased until finishOverlay, or null. */
     public int[] renderOverlay(Object[] packets) { return renderOverlay(packets, false); }
@@ -211,6 +225,7 @@ public final class MainWindowBackend implements AutoCloseable {
     public void present(int sourceFramebuffer, int sourceWidth, int sourceHeight, int framebufferWidth, int framebufferHeight) throws IOException {
         finishWorldFrame();
         var packets = guiPackets; guiPackets = java.util.List.of();
+        var held = handPackets; handPackets = java.util.List.of();
         if (!acquire(framebufferWidth, framebufferHeight, false)) return;
         FrameSlot slot = slots[(int)(frames % slots.length)];
         int timerSlot = (int)(frames % slots.length);
@@ -243,6 +258,9 @@ public final class MainWindowBackend implements AutoCloseable {
                     timers.end(command, timerSlot, 0, VK_PIPELINE_STAGE_2_BLIT_BIT);
                 }, FrameGraph.use(source, new FrameGraph.State(VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, context.queueFamily)),
                         FrameGraph.use(target, FrameGraph.state(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT)));
+                if (!held.isEmpty()) graph.pass("Hand", () -> gui.recordHand(command, stack, timerSlot, views[image], width, height, held),
+                        FrameGraph.use(target, FrameGraph.state(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT)));
                 if (!packets.isEmpty()) graph.pass("GUI", () -> gui.record(command, stack, timerSlot, views[image], width, height, packets),
                         FrameGraph.use(target, FrameGraph.state(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                                 VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT)));
@@ -409,7 +427,7 @@ public final class MainWindowBackend implements AutoCloseable {
             closeWorld();
             finishGL.run(); drainAcquired(); check(vkDeviceWaitIdle(context.device), "wait presentation shutdown");
             if (timers != null) { timers.collectAll(); timers.report(this::log); timers.close(); }
-            if (gui != null) { log("GUI_SWAPCHAIN_PASSES=" + gui.passes()); log("GUI_BINDINGS=" + java.util.Arrays.toString(gui.bindingStats())); gui.close(); gui = null; }
+            if (gui != null) { log("GUI_SWAPCHAIN_PASSES=" + gui.passes()); log("HAND_SWAPCHAIN_PASSES=" + gui.handPasses()); log("GUI_BINDINGS=" + java.util.Arrays.toString(gui.bindingStats())); gui.close(); gui = null; }
             destroySwapchain();
             if (pool != 0) { vkDestroyCommandPool(context.device, pool, null); pool = 0; }
             for (FrameSlot slot : slots) {

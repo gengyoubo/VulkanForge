@@ -5,11 +5,11 @@ Minecraft **1.20.1 / Forge 47.4.28 / Java 17** 客户端 Vulkan 渲染实验。
 当前已经打通四条路径：
 
 - 独立 Vulkan 1.4 窗口：交换链、动态渲染、缩放重建、三角形绘制。
-- Minecraft 主窗口呈现（Windows）：可见窗口使用 `GLFW_NO_API`，创建 Win32 Vulkan Surface / Swapchain；原版主 framebuffer 经共享 GPU 图像和跨 API 信号量交给 `vkQueuePresentKHR`，包含世界、手持物和 HUD。正常呈现过程不经过 CPU 像素读回。
+- Minecraft 主窗口呈现（Windows）：可见窗口使用 `GLFW_NO_API`，创建 Win32 Vulkan Surface / Swapchain；原版主 framebuffer 经共享 GPU 图像和跨 API 信号量交给 `vkQueuePresentKHR`，Vulkan 在最终图像中追加受支持的手持物和 HUD。正常呈现过程不经过 CPU 像素读回。
 - 游戏主窗口预览：同进程 Vulkan 绘制旋转三角形 → 导出共享 GPU 图像 → 原有 GL 上下文采样 → 主菜单 / HUD 显示。
 - 世界不透明和镂空方块：采集原版烘焙模型、贴图 UV、染色、环境遮蔽与光照坐标 → 分区顶点缓冲 → Vulkan 图集/光照图采样、相机变换、alpha 丢弃、D32 深度测试 → 在原版 cutout 阶段之后合成。
 
-**这是混合渲染原型。主窗口的最终呈现已交给 Vulkan；Windows 主窗口路径中的 WorldScene 已接入同一个 Vulkan 后端，solid、cutout、cutoutMipped 地形通过共享 GPU 纹理合成，正常地形帧不经过 CPU 像素读回或 FrameProtocol。** Vulkan 覆盖范围内的半透明方块与水也由 Vulkan 绘制（P6 第一步），常见实体、方块实体和告示牌文字（P7/P8）、粒子和雨雪（P9）以及云（P10）由 Vulkan 叠加层通道回放，天空在地形提交中由 Vulkan 先行绘制（P10）；范围外地形、Fabulous 模式下的半透明层、不支持的着色器仍在隐藏的 OpenGL 上下文中绘制。手持物通过带深度的 Vulkan 叠加层合成；受支持的 GUI/HUD 在 framebuffer blit 后直接画进 Swapchain（P11）。关闭主窗口 Vulkan 路径时保留旧的子进程读回预览作为兼容路径。
+**这是混合渲染原型。主窗口的最终呈现已交给 Vulkan；Windows 主窗口路径中的 WorldScene 已接入同一个 Vulkan 后端，solid、cutout、cutoutMipped 地形通过共享 GPU 纹理合成，正常地形帧不经过 CPU 像素读回或 FrameProtocol。** Vulkan 覆盖范围内的半透明方块与水也由 Vulkan 绘制（P6 第一步），常见实体、方块实体和告示牌文字（P7/P8）、粒子和雨雪（P9）以及云（P10）由 Vulkan 叠加层通道回放，天空在地形提交中由 Vulkan 先行绘制（P10）；范围外地形、Fabulous 模式下的半透明层、不支持的着色器仍在隐藏的 OpenGL 上下文中绘制。受支持的手持物与 GUI/HUD 在 framebuffer blit 后依次直接画进 Swapchain（P11），不再经 GL 合成。关闭主窗口 Vulkan 路径时保留旧的子进程读回预览作为兼容路径。
 
 ## 构建和启动
 
@@ -112,7 +112,7 @@ java -jar vulkan-lab/build/libs/vulkan-lab.jar --probe --require-validation
 
 普通 `build` 不要求 GPU 或 Vulkan 驱动。GPU 检查需要 Vulkan 1.4 硬件和驱动。日志中 `VALIDATION=UNAVAILABLE` 表示没有启用校验层；此时错误计数为零不代表通过了校验层检查。
 
-`-PvalidationSmoke` 要求主窗口校验层实际启用，并在客户端退出后检查 `VALIDATION=ENABLED`、`VALIDATION_ERRORS=0`、共享地形计时与完整关闭标记；兼容路径额外检查地形桥。检查缺少校验层或退出超时会失败。同进程检查核对后端 PID 等于游戏 PID、45 个分区和无地形子进程启动。`smokePresent` 额外检查 acquire 后取消帧、GL 交接前/后故障恢复，以及仍持有已 acquire 图像时的关闭。同步验证通过 `VK_VALIDATION_VALIDATE_SYNC=1` 开启，正式性能测量时应关闭校验层。
+`-PvalidationSmoke` 要求主窗口校验层实际启用，并在客户端退出后检查 `VALIDATION=ENABLED`、`VALIDATION_ERRORS=0`、共享地形计时与完整关闭标记；兼容路径额外检查地形桥。检查缺少校验层或退出超时会失败。同进程检查核对后端 PID 等于游戏 PID、复用原版网格、远处与垂直范围覆盖、渲染距离增减和无地形子进程启动。独立 GPU 像素测试仍使用固定 45 个非空分区。`smokePresent` 额外检查 acquire 后取消帧、GL 交接前/后故障恢复，以及仍持有已 acquire 图像时的关闭。同步验证通过 `VK_VALIDATION_VALIDATE_SYNC=1` 开启，正式性能测量时应关闭校验层。
 
 ## 半透明地形（P6 第一步）
 
@@ -178,9 +178,9 @@ Fabulous 图形模式会把半透明层画进独立目标供透明后处理链�
 
 ## 手持物与 GUI（P11）
 
-HAND 从 `AFTER_LEVEL` 到 `GameRenderer.render` 的 GUI 深度清除，复用实体捕获与带深度合成。GUI 则从第一次 GUI 深度清除捕获到 swap，包括 HUD、菜单、背包、加载界面和 toast；第二次清除（HUD → Screen）也记录为回放命令。支持 `GuiGraphics` blit、纯色/渐变、彩色和灰度字形、普通物品图标、scissor、准星反色和暗角乘法。
+HAND 从 `AFTER_LEVEL` 到 `GameRenderer.render` 的 GUI 深度清除，保存不可变实体绘制包，在最终 GL blit 之后直接画进 Swapchain，随后清除私有深度再画 GUI；不再增加一次世界叠加层提交或 Vulkan/GL 信号量往返。手持物光照图由最终呈现通道独立持有并随世界 lightmap 更新，避免世界重置早于呈现完成时销毁采样资源。GUI 则从第一次 GUI 深度清除捕获到 swap，包括 HUD、菜单、背包、加载界面和 toast；第二次清除（HUD → Screen）也记录为回放命令。支持 `GuiGraphics` blit、纯色/渐变、彩色和灰度字形、普通物品图标、scissor、准星反色和暗角乘法。
 
-`GuiPass` 在 GL framebuffer blit 之后直接向 Swapchain image view 动态渲染，使用每槽位私有深度；默认 fullbright 光照图为 16×16，支持原版 `(240,240)` 坐标。GUI 顶点/索引在捕获时复制，原版 BufferBuilder 批次立即释放。遇到暂未镜像的贴图、自定义着色器或不支持的状态时，按保存的状态和原顺序回放到 GL，该帧余下 GUI 继续由 GL 绘制。诊断截图使用 `captureNext` 的最终 Swapchain 截图；原版 F2 的 GL 截图会遗漏直接绘制的 GUI。
+`GuiPass` 在 GL framebuffer blit 之后直接向 Swapchain image view 动态渲染，使用每槽位私有深度；默认 fullbright 光照图为 16×16，支持原版 `(240,240)` 坐标。GUI 顶点/索引在捕获时复制，原版 BufferBuilder 批次立即释放。遇到暂未镜像的贴图、自定义着色器或不支持的状态时，按保存的状态和原顺序回放到 GL，该帧余下 GUI 继续由 GL 绘制；若手持物尚待交换链绘制，也先回放手持物、清深度，再回放 GUI。诊断截图使用 `captureNext` 的最终 Swapchain 截图；原版 F2 的 GL 截图会遗漏直接绘制的 GUI 和手持物。
 
 字体在 `FontTexture.add` 的实际字形上传后更新页版本；旧版本 PBO 快照不会使新字形提前进入 Vulkan。GL 仍异步读回整页，Vulkan 仅上传像素变化矩形，在 GPU 复制旧页后覆盖补丁；旧图像在上传与引用帧都结束后回收。GL 合成同时保存和恢复 `GlStateManager` 与 `BlendMode.lastApplied` 两层混合缓存。
 
@@ -192,14 +192,14 @@ HAND 从 `AFTER_LEVEL` 到 `GameRenderer.render` 的 GUI 深度清除，复用�
 | --- | --- | --- |
 | P0 异步上传 | 8 个 staging/command 槽位、32 MiB 在途预算、timeline 完成值；繁忙时交互更新延后重试，保留 dirty 状态和已完成网格 | GPU 队列被阻塞时不复用在途暂存数据、不阻塞更新入口 |
 | P0 Geometry Arena / 内存 | 不透明 Section 共用 device-local 顶点池；Buffer/普通图像在设备级内存块中分配、合并空闲范围，host-visible 内存块持久映射 | 扩容、替换、删除、范围复用、无重叠和完整回收 |
-| P0 采集与重建 | 每帧 1.5 ms 软预算；优先编辑、可见和附近分区，队列年龄防止饥饿；移动时更新候选缓存，取消过期任务；顶点转换也分帧；空分区可在同帧完成多个 | 快速移动、区块加载、资源重载、旧 epoch 结果丢弃 |
+| P0 采集与重建 | 复用原版 ChunkRenderDispatcher 成功提交的完整网格；每帧 1.5 ms 软预算转换/发布，优先编辑、可见和附近分区，队列年龄防止饥饿；取消过期转换 | 快速移动、区块加载、距离增减、资源重载、旧 epoch 结果丢弃 |
 | P1 GPU Driven | GPU 视锥测试、atomicAdd 压缩可见命令、GPU count；一次顶点池绑定和一次 `vkCmdDrawIndirectCount` 覆盖不透明 Section | 45 Section 像素、零可见数量、池扩容后几何保持正确 |
 | P1 实体 / GUI 批处理 | 相邻且 uniform、纹理、管线、裁剪完全相同的绘制合并；默认每槽位持久缓存纹理和 uniform Descriptor，保留 push 路径作 A/B | 绘制顺序、透明、深度清除、纹理版本和 Descriptor 生命周期 |
 | P1 GL / Vulkan 交接 | 地形四张图共用一对 semaphore；叠加层颜色/深度共用一对 semaphore；一次 GL wait/signal 包含该组所有纹理 | 所有权往返、独立窗口的深度顺序、多帧与关闭 |
 
-上传仍在同一图形队列，使用资源屏障保证后续绘制看到新数据。首次图集也通过异步 PBO 读回；完整图集替换、场景重置、缩放、关闭和非交互压力测试仍保留必要等待。内存池区分 Buffer 与 optimal image，遵守各资源的对齐和 mandatory dedicated allocation；跨 GL 的导出共享图像继续使用专用分配。单个模组模型或内存分配仍可能超过采集软预算。
+上传仍在同一图形队列，使用资源屏障保证后续绘制看到新数据。首次图集也通过异步 PBO 读回；完整图集替换、场景重置、缩放、关闭和非交互压力测试仍保留必要等待。内存池区分 Buffer 与 optimal image，遵守各资源的对齐和 mandatory dedicated allocation；跨 GL 的导出共享图像继续使用专用分配。内存分配与候选扫描仍可能超过软预算；方块模型不再由 WorldCapture 重建。
 
-`FrameGraph` 已接管最终呈现：`GL blit → GUI（可选）→ Capture（可选）→ Present`。图像使用声明生成读写依赖、稳定拓扑顺序、layout/队列所有权屏障，并拒绝未初始化读取、未知依赖和环。世界通道的跨提交同步仍由现有代码管理。
+`FrameGraph` 已接管最终呈现：`GL blit → Hand（可选）→ GUI（可选）→ Capture（可选）→ Present`。图像使用声明生成读写依赖、稳定拓扑顺序、layout/队列所有权屏障，并拒绝未初始化读取、未知依赖和环。世界通道的跨提交同步仍由现有代码管理。
 
 | Vulkan 1.4 功能 | 接入策略 |
 | --- | --- |
@@ -227,6 +227,24 @@ HAND 从 `AFTER_LEVEL` 到 `GameRenderer.render` 的 GUI 深度清除，复用�
 .\gradlew.bat -PvalidationSmoke -PworldSmoke runClient
 ```
 
+2026-10-26 本轮回归：资源压力、GPU Driven / push 与回退路径、世界和兼容桥像素检查、完整 Forge 场景及 `build` 均通过。新增远处/垂直 Section 覆盖、4→6→4 距离变化、退出世界缓存释放、手持物直画交换链及 GUI 回退顺序检查。主窗口启用 Khronos 与同步校验，完成 12978 帧呈现，`VALIDATION_ERRORS=0`；5485 次异步上传背压等待为零。手持物光照图按版本绑定后，同一回归流程的 uniform Descriptor 更新从 1928 次降至 6 次；这是缓存工作量计数，不代表 FPS 提升。报告位于 `run/logs/vulkanforge/world-client-smoke/report.txt` 与 `run/logs/vulkanforge/main-window-report.txt`。
+
+## 减少 OpenGL 依赖
+
+| 优先级 | 路径 | 当前状态 |
+| --- | --- | --- |
+| P0 | 覆盖范围外地形 | 已取消固定相机立方体；使用实际 ViewArea 的水平距离与全部垂直层，逐步上传原版已经编译的非空 Section |
+| P0 | Vulkan 结果的 GL 合成 | 手持物已迁到最终交换链，与 GUI 共用呈现提交；地形、实体、透明与天气的中途 GL 深度合成仍保留 |
+| P1 | 重复区块构建 | 已复用原版上传前网格，保留原版构建调度；Vulkan 转换/发布在单独的有界帧预算内推进 |
+| P1 | 图集、光照、实体纹理 | 仍使用异步 PBO 镜像；后续从 CPU 上传源接入，保留无法捕获上传源时的读回 |
+| P1 | 特殊 RenderType / Glint / 阴影 | 继续逐项移植，当前不支持的状态仍走 GL |
+| P2 | 裂纹、轮廓、特效、Fabulous 和后处理 | 后续增加对应 Vulkan Pass，保持原版顺序和深度语义 |
+| P2 / 长期 | 自定义 Shader、独立渲染器、GL 资源生命周期 | 通用捕获兼容与专用适配并行，逐步替换资源所有者 |
+
+网格快照只从成功的原版 RebuildTask 提交取得；index-only 半透明排序不会误当作顶点更新。原版 RenderChunk 池换坐标、ViewArea 重建/释放、世界切换都会淘汰旧数据。GL 跳过绘制前同时核对原版 compiled 对象、Section 坐标和 Vulkan 已接纳的快照，未接纳的 Section 继续由 GL 绘制。CPU 上传副本缓存限额 128 MiB，已发布网格逻辑预算 192 MiB，最多 65534 个非空 Section；超过限制的部分保持 GL 路径，不能据此宣称所有场景已完全脱离 GL。缓存快照和转换输出有独立的生命周期，预算不等于进程总内存上限。
+
+Forge 检查使用远处标记方块、旧范围之外的底层地形，以及 4→6→4 渲染距离变化验证覆盖；已接管数量只统计非空 Section，不能与早期包含空分区的固定 45 个计数直接比较。`nativeMeshStats` 为 `[copies, successfulCommits, missingSnapshots, indexOnlyUpdates, cachedRawBytes, viewAreaSections, readySnapshots]`。最终呈现报告增加 `HAND_SWAPCHAIN_PASSES`。
+
 ## 接入结构
 
 - `src/main/java/github/com/gengyoubo/vulkanforge/client/ClientEvents.java`：Forge 生命周期、世界/屏幕/HUD 事件、按键。
@@ -235,7 +253,7 @@ HAND 从 `AFTER_LEVEL` 到 `GameRenderer.render` 的 GUI 深度清除，复用�
 - `gl-interop/` / `GlInterop`：所有 GL memory object、framebuffer、semaphore 和 blit 调用都在游戏现有的 LWJGL 中完成，通过 JDK 回调供 Vulkan 后端使用；不在游戏线程上加载第二套 GL 绑定或切换不同版本的 GL 调度表。实验模块复用源码，独立测试时编译到其自己的 LWJGL 版本。
 - `MainWindowBackend` / `SharedPresentImage`：Win32 Surface、GPU UUID 匹配、专用导出图像、GL memory object / semaphore 导入、显式队列所有权转换、Y 翻转、Swapchain acquire/submit/present、缩放和退出释放。正常帧无 CPU 像素拷贝；显式请求截图时才读回 Swapchain。
 - `SharedWorldRenderer`：同一个 VkDevice/队列内的 WorldScene、双缓冲共享地形颜色图像及独立深度、GPU 时间戳和 GL 采样生命周期。
-- `WorldCapture`：相机附近 **3×3×5 个 16³ 分区**，按每帧 1.5 ms 软预算推进；候选列表在跨分区移动时更新，模型采集和最终顶点转换可跨多个渲染帧，只有网格变化才发送。移动时增删分区，世界/维度切换和资源重载时取消未完成采集并重置场景。单个模组模型和最终字节转换仍可能超过预算，因此不保证严格的耗时上限。
+- `TerrainMeshes` / `WorldCapture`：在原版 Section 上传前复制不可变 BLOCK 顶点，在 RebuildTask 成功提交后才发布完整多层快照；不再重复遍历方块、调用模型或构建流体。覆盖跟随原版 ViewArea 的渲染距离与全部世界高度，原版遮挡/构建调度继续决定哪些网格可用。1.5 ms 软预算分帧转换、异步上传；未完成、过期、超预算或不支持的网格保持 GL 绘制。
 - `TerrainPresenter`：在 cutout 阶段后合成 Vulkan 颜色，保留原版 GL 深度，后续原版渲染继续执行；恢复改动的 GL 状态。
 - `TextureCapture`：首次读取方块图集；后续方块图集和 16×16 光照图使用可复用 PBO / GL fence 异步读回，零超时轮询，完成后才映射。每 100 ms 请求检查一次变化，图集按 32×32 区域轮询，每次最多发送 8 个变化区域；队列满时保留差异以便重试。恢复纹理绑定和 pixel-pack 状态，重载/关闭时回收 PBO 与 fence。
 - `VulkanPreview` / `SharedFrameTexture`：同进程路径只引用后端拥有的 GL 纹理，TextureManager 不负责删除共享图像；`FrameTexture` 仅用于兼容路径的 RGBA 上传。
@@ -248,6 +266,6 @@ HAND 从 `AFTER_LEVEL` 到 `GameRenderer.render` 的 GUI 深度清除，复用�
 
 世界图像清屏 alpha 为零，只有 Vulkan 方块像素覆盖原版颜色。图集动画与原版光照图增量同步，不保证呈现原版每一个动画帧；动画区域较多时按轮询预算分批更新。镂空阈值采用原版 0.1，图集目前只采样 mip level 0；光照采样坐标和线性过滤与 1.20.1 原版一致。雾和后处理尚未接入 Vulkan。原版 Solid/Cutout 接管、GPU 视锥剔除、批量间接绘制和异步增量上传已接入；后续继续扩大可见范围并改善重建调度。当前仍是功能原型，未承诺帧率提升。
 
-2026-10-26 本机 Windows / RTX 3050 Laptop 验证：GPU 世界管线检查通过；Forge 客户端成功采集 45 个分区、树叶/花等镂空模型、1024×512 图集和原版光照图。相机、方块更新、资源重载与动画贴图更新检查通过；测试场景切换夜晚后，地形平均亮度约从 137 降至 24，切回白天恢复。检查图片与报告位于 `run/logs/vulkanforge/world-client-smoke/`。
+2026-10-26 本机 Windows / RTX 3050 Laptop 验证：GPU 世界管线检查通过；Forge 客户端成功复用原版非空分区、树叶/花等镂空模型、1024×512 图集和原版光照图。相机、方块更新、资源重载与动画贴图更新检查通过；测试场景切换夜晚后，地形平均亮度约从 137 降至 24，切回白天恢复。检查图片与报告位于 `run/logs/vulkanforge/world-client-smoke/`。
 
 主窗口地形/三角形预览位于同进程的隔离加载器中，避免新旧 LWJGL 类和 native 库混入同一个加载器。独立测试窗口、能力探测和旧兼容预览仍使用子进程。打包的 Gradle wrapper 来自 Forge 官方 MDK；LWJGL 及其原生依赖许可证随实验模块 jar 保留。

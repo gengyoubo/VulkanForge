@@ -74,9 +74,10 @@ final class VulkanPreview {
     }
     /** P11, AFTER_LEVEL: GameRenderer next clears depth and draws the held items, arms and screen effects. */
     static boolean guiEnabled() { return enabled && direct && !inset; }
-    static void handBegin() { ordered(() -> EntityDraws.openOrdered(EntityDraws.Window.HAND)); }
+    static void handBegin() { ordered(GuiDraws::beginHand); }
     /** Before GUI clear or present: composite a still-open hand window into the main target. */
     static void beforeSwap() {
+        GuiDraws.finishHand();
         EntityDraws.Window window = EntityDraws.openWindow();
         if (window == null || !window.ordered()) return;
         var target = Minecraft.getInstance().getMainRenderTarget();
@@ -131,17 +132,18 @@ final class VulkanPreview {
     static boolean replacesTranslucent(net.minecraft.core.BlockPos origin) { return translucentPending && replacesSection(origin); }
     static long translucentComposites() { return translucentComposites; }
     static long translucentQuads() { return WORLD.translucentQuads(); }
-    static long fluidBlocks() { return WORLD.fluidBlocks(); }
+    static long translucentMeshes() { return WORLD.translucentMeshes(); }
     static void invalidateWorld() { WORLD.invalidate(); }
     static void markDirty(int x, int y, int z) { if (enabled) WORLD.markDirty(x, y, z); }
     static void toggleInset() { inset = !inset; }
     static long worldEpoch() { return uploadedEpoch == WORLD.epoch() ? uploadedEpoch : 0; }
     static int capturedSections() { return WORLD.sections(); }
     static long[] schedulerStats() { return WORLD.schedulerStats(); }
+    static long[] nativeMeshStats() { return TerrainMeshes.stats(); }
     static long rebuiltSections() { return WORLD.builds(); }
     static long atlasPatches() { return WORLD.atlasPatches(); }
     static long lightUpdates() { return WORLD.lightUpdates(); }
-    static int capturedCutoutBlocks() { return WORLD.cutoutBlocks(); }
+    static int capturedCutoutQuads() { return WORLD.cutoutQuads(); }
     static boolean replacesSection(net.minecraft.core.BlockPos origin) {
         return enabled && direct && !inset && sharedDepth > 0 && TerrainPresenter.depthReady()
                 && uploadedEpoch != 0 && uploadedEpoch == WORLD.epoch() && WORLD.covers(origin);

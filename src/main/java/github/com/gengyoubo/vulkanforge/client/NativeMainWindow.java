@@ -24,6 +24,7 @@ public final class NativeMainWindow {
     private static Object backend;
     private static boolean revealed;
     private static Method present, beginFrame, setVsync, frames, generations, capture, close, earlyAcquires, lateAcquires;
+    private static Method hand, handPasses;
     private static Method renderWorld, renderWorldWithSky, worldStats, finishWorldFrame, closeWorld, renderOverlay, finishOverlay, entityTexture, entityTexturePatch, gui, guiPasses, optimizationStats, uploadStats, tryWorldCommand, memoryStats, guiBindingStats;
     private static Consumer<Object[]> worldCommands;
 
@@ -58,6 +59,7 @@ public final class NativeMainWindow {
             tryWorldCommand = type.getMethod("tryWorldCommand", Object[].class);
             optimizationStats = type.getMethod("optimizationStats"); uploadStats = type.getMethod("uploadStats");
             gui = type.getMethod("gui", Object[].class); guiPasses = type.getMethod("guiPasses");
+            hand = type.getMethod("hand", Object[].class); handPasses = type.getMethod("handPasses");
             entityTexture = type.getMethod("entityTexture", Object[].class);
             entityTexturePatch = type.getMethod("entityTexturePatch", Object[].class);
             Function<long[], Consumer<int[]>> terrainImporter = GlInterop::importTerrain;
@@ -120,8 +122,9 @@ public final class NativeMainWindow {
     }
     public static void swapBuffers(long window) {
         if (!active() || window != mainWindow) { GLFW.glfwSwapBuffers(window); return; }
-        // P11: a hand/GUI window still open (e.g. F1 hides the GUI, so no GUI event closed HAND) is composited before present.
+        // Seal deferred hand capture too when F1 hides the HUD; both batches are consumed by this presentation only.
         VulkanPreview.beforeSwap();
+        call(hand, (Object) GuiDraws.takeHand());
         call(gui, (Object) GuiDraws.take());
         call(finishWorldFrame);
         Minecraft mc = Minecraft.getInstance();
@@ -143,6 +146,7 @@ public final class NativeMainWindow {
     static long[] optimizationStats() { return active() ? (long[]) call(optimizationStats) : new long[4]; }
     static long[] uploadStats() { return active() ? (long[]) call(uploadStats) : new long[5]; }
     static long guiPasses() { return active() ? ((Number) call(guiPasses)).longValue() : 0; }
+    static long handPasses() { return active() ? ((Number) call(handPasses)).longValue() : 0; }
     public static long presentedFrames() { return active() ? ((Number) call(frames)).longValue() : 0; }
     static boolean sendWorld(dev.vulkanforge.bridge.WorldProtocol.Command command) {
         if (!active()) return false;
@@ -186,6 +190,7 @@ public final class NativeMainWindow {
         catch (Throwable error) { LOGGER.error("Could not close Vulkan main-window resources", cause(error)); }
         finally {
             backend = null; present = beginFrame = setVsync = frames = generations = capture = close = earlyAcquires = lateAcquires = null;
+            hand = handPasses = null;
             renderWorld = renderWorldWithSky = worldStats = finishWorldFrame = closeWorld = renderOverlay = finishOverlay = entityTexture = entityTexturePatch = gui = guiPasses = optimizationStats = uploadStats = tryWorldCommand = memoryStats = guiBindingStats = null; worldCommands = null;
             try { if (loader != null) loader.close(); } catch (Exception error) { LOGGER.warn("Could not close backend loader", error); }
             loader = null;

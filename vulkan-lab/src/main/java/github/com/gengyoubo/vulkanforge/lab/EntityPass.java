@@ -34,7 +34,7 @@ final class EntityPass implements AutoCloseable {
     private static final String[] VERTEX_SHADERS = {"/shaders/entity.vert", "/shaders/text.vert", "/shaders/particle.vert", "/shaders/simple_pos.vert",
             "/shaders/simple_color.vert", "/shaders/simple_tex.vert", "/shaders/simple_tex_color.vert", "/shaders/simple_tex_color.vert", "/shaders/simple_tex_color.vert"};
     private record Texture(GpuImage image, int flags) implements AutoCloseable { @Override public void close() { image.close(); } }
-    private record BindingKey(Texture texture, Texture overlay, long lightView, long lightSampler) { }
+    private record BindingKey(Texture texture, Texture overlay, long lightView, long lightSampler, Object lightIdentity) { }
     private static final class SlotResources {
         GpuBuffer vertices, indices, uniforms;
         long pool, uniformSet, uniformBuffer;
@@ -91,6 +91,9 @@ final class EntityPass implements AutoCloseable {
     }
 
     boolean hasTexture(int id) { return textures.containsKey(id); }
+    long textureView(int id) { return textures.get(id).image.view; }
+    long textureSampler(int id) { return samplers[textures.get(id).flags]; }
+    Object textureIdentity(int id) { return textures.get(id); }
     boolean usesPushDescriptors() { return pushDescriptors; }
     void invalidateDescriptors() { for (SlotResources slot : slots) slot.invalidated = true; }
     long[] bindingStats() { return new long[]{descriptorAllocations, descriptorPushes, uniformWrites, bindingHits, mergedDraws}; }
@@ -157,6 +160,9 @@ final class EntityPass implements AutoCloseable {
 
     /** Records all draws inside an active dynamic-rendering pass. The slot's previous use must have completed. */
     void record(VkCommandBuffer command, MemoryStack stack, int slot, List<Object[]> packets, long lightView, long lightSampler) {
+        record(command, stack, slot, packets, lightView, lightSampler, null);
+    }
+    void record(VkCommandBuffer command, MemoryStack stack, int slot, List<Object[]> packets, long lightView, long lightSampler, Object lightIdentity) {
         if (packets.isEmpty()) return;
         packets = batch(packets);
         SlotResources resources = slots[slot];
@@ -199,6 +205,8 @@ final class EntityPass implements AutoCloseable {
         var uniformData = resources.uniforms.mapped.duplicate().order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer();
         var buffers = stack.mallocLong(1); var offsets = stack.mallocLong(1); var dynamic = stack.mallocInt(1);
         long bound = 0, boundTexture = Long.MIN_VALUE;
+        long effectiveLight = lightView != 0 ? lightView : direct ? textures.get(WHITE_TEXTURE).image.view : 0;
+        long effectiveSampler = lightView != 0 ? lightSampler : samplers[0];
         for (int i = 0; i < packets.size(); i++) {
             Object[] packet = packets.get(i);
             if (packet[0] == null) {
@@ -218,12 +226,13 @@ final class EntityPass implements AutoCloseable {
             }
             int[] header = (int[]) packet[0];
             Texture texture = textures.get(header[H_TEXTURE]);
-            if (texture == null || (!direct && lightView == 0)) { missingTextures++; continue; }
+            if (texture == null || effectiveLight == 0) { missingTextures++; continue; }
             Texture overlay = textures.getOrDefault(header[H_OVERLAY], texture);
             long pipeline = pipeline(header[H_FORMAT], header[H_FLAGS]);
             if (pipeline != bound) { vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline); bound = pipeline; }
             long key = (long) header[H_TEXTURE] << 32 | (header[H_OVERLAY] & 0xffffffffL);
-            BindingKey bindingKey = new BindingKey(texture, overlay, direct ? textures.get(WHITE_TEXTURE).image.view : lightView, direct ? samplers[0] : lightSampler);
+            BindingKey bindingKey = new BindingKey(texture, overlay, effectiveLight, effectiveSampler,
+                    lightIdentity != null ? lightIdentity : direct ? textures.get(WHITE_TEXTURE) : effectiveLight);
             Long set = null;
             if (pushDescriptors) set = 0L; else set = resources.textureSets.get(bindingKey);
             if (pushDescriptors ? boundTexture != key : set == null) {
@@ -237,7 +246,7 @@ final class EntityPass implements AutoCloseable {
                 var images = VkDescriptorImageInfo.calloc(3, stack);
                 images.get(0).sampler(samplers[texture.flags()]).imageView(texture.image().view).imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                 images.get(1).sampler(samplers[0]).imageView(overlay.image().view).imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-                images.get(2).sampler(direct ? samplers[0] : lightSampler).imageView(direct ? textures.get(WHITE_TEXTURE).image().view : lightView).imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                images.get(2).sampler(effectiveSampler).imageView(effectiveLight).imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                 writes = VkWriteDescriptorSet.calloc(3, stack);
                 for (int b = 0; b < 3; b++) writes.get(b).sType$Default().dstSet(set).dstBinding(b).descriptorCount(1)
                         .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(VkDescriptorImageInfo.create(images.address(b), 1));

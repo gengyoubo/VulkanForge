@@ -10,7 +10,7 @@ import static org.lwjgl.vulkan.VK13.*;
 
 /** Per-frame AABBs -> compute-written VkDrawIndirectCommand. Results are inspected only after existing fences. */
 final class GpuCuller implements AutoCloseable {
-    static final int CAPACITY = 4096, INPUT_STRIDE = 64;
+    static final int CAPACITY = 65535, INPUT_STRIDE = 64;
     private final VulkanContext context;
     private final GpuBuffer[] inputs, outputs, drawCounts;
     private final boolean compact;

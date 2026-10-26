@@ -159,6 +159,7 @@ final class WorldScene implements AutoCloseable {
     int drawableSections() { return sections.size(); }
     /** Lightmap shared with the entity pass; 0 until the first lightmap patch of this epoch. */
     long lightMapView() { return lightMap == null ? 0 : lightMap.view; }
+    Object lightMapIdentity() { return lightMap; }
     long lightSampler() { return lightSampler; }
     int translucentSections() { int count = 0; for (Section section : sections.values()) if (section.translucent() != null) count++; return count; }
     long translucentSorts() { return translucentSorts; }

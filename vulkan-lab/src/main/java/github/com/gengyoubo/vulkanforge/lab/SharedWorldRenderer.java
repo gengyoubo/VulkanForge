@@ -109,6 +109,7 @@ final class SharedWorldRenderer implements AutoCloseable {
         world.apply(command);
     }
     void prepareFrame() { waitSlot((int)(frames % SLOT_COUNT)); }
+    long epoch() { return world.epoch(); }
 
     int render(int requestedWidth, int requestedHeight) { return render(requestedWidth, requestedHeight, java.util.List.of()); }
     /** P10: {@code sky} packets (captured renderSky draws) are drawn first in the opaque pass, under terrain, with its depth. */
@@ -158,7 +159,7 @@ final class SharedWorldRenderer implements AutoCloseable {
             vkCmdSetScissor(command, 0, scissor);
             if (terrain) {
                 if (!sky.isEmpty() && world.lightMapView() != 0) {
-                    entities.record(command, stack, index * (MAX_OVERLAYS + 1) + MAX_OVERLAYS, sky, world.lightMapView(), world.lightSampler());
+                    entities.record(command, stack, index * (MAX_OVERLAYS + 1) + MAX_OVERLAYS, sky, world.lightMapView(), world.lightSampler(), world.lightMapIdentity());
                     skyDraws += sky.size();
                 }
                 world.draw(command, stack, culler, index);
@@ -294,7 +295,7 @@ final class SharedWorldRenderer implements AutoCloseable {
                     .renderArea(r -> r.offset(o -> o.set(0, 0)).extent(e -> e.set(width, height))));
             vkCmdSetViewport(command, 0, VkViewport.calloc(1, stack).width(width).height(height).minDepth(0).maxDepth(1));
             vkCmdSetScissor(command, 0, VkRect2D.calloc(1, stack).offset(o -> o.set(0, 0)).extent(e -> e.set(width, height)));
-            entities.record(command, stack, index * (MAX_OVERLAYS + 1) + pass, packets, world.lightMapView(), world.lightSampler());
+            entities.record(command, stack, index * (MAX_OVERLAYS + 1) + pass, packets, world.lightMapView(), world.lightSampler(), world.lightMapIdentity());
             vkCmdEndRendering(command);
             var release = VkImageMemoryBarrier2.calloc(2, stack);
             releaseBarrier(release.get(0), slot.overlayColor, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, false);

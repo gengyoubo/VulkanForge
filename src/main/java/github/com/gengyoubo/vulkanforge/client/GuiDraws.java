@@ -12,23 +12,41 @@ import static org.lwjgl.opengl.GL11.*;
 import static org.lwjgl.opengl.GL14.*;
 import static org.lwjgl.opengl.GL30.GL_DRAW_FRAMEBUFFER_BINDING;
 
-/** Holds immutable GUI packets until present; unsupported draws replay the complete GUI on GL in the original order. */
+/** Holds immutable hand/GUI packets until present; unsupported draws replay the pending stages on GL in their original order. */
 public final class GuiDraws {
     private record Draw(VertexFormat format, Object[] packet, State state) { }
     private static final List<Draw> pending = new ArrayList<>();
+    private static final List<Draw> held = new ArrayList<>();
     private static final Map<VertexFormat, BufferBuilder> replayBuilders = new IdentityHashMap<>();
-    private static boolean active, fallback;
+    private static boolean active, fallback, hand;
     private static long draws, frames, fallbacks;
     private static final Map<String, Long> reasons = new TreeMap<>();
     static Map<String, Long> fallbackReasons() { return Collections.unmodifiableMap(reasons); }
     private static final int MAX_DRAWS = 4096;
     private GuiDraws() { }
     static boolean active() { return active; }
+    static boolean handActive() { return active && hand; }
     static long[] stats() { return new long[]{draws, frames, fallbacks}; }
+
+    static void beginHand() {
+        if (!VulkanPreview.guiEnabled() || !EntityDraws.frameActive()) return;
+        held.clear(); pending.clear(); active = hand = true; fallback = false;
+    }
+    static void finishHand() {
+        if (!active || !hand) return;
+        held.addAll(pending); pending.clear(); active = hand = fallback = false;
+    }
+    static Object[] takeHand() {
+        finishHand();
+        Object[] packets = held.stream().map(Draw::packet).toArray();
+        if (packets.length > 0) EntityDraws.lateHand(packets.length);
+        held.clear(); return packets;
+    }
 
     /** GameRenderer's first depth clear is the boundary between held items and all GUI, including menus, overlays and toasts. */
     public static void clear(int mask, boolean onMac) {
         if (!RenderSystem.isOnRenderThread() || !NativeMainWindow.active()) { RenderSystem.clear(mask, onMac); return; }
+        if (hand && (mask & GL_DEPTH_BUFFER_BIT) != 0) finishHand();
         if (!active && (mask & GL_DEPTH_BUFFER_BIT) != 0 && VulkanPreview.guiEnabled()) {
             VulkanPreview.beforeSwap();
             EntityTextures.poll();
@@ -72,7 +90,14 @@ public final class GuiDraws {
         BufferUploader.reset();
         Map<VertexFormat, VertexBuffer> buffers = new IdentityHashMap<>();
         try {
-            for (Draw draw : pending) {
+            List<Draw> replay = new ArrayList<>();
+            if (!held.isEmpty()) {
+                // A GL GUI fallback must include the deferred hand before its GUI depth clear.
+                GlStateManager._disableScissorTest(); RenderSystem.depthMask(true); RenderSystem.clear(GL_DEPTH_BUFFER_BIT, Minecraft.ON_OSX);
+                replay.addAll(held); held.clear(); replay.add(new Draw(null, null, null));
+            }
+            replay.addAll(pending);
+            for (Draw draw : replay) {
                 if (draw.format == null) { GlStateManager._disableScissorTest(); RenderSystem.depthMask(true); RenderSystem.clear(GL_DEPTH_BUFFER_BIT, Minecraft.ON_OSX); continue; }
                 draw.state.restore();
                 VertexBuffer buffer = buffers.computeIfAbsent(draw.format, key -> new VertexBuffer(VertexBuffer.Usage.DYNAMIC));
@@ -114,7 +139,7 @@ public final class GuiDraws {
     }
 
     static void reset() {
-        pending.clear(); active = fallback = false;
+        pending.clear(); held.clear(); active = hand = fallback = false;
     }
 
     /** Only supported GUI states enter pending; preserve the current unsupported draw's extra states too when replaying. */

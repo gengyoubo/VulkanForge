@@ -37,14 +37,23 @@ final class GuiPassSmoke {
         Path third = output.resolve("gui-depth-clear.png"); backend.captureNext(third.toString()); backend.present(source, 320, 240, 640, 480);
         image = ImageIO.read(third.toFile());
         near(image.getRGB(320, 240), 0, 0, 255, "HUD -> screen depth clear");
+        backend.beginFrame(640, 480);
+        backend.hand(new Object[]{red});
+        Object[] clippedGui = behind.clone(); clippedGui[4] = new int[]{320,0,320,480};
+        backend.gui(new Object[]{clippedGui});
+        Path fourth = output.resolve("hand-swapchain.png"); backend.captureNext(fourth.toString()); backend.present(source, 320, 240, 640, 480);
+        image = ImageIO.read(fourth.toFile());
+        near(image.getRGB(160, 240), 255, 0, 0, "Hand after GL blit");
+        near(image.getRGB(480, 240), 0, 0, 255, "GUI clears hand depth");
+        if (backend.handPasses() != 1) throw new AssertionError("Hand did not draw directly into swapchain");
         if (backend.guiPasses() < 3) throw new AssertionError("GUI did not draw after blit");
         long[] bindings = backend.guiBindingStats();
         if (bindings[4] == 0) throw new AssertionError("Compatible adjacent GUI draws were not batched");
-        if (bindings[2] > 2) throw new AssertionError("Uniform descriptors were rewritten every frame");
-        if (backend.pushDescriptorsEnabled() && (bindings[0] > 2 || bindings[1] == 0 || bindings[2] > 2))
+        if (bindings[2] > 4) throw new AssertionError("Uniform descriptors were rewritten every frame");
+        if (backend.pushDescriptorsEnabled() && (bindings[0] > 4 || bindings[1] == 0 || bindings[2] > 4))
             throw new AssertionError("Vulkan 1.4 push descriptors / persistent uniform descriptors not exercised: " + java.util.Arrays.toString(bindings));
         System.out.println("GUI_BINDING_SMOKE=OK " + java.util.Arrays.toString(bindings));
-        System.out.println("GUI_SWAPCHAIN_SMOKE=OK (alpha, scissor, depth, depth clear, incremental texture patch, no world renderer)");
+        System.out.println("GUI_SWAPCHAIN_SMOKE=OK (alpha, scissor, depth, depth clear, incremental texture patch, direct hand, no world renderer)");
     }
     static Object[] quad(int format, int variant, int flags, int texture, int color, float z) {
         int stride = format == FORMAT_TEXT ? 28 : format == FORMAT_POSITION_TEX ? 20 : 16;

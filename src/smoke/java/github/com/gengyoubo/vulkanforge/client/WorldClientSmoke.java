@@ -27,8 +27,8 @@ public final class WorldClientSmoke {
     private static long firstEpoch;
     private static double dayBrightness, nightBrightness;
     private static long lightBaseline, glyphBaseline, movingBuilds;
-    private static int originalWidth, originalHeight, swapchainBaseline;
-    private static long minimizedFrames, screenBaseline;
+    private static int originalWidth, originalHeight, swapchainBaseline, initialCoverage;
+    private static long minimizedFrames, screenBaseline, fallbackBaseline;
     private static long bridgeLaunches;
     private static final long START = System.nanoTime();
     private static Path report;
@@ -36,6 +36,18 @@ public final class WorldClientSmoke {
     @SubscribeEvent public static void glyphs(net.minecraftforge.client.event.ScreenEvent.Render.Post event) {
         if (Boolean.getBoolean("vulkanforge.worldSmoke") && (stage == 40 || stage == 41) && ticks > 10) {
             event.getGuiGraphics().drawString(Minecraft.getInstance().font, "P11 动态字形 Ω Ж あ 漢", 8, 8, -1);
+            if (stage == 40 && ticks == 20 && GuiDraws.active()) {
+                event.getGuiGraphics().flush();
+                var previous = com.mojang.blaze3d.systems.RenderSystem.getShader();
+                com.mojang.blaze3d.systems.RenderSystem.setShader(net.minecraft.client.renderer.GameRenderer::getPositionColorShader);
+                var buffer = new com.mojang.blaze3d.vertex.BufferBuilder(256);
+                buffer.begin(com.mojang.blaze3d.vertex.VertexFormat.Mode.TRIANGLE_STRIP, com.mojang.blaze3d.vertex.DefaultVertexFormat.POSITION_COLOR);
+                buffer.vertex(8, 40, 0).color(255,0,255,255).endVertex(); buffer.vertex(8, 48, 0).color(255,0,255,255).endVertex();
+                buffer.vertex(32, 40, 0).color(255,0,255,255).endVertex(); buffer.vertex(32, 48, 0).color(255,0,255,255).endVertex();
+                EntityDraws.drawImmediate(buffer.end()); // Unsupported topology: replay hand + pending GUI on GL, then continue in order.
+                com.mojang.blaze3d.systems.RenderSystem.setShader(() -> previous);
+                NativeMainWindow.captureNext(report.resolve("gui-fallback-swapchain.png"));
+            }
         }
     }
 
@@ -86,6 +98,9 @@ public final class WorldClientSmoke {
                     for (int x = -8; x <= -4; x++) for (int z = 4; z <= 8; z++) level.setBlock(new BlockPos(x, 65, z),
                             x == -8 || x == -4 || z == 4 || z == 8 ? Blocks.STONE_BRICKS.defaultBlockState() : Blocks.WATER.defaultBlockState(), 3);
                     for (int x = -1; x <= 1; x++) for (int y = 65; y <= 66; y++) level.setBlock(new BlockPos(x, y, 7), Blocks.LIGHT_BLUE_STAINED_GLASS.defaultBlockState(), 3);
+                    // Beyond the former radius=1 capture cube, but inside the actual vanilla render distance.
+                    for (int y = 64; y <= 73; y++) level.setBlock(new BlockPos(24, y, -40), Blocks.GOLD_BLOCK.defaultBlockState(), 3);
+                    for (int y = 64; y <= 73; y++) level.setBlock(new BlockPos(-48, y, -72), Blocks.DIAMOND_BLOCK.defaultBlockState(), 3);
                     // P7/P8: block entities (chest, sign) and a mob without AI in front of the camera.
                     level.setBlock(new BlockPos(3, 65, 6), Blocks.CHEST.defaultBlockState(), 3);
                     level.setBlock(new BlockPos(2, 65, 7), Blocks.OAK_SIGN.defaultBlockState(), 3);
@@ -113,20 +128,27 @@ public final class WorldClientSmoke {
                 }
                 bridgeLaunches = OffscreenBridge.launches();
                 VulkanPreview.toggle(); stage = 3; ticks = 0;
-            } else if (stage == 3 && ++ticks > 100 && VulkanPreview.worldEpoch() > 0 && VulkanPreview.capturedSections() >= (NativeMainWindow.active() ? 45 : 10)) {
+            } else if (stage == 3 && ++ticks > 100 && VulkanPreview.worldEpoch() > 0 && VulkanPreview.capturedSections() >= 20
+                    && (!NativeMainWindow.active() || VulkanPreview.replacesSection(new BlockPos(16, 64, -48)))) {
                 if (NativeMainWindow.active()) {
                     long[] stats = VulkanPreview.directWorldStats();
-                    require(VulkanPreview.directWorld() && stats[2] == 45 && stats[7] > 0, "WorldScene is not drawing 45 sections through the main backend");
+                    require(VulkanPreview.directWorld() && stats[2] >= 20 && stats[7] > 0, "WorldScene is not drawing native section meshes through the main backend");
+                    initialCoverage = VulkanPreview.capturedSections();
+                    require(VulkanPreview.replacesSection(new BlockPos(0, -64, 0)), "Full vertical world coverage is missing");
+                    long[] nativeMeshes = VulkanPreview.nativeMeshStats();
+                    require(nativeMeshes[0] > 0 && nativeMeshes[1] > 0, "Vanilla section meshes were not reused");
+                    require(nativeMeshes[5] == 9L * 9 * mc.level.getSectionsCount(), "Coverage does not match vanilla ViewArea height/distance");
+                    log("PASS native mesh reuse and distant section coverage: " + java.util.Arrays.toString(nativeMeshes));
                     require(stats[8] == ProcessHandle.current().pid() && OffscreenBridge.launches() == bridgeLaunches, "Terrain still runs in a subprocess");
                     require(stats[4] == mc.getMainRenderTarget().viewWidth && stats[5] == mc.getMainRenderTarget().viewHeight, "Shared terrain target does not match the main target");
                     log("PASS same-process WorldScene, sections=" + stats[2] + ", pid=" + stats[8] + ", no terrain subprocess / FrameProtocol RGBA");
                     long[] passes = TerrainPasses.stats();
                     require(passes[0] > 0 && passes[1] > 0, "Vanilla Solid/Cutout sections were not replaced");
                     log("PASS P4 vanilla terrain skipped: solid=" + passes[0] + ", cutout=" + passes[1] + ", fallback=" + passes[2]);
-                    require(VulkanPreview.fluidBlocks() > 0 && VulkanPreview.translucentQuads() > 0 && stats[15] > 0, "Water/stained glass were not captured as Vulkan translucent geometry");
+                    require(VulkanPreview.translucentMeshes() > 0 && VulkanPreview.translucentQuads() > 0 && stats[15] > 0, "Water/stained glass were not captured as Vulkan translucent geometry");
                     require(stats[13] > 0 && stats[14] > 0 && stats[16] > 0 && stats[17] > 0, "Vulkan translucent pass did not draw sorted sections");
                     require(passes[3] > 0 && VulkanPreview.translucentComposites() > 0, "Vanilla translucent sections were not replaced by the Vulkan composite");
-                    log("PASS P6 translucent terrain: fluids=" + VulkanPreview.fluidBlocks() + ", quads=" + VulkanPreview.translucentQuads() + ", sections=" + stats[15]
+                    log("PASS P6 translucent terrain: native translucent meshes=" + VulkanPreview.translucentMeshes() + ", quads=" + VulkanPreview.translucentQuads() + ", sections=" + stats[15]
                             + ", sorts=" + stats[17] + ", vanilla translucent skipped=" + passes[3] + ", composites=" + VulkanPreview.translucentComposites());
                     long[] entities = EntityDraws.stats(), mirrors = EntityTextures.stats();
                     require(entities[0] > 0 && entities[4] > 0 && mirrors[1] > 0, "No entity/block-entity draws were replayed by Vulkan: " + java.util.Arrays.toString(entities));
@@ -153,6 +175,7 @@ public final class WorldClientSmoke {
                     log("PASS async uploads: submitted=" + uploads[0] + ", bytes=" + uploads[2] + ", backpressure waits=" + uploads[3]);
                     long[] hand = EntityDraws.stats(EntityDraws.Window.HAND), hud = GuiDraws.stats();
                     require(hand[0] > 0 && hand[1] > 0, "Held item / arm was not replayed by Vulkan: " + java.util.Arrays.toString(hand));
+                    require(NativeMainWindow.handPasses() > 0, "Hand is still composited through GL");
                     require(hud[0] > 0 && hud[1] > 0 && NativeMainWindow.guiPasses() > 0, "HUD was not replayed by Vulkan: " + java.util.Arrays.toString(hud) + " reasons=" + GuiDraws.fallbackReasons());
                     log("PASS P11 hand and HUD: hand draws=" + hand[0] + " composites=" + hand[1] + ", GUI draws=" + hud[0] + " swapchain passes=" + NativeMainWindow.guiPasses()
                             + ", order-preserving splits=" + EntityDraws.stats()[5]);
@@ -166,14 +189,14 @@ public final class WorldClientSmoke {
                 net.minecraft.client.Screenshot.grab(mc.gameDirectory, "world-smoke-main.png", mc.getMainRenderTarget(), message -> { });
                 firstEpoch = VulkanPreview.worldEpoch();
                 log("PASS real block atlas and section capture, epoch=" + firstEpoch + ", sections=" + VulkanPreview.capturedSections());
-                require(VulkanPreview.capturedCutoutBlocks() > 0, "No cutout blocks were captured");
+                require(VulkanPreview.capturedCutoutQuads() > 0, "No native cutout quads were reused");
                 require(VulkanPreview.atlasPatches() > 0 && VulkanPreview.lightUpdates() > 0, "Texture synchronization did not start");
                 log("PASS cutout model capture, atlas patches=" + VulkanPreview.atlasPatches() + ", lightmap updates=" + VulkanPreview.lightUpdates());
                 var server = mc.getSingleplayerServer(); var uuid = mc.player.getUUID();
                 server.execute(() -> { var player = server.getPlayerList().getPlayer(uuid); player.teleportTo(server.overworld(), 0.5, 68, 9, 130, 18); });
                 if (NativeMainWindow.active()) {
                     // P11: a screen over the world.
-                    screenBaseline = GuiDraws.stats()[0]; glyphBaseline = EntityTextures.stats()[5];
+                    screenBaseline = GuiDraws.stats()[0]; glyphBaseline = EntityTextures.stats()[5]; fallbackBaseline = GuiDraws.stats()[2];
                     mc.setScreen(new net.minecraft.client.gui.screens.inventory.InventoryScreen(mc.player));
                     stage = 40;
                 } else stage = 4;
@@ -190,7 +213,10 @@ public final class WorldClientSmoke {
                 stage = 41; ticks = 0;
             } else if (stage == 41 && ++ticks > 5) {
                 verifyCapture(report.resolve("inventory-swapchain.png"), mc.getWindow().getWidth(), mc.getWindow().getHeight());
-                mc.setScreen(null); movingBuilds = VulkanPreview.rebuiltSections();
+                require(GuiDraws.stats()[2] > fallbackBaseline, "GUI fallback did not replay the deferred hand");
+                verifyCapture(report.resolve("gui-fallback-swapchain.png"), mc.getWindow().getWidth(), mc.getWindow().getHeight());
+                log("PASS deferred hand + GUI GL fallback order");
+                mc.setScreen(null); movingBuilds = VulkanPreview.rebuiltSections(); mc.options.renderDistance().set(6);
                 stage = 42; ticks = 0;
             } else if (stage == 42) {
                 ticks++;
@@ -199,14 +225,19 @@ public final class WorldClientSmoke {
                     var server = mc.getSingleplayerServer(); var uuid = mc.player.getUUID();
                     server.execute(() -> server.getPlayerList().getPlayer(uuid).teleportTo(server.overworld(), x, 68, 9, 130, 18));
                 }
-                if (ticks > 110 && VulkanPreview.capturedSections() == 45) {
+                if (ticks > 110 && VulkanPreview.replacesSection(new BlockPos(-48, 64, -80))) {
                     require(VulkanPreview.rebuiltSections() > movingBuilds, "Movement did not schedule new section captures");
                     long[] schedule = VulkanPreview.schedulerStats();
-                    require(schedule[5] > 1, "Empty sections are still throttled to one per frame");
+                    require(schedule[5] > 1, "Native mesh publication is still throttled to one per frame");
+                    require(VulkanPreview.nativeMeshStats()[5] == 13L * 13 * mc.level.getSectionsCount(), "Render distance increase did not expand native coverage");
                     log("PASS fast movement rebuild scheduling: " + java.util.Arrays.toString(schedule));
+                    log("PASS render distance increase: sections=" + VulkanPreview.capturedSections());
+                    mc.options.renderDistance().set(4);
                     stage = 4; ticks = 0;
                 }
             } else if (stage == 4 && ++ticks > 60) {
+                require(!VulkanPreview.replacesSection(new BlockPos(-48, 64, -80)), "Render distance decrease retained an out-of-range section");
+                require(VulkanPreview.nativeMeshStats()[5] == 9L * 9 * mc.level.getSectionsCount(), "Render distance decrease did not shrink native coverage");
                 require(VulkanPreview.saveWorldFrame(report.resolve("camera.png")) != firstHash, "Camera rotation did not change Vulkan frame");
                 log("PASS camera rotation");
                 var server = mc.getSingleplayerServer(); var uuid = mc.player.getUUID();
@@ -301,12 +332,13 @@ public final class WorldClientSmoke {
             } else if (stage == 21 && ++ticks > 10) {
                 VulkanPreview.toggle();
                 stage = 22; ticks = 0;
-            } else if (stage == 22 && ++ticks > 60 && VulkanPreview.worldEpoch() > 0 && VulkanPreview.capturedSections() == 45) {
-                require(VulkanPreview.directWorldStats()[2] == 45 && OffscreenBridge.launches() == bridgeLaunches, "F8 reopen did not restore same-process sections");
-                log("PASS F8 shared world release/reopen, sections=45");
+            } else if (stage == 22 && ++ticks > 60 && VulkanPreview.worldEpoch() > 0 && VulkanPreview.capturedSections() > 0) {
+                require(VulkanPreview.directWorldStats()[2] == VulkanPreview.capturedSections() && OffscreenBridge.launches() == bridgeLaunches, "F8 reopen did not restore same-process sections");
+                log("PASS F8 shared world release/reopen, sections=" + VulkanPreview.capturedSections());
                 leaveWorld(mc);
             } else if (stage == 18 && mc.level == null && mc.screen instanceof TitleScreen && ++ticks > 20) {
                 require(VulkanPreview.worldEpoch() == 0, "Vulkan world state survived leaving the world");
+                require(VulkanPreview.nativeMeshStats()[4] == 0 && VulkanPreview.nativeMeshStats()[5] == 0, "Native mesh cache retained the departed world");
                 long frames = NativeMainWindow.presentedFrames();
                 createWorld(mc, "VulkanForge Smoke Switch ");
                 minimizedFrames = frames;
@@ -347,6 +379,7 @@ public final class WorldClientSmoke {
             require(NativeMainWindow.acquiresBeforeInput() > NativeMainWindow.presentedFrames() * .9,
                     "Most acquisitions still happen after camera rendering");
             log("PASS memory pool: " + java.util.Arrays.toString(NativeMainWindow.memoryStats()));
+            require(NativeMainWindow.guiBindingStats()[2] < 128, "Lightmap updates repeatedly invalidated GUI uniform descriptors");
             log("PASS GUI descriptor/batch counters: " + java.util.Arrays.toString(NativeMainWindow.guiBindingStats()));
             log("PASS acquire before input=" + NativeMainWindow.acquiresBeforeInput() + ", fallback acquire after render=" + NativeMainWindow.acquiresAfterRender());
         }

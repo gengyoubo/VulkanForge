@@ -22,11 +22,11 @@ import static org.lwjgl.opengl.GL14.*;
  * <li>ENTITIES: Vulkan terrain composite (AFTER_CUTOUT_BLOCKS) to AFTER_BLOCK_ENTITIES - entities and block entities (P7/P8);</li>
  * <li>PARTICLES: AFTER_TRIPWIRE_BLOCKS to AFTER_PARTICLES - ParticleEngine.render (P9);</li>
  * <li>WEATHER: AFTER_PARTICLES to AFTER_WEATHER - clouds (P10) and rain/snow (P9);</li>
- * <li>HAND: AFTER_LEVEL to GameRenderer's GUI depth clear (or swap) - held items, arms, screen effects (P11).</li>
- * GUI capture is handled separately by GuiDraws and replayed directly into the swapchain (P11).</ul>
+ * <li>HAND: counters for GuiDraws' final-swapchain held items, arms and screen effects (P11).</li>
+ * Hand and GUI capture are handled by GuiDraws and replayed directly into the swapchain (P11).</ul>
  * World windows are replayed as overlay passes over this frame's terrain depth and composited with depth when they close.
- * HAND starts from cleared depth (vanilla clears it before them) and are order-sensitive: a draw that must stay on GL
- * first flushes everything captured before it, so GL and Vulkan draws keep vanilla's painter's order. Anything else - other
+ * Legacy ordered overlay helpers start from cleared depth and flush before GL fallback. GuiDraws instead replays the deferred
+ * hand and GUI together when required, so GL and Vulkan draws keep vanilla's painter's order. Anything else - other
  * shaders, formats, blend/depth states or not-yet-mirrored textures - is drawn by GL exactly as before.
  * Packets match the backend's EntityPass.
  */
@@ -129,6 +129,8 @@ public final class EntityDraws {
     /** Flushes {@code window} if it is the open one (RenderGuiEvent.Post, ScreenEvent.Render.Post, swap). */
     static void closeOrdered(Window window) { if (open == window) flush(window, presenter); }
     static Window openWindow() { return open; }
+    static boolean frameActive() { return frameActive; }
+    static void lateHand(int draws) { windowDraws[Window.HAND.ordinal()] += draws; windowComposites[Window.HAND.ordinal()]++; }
     /** GL is about to draw something it must draw itself: keep painter's order by compositing what was captured before it. */
     private static void split() {
         if (open == null || !open.ordered() || packets.isEmpty() || !RenderSystem.isOnRenderThread()) return;
@@ -210,7 +212,7 @@ public final class EntityDraws {
                 || (mode != VertexFormat.Mode.QUADS && mode != VertexFormat.Mode.TRIANGLES && !fan)) { reject(shader); return null; }
         ShaderBlendState.apply(shader); // Match the blend change vanilla performs inside ShaderInstance.apply.
         int flags = glState();
-        if (flags >= 0 && !GuiDraws.active() && spec.lightmap() && RenderSystem.getShaderTexture(2) != lightmap) flags = -6;
+        if (flags >= 0 && (!GuiDraws.active() || GuiDraws.handActive()) && spec.lightmap() && RenderSystem.getShaderTexture(2) != lightmap) flags = -6;
         if (flags < 0) {
             stateFallbacks++;
             String reason = STATE_REASONS[-flags];
