@@ -71,6 +71,10 @@ final class WorldCapture {
             bridge.reset(epoch);
             VulkanForge.LOGGER.info("Vulkan vanilla mesh capture reset: epoch={}, dimension={}", epoch, level.dimension().location());
         }
+        if (!atlasSent && !bridge.mirrorsTextures()) {
+            atlasSent = true;
+            bootstrap = bridge.send(new WorldProtocol.Mesh(epoch, 0, 0, 0, 0, new byte[0]));
+        }
         if (!atlasSent) {
             atlasReadback.request(mc.getTextureManager().getTexture(InventoryMenu.BLOCK_ATLAS).getId());
             var snapshot = atlasReadback.poll();
@@ -80,7 +84,7 @@ final class WorldCapture {
             // A void world still has a valid sky/camera even before any nonempty chunk finishes compiling.
             bootstrap = bridge.send(new WorldProtocol.Mesh(epoch, 0, 0, 0, 0, new byte[0]));
         }
-        if (!syncTextures(mc, bridge)) return;
+        if (bridge.mirrorsTextures() && !syncTextures(mc, bridge)) return;
         var position = event.getCamera().getPosition();
         float[] matrix = new Matrix4f(event.getProjectionMatrix()).mul(event.getPoseStack().last().pose()).get(new float[16]);
         float[] fog = RenderSystem.getShaderFogColor();

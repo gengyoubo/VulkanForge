@@ -9,6 +9,7 @@ import net.minecraftforge.fml.loading.FMLPaths;
 import org.lwjgl.glfw.GLFW;
 import org.lwjgl.glfw.GLFWNativeWin32;
 import org.lwjgl.opengl.GL;
+import github.com.gengyoubo.vulkanforge.config.VulkanForgeConfig;
 import github.com.gengyoubo.vulkanforge.interop.GlInterop;
 import org.slf4j.Logger;
 import java.lang.reflect.*;
@@ -33,6 +34,14 @@ public final class NativeMainWindow {
 
     public static long createWindow(IntSupplier width, IntSupplier height, Supplier<String> title, LongSupplier monitor) {
         long legacy = ImmediateWindowHandler.setupMinecraftWindow(width, height, title, monitor);
+        var startup = VulkanForgeConfig.startup();
+        LOGGER.info("VulkanForge startup renderer: {}", startup);
+        if (startup.backend() == VulkanForgeConfig.Backend.OPENGL)
+            return Gl46Context.window(legacy, startup.openGLVersion(), width, height, title, monitor);
+        if (!startup.vulkanMainWindow()) {
+            LOGGER.warn("Vulkan {} is not implemented yet; keeping the original OpenGL window", startup.vulkanVersion().label);
+            return legacy;
+        }
         if (!System.getProperty("vulkanforge.directPresent", "true").equalsIgnoreCase("true")
                 || !System.getProperty("os.name").startsWith("Windows")) return legacy;
         try {

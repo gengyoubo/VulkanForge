@@ -55,6 +55,7 @@ tasks.named('processResources', ProcessResources) {
     inputs.property 'version', project.version
     filesMatching('META-INF/mods.toml') { expand version: project.version }
     from(labJar) { into 'vulkanforge'; rename { 'vulkan-lab.jar' } }
+    from(project(':vulkan-lab').tasks.named('glSpirv')) { into 'assets/vulkanforge/shaders/gl46' }
 }
 tasks.named('jar', Jar) {
     finalizedBy 'reobfJar'

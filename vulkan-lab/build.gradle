@@ -29,6 +29,16 @@ tasks.register('fatJar', Jar) {
     from { configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) } }
     exclude 'META-INF/*.SF', 'META-INF/*.RSA', 'META-INF/*.DSA', 'module-info.class', 'META-INF/versions/**/module-info.class'
 }
+// OpenGL 4.6 backend shaders live with the mod; compile them to GL SPIR-V here, where shaderc is on the classpath.
+tasks.register('glSpirv', JavaExec) {
+    def sources = file('../src/main/resources/assets/vulkanforge/shaders/gl46')
+    def output = layout.buildDirectory.dir('generated/gl46-spirv')
+    inputs.dir sources
+    outputs.dir output
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.lab.GlSpirvCompiler'
+    args sources.absolutePath, output.get().asFile.absolutePath
+}
 tasks.register('runProbe', JavaExec) {
     classpath = sourceSets.main.runtimeClasspath
     mainClass = application.mainClass

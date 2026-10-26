@@ -1,0 +1,35 @@
+#version 460 core
+layout(local_size_x = 64) in;
+layout(std140, binding = 0) uniform Frame {
+    mat4 viewProjection;
+    ivec4 cameraBlock;
+    vec4 cameraFraction;
+    vec4 fogColor;
+    vec4 fog;
+    uvec4 counts;
+};
+struct Section { ivec4 origin; vec4 minimum; vec4 maximum; uvec4 draw; };
+struct Command { uint count; uint instanceCount; uint first; uint baseInstance; };
+layout(std430, binding = 0) readonly buffer Sections { Section sections[]; };
+layout(std430, binding = 1) writeonly buffer Commands { Command commands[]; };
+layout(std430, binding = 2) buffer Count { uint drawCount; };
+// Frustum test per section slot; visible sections are compacted into DrawArraysIndirectCommand + GPU draw count.
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= counts.x) return;
+    Section section = sections[index];
+    if (section.draw.x == 0u) return;
+    vec3 base = vec3(section.origin.xyz - cameraBlock.xyz) - cameraFraction.xyz;
+    uint outside = 63u;
+    for (uint corner = 0u; corner < 8u; corner++) {
+        vec3 position = base + vec3((corner & 1u) == 0u ? section.minimum.x : section.maximum.x,
+                                    (corner & 2u) == 0u ? section.minimum.y : section.maximum.y,
+                                    (corner & 4u) == 0u ? section.minimum.z : section.maximum.z);
+        vec4 clip = viewProjection * vec4(position, 1.0);
+        outside &= (clip.x < -clip.w ? 1u : 0u) | (clip.x > clip.w ? 2u : 0u)
+                 | (clip.y < -clip.w ? 4u : 0u) | (clip.y > clip.w ? 8u : 0u)
+                 | (clip.z < -clip.w ? 16u : 0u) | (clip.z > clip.w ? 32u : 0u);
+    }
+    if (outside != 0u) return;
+    commands[atomicAdd(drawCount, 1u)] = Command(section.draw.x, 1u, section.draw.y, index);
+}
