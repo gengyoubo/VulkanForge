@@ -1,0 +1,17 @@
+#version 460 core
+layout(local_size_x = 8, local_size_y = 8) in;
+// One pyramid level: each texel keeps the farthest (max) depth of the 2x2 source texels it covers; an odd last row/column
+// also takes the leftover texel, so coverage stays conservative. Level 0 reads the main target's depth texture.
+layout(binding = 0) uniform sampler2D source;
+layout(binding = 0, r32f) writeonly uniform image2D target;
+layout(std140, binding = 1) uniform Level { ivec4 level; }; // x source lod, y/z source size
+void main() {
+    ivec2 size = imageSize(target), position = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(position, size))) return;
+    ivec2 sourceSize = level.yz;
+    ivec2 first = position * 2;
+    ivec2 last = min(first + ivec2(1) + ivec2(equal(position, size - 1)) * (sourceSize & 1), sourceSize - 1);
+    float farthest = 0.0;
+    for (int y = first.y; y <= last.y; y++) for (int x = first.x; x <= last.x; x++) farthest = max(farthest, texelFetch(source, ivec2(x, y), level.x).r);
+    imageStore(target, position, vec4(farthest));
+}

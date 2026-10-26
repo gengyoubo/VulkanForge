@@ -19,7 +19,17 @@ final class WorldCapture {
     private static int triangleBytes(int rawBytes) { return rawBytes / BLOCK_STRIDE / 4 * 6 * WorldProtocol.STRIDE; }
     private static final AtomicLong EPOCHS = new AtomicLong();
     private static final long FRAME_BUILD_BUDGET = 1_500_000L, GEOMETRY_LIMIT = 192L * 1024 * 1024;
-    private static final int MAX_SECTIONS = 65534;
+    private static final int MAX_SECTIONS = 65534, MAX_PER_FRAME = 16;
+    /** Raw vertex bytes published per frame (the first section of a frame is always admitted). */
+    private static final long FRAME_UPLOAD_BYTES = 8L << 20;
+    /** Rolling re-validation: every frame checks 1/VALIDATION_SLICES of the tracked sections (chunk unloads, missed events). */
+    private static final int VALIDATION_SLICES = 32;
+    /** Valid sections (current, nonempty, chunk loaded) by key, and those whose candidate differs from what was published. */
+    private final Map<Long, TerrainMeshes.Snapshot> candidates = new HashMap<>();
+    private final Set<Long> pending = new HashSet<>(), failedRemovals = new HashSet<>();
+    private long generation = -1, validations, rescans, budgetDeferrals;
+    private long[] validationKeys = new long[0];
+    private int validationCursor;
     private final Map<Long, TerrainMeshes.Snapshot> sent = new HashMap<>();
     private final Map<Long, Long> queuedAt = new HashMap<>();
     private final Set<Long> dirty = java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -36,8 +46,8 @@ final class WorldCapture {
 
     long[] schedulerStats() {
         long[] sample = Arrays.copyOf(frameSamples, frameSampleCount); Arrays.sort(sample);
-        return new long[]{completedBuilds, cancelledBuilds, deferredPublishes, queuedAt.size(), maxFrameBuildNanos, maxCompletedPerFrame,
-                sample.length == 0 ? 0 : sample[(sample.length - 1) * 95 / 100]};
+        return new long[]{completedBuilds, cancelledBuilds, deferredPublishes, pending.size(), maxFrameBuildNanos, maxCompletedPerFrame,
+                sample.length == 0 ? 0 : sample[(sample.length - 1) * 95 / 100], budgetDeferrals, rescans, validations};
     }
     long epoch() { return epoch; }
     int sections() { return sent.size(); }
@@ -53,7 +63,10 @@ final class WorldCapture {
     long translucentQuads() { return translucentQuads; }
     long translucentMeshes() { return translucentMeshes; }
     void invalidate() { level = null; }
-    void close() { build = null; queuedAt.clear(); sent.clear(); dirty.clear(); geometryBytes = 0; atlasReadback.close(); lightReadback.close(); invalidate(); }
+    void close() {
+        build = null; queuedAt.clear(); sent.clear(); dirty.clear(); candidates.clear(); pending.clear(); failedRemovals.clear(); generation = -1;
+        geometryBytes = 0; atlasReadback.close(); lightReadback.close(); invalidate();
+    }
     void leave(WorldSink bridge) { if (epoch != 0) { close(); epoch = 0; atlasSent = false; bridge.reset(0); } }
 
     private static long size(TerrainMeshes.Snapshot snapshot) {
@@ -71,6 +84,10 @@ final class WorldCapture {
             bridge.reset(epoch);
             VulkanForge.LOGGER.info("Vulkan vanilla mesh capture reset: epoch={}, dimension={}", epoch, level.dimension().location());
         }
+        if (!atlasSent && !bridge.mirrorsTextures()) {
+            atlasSent = true;
+            bootstrap = bridge.send(new WorldProtocol.Mesh(epoch, 0, 0, 0, 0, new byte[0]));
+        }
         if (!atlasSent) {
             atlasReadback.request(mc.getTextureManager().getTexture(InventoryMenu.BLOCK_ATLAS).getId());
             var snapshot = atlasReadback.poll();
@@ -80,44 +97,32 @@ final class WorldCapture {
             // A void world still has a valid sky/camera even before any nonempty chunk finishes compiling.
             bootstrap = bridge.send(new WorldProtocol.Mesh(epoch, 0, 0, 0, 0, new byte[0]));
         }
-        if (!syncTextures(mc, bridge)) return;
+        if (bridge.mirrorsTextures() && !syncTextures(mc, bridge)) return;
         var position = event.getCamera().getPosition();
         float[] matrix = new Matrix4f(event.getProjectionMatrix()).mul(event.getPoseStack().last().pose()).get(new float[16]);
         float[] fog = RenderSystem.getShaderFogColor();
         bridge.camera(new WorldProtocol.Camera(epoch, position.x, position.y, position.z, matrix, fog[0], fog[1], fog[2]));
 
         long frameStart = System.nanoTime(), deadline = frameStart + FRAME_BUILD_BUDGET;
-        Map<Long, TerrainMeshes.Snapshot> candidates = new HashMap<>();
-        for (var snapshot : TerrainMeshes.snapshots(level)) if (snapshot.current() && !snapshot.empty()
-                && level.hasChunk(SectionPos.blockToSectionCoord(snapshot.origin().getX()), SectionPos.blockToSectionCoord(snapshot.origin().getZ())))
-            candidates.put(snapshot.key(), snapshot);
-        Iterator<Map.Entry<Long, TerrainMeshes.Snapshot>> old = sent.entrySet().iterator();
-        while (old.hasNext()) {
-            var entry = old.next();
-            if (candidates.get(entry.getKey()) != entry.getValue() && bridge.send(new WorldProtocol.Remove(epoch, entry.getKey()))) {
-                geometryBytes -= size(entry.getValue()); old.remove();
-            }
-        }
-        queuedAt.keySet().retainAll(candidates.keySet()); dirty.retainAll(candidates.keySet());
+        refresh(bridge);
         if (build != null && candidates.get(build.snapshot.key()) != build.snapshot) { build = null; cancelledBuilds++; }
         int completed = 0;
-        while (completed < 16 && System.nanoTime() < deadline) {
+        long uploaded = 0;
+        Deque<TerrainMeshes.Snapshot> next = select(event, position, frameStart);
+        while (completed < MAX_PER_FRAME && System.nanoTime() < deadline) {
             if (build == null) {
-                TerrainMeshes.Snapshot selected = null; double best = Double.POSITIVE_INFINITY;
-                for (var candidate : candidates.values()) {
-                    long key = candidate.key();
-                    if (sent.get(key) == candidate) { queuedAt.remove(key); continue; }
-                    long since = queuedAt.computeIfAbsent(key, ignored -> frameStart);
-                    long opaqueBytes = triangleBytes(candidate.layers()[0].length + candidate.layers()[1].length + candidate.layers()[2].length);
-                    if (sent.size() >= MAX_SECTIONS || geometryBytes + size(candidate) > GEOMETRY_LIMIT
-                            || opaqueBytes > WorldProtocol.MAX_MESH_BYTES) continue;
-                    BlockPos origin = candidate.origin();
-                    boolean visible = event.getFrustum() == null || event.getFrustum().isVisible(candidate.chunk().getBoundingBox());
-                    double score = origin.distToCenterSqr(position) - Math.min(2_000_000, (frameStart - since) / 10_000.0)
-                            - (dirty.contains(key) ? 4_000_000 : visible ? 1_000_000 : 0);
-                    if (score < best) { best = score; selected = candidate; }
-                }
+                TerrainMeshes.Snapshot selected = next.pollFirst();
                 if (selected == null) break;
+                long bytes = rawBytes(selected);
+                if (completed > 0 && uploaded + bytes > FRAME_UPLOAD_BYTES) { budgetDeferrals++; break; }
+                if (bridge.rawQuads()) {
+                    // Same-context sink: vanilla's immutable BLOCK quads are uploaded as they are, no triangle conversion.
+                    BlockPos origin = selected.origin();
+                    if (!bridge.quads(epoch, selected.key(), origin.getX(), origin.getY(), origin.getZ(), selected.layers())) { deferredPublishes++; break; }
+                    published(bridge, selected, selected.layers()[3].length / (4 * BLOCK_STRIDE));
+                    uploaded += bytes; completed++; completedBuilds++;
+                    continue;
+                }
                 build = new Build(selected);
             }
             if (!build.step(deadline)) break;
@@ -125,17 +130,93 @@ final class WorldCapture {
             if (!bridge.send(new WorldProtocol.Mesh(epoch, source.key(), origin.getX(), origin.getY(), origin.getZ(), build.opaque, build.translucent))) {
                 deferredPublishes++; break;
             }
-            sent.put(source.key(), source); geometryBytes += size(source); queuedAt.remove(source.key()); dirty.remove(source.key());
-            if (bootstrap) { if (source.key() != 0) bridge.send(new WorldProtocol.Remove(epoch, 0)); bootstrap = false; }
-            cutoutQuads += (source.layers()[1].length + source.layers()[2].length) / (4 * BLOCK_STRIDE);
-            translucentQuads += build.translucent.length / (6 * WorldProtocol.STRIDE);
-            if (build.translucent.length > 0) translucentMeshes++;
-            build = null; completed++; completedBuilds++;
+            published(bridge, source, build.translucent.length / (6 * WorldProtocol.STRIDE));
+            uploaded += rawBytes(source); build = null; completed++; completedBuilds++;
         }
         long elapsed = System.nanoTime() - frameStart;
         maxFrameBuildNanos = Math.max(maxFrameBuildNanos, elapsed); maxCompletedPerFrame = Math.max(maxCompletedPerFrame, completed);
         frameSamples[frameSampleCursor++ & (frameSamples.length - 1)] = elapsed;
         frameSampleCount = Math.min(frameSampleCount + 1, frameSamples.length);
+    }
+
+    private static long rawBytes(TerrainMeshes.Snapshot snapshot) { long bytes = 0; for (byte[] layer : snapshot.layers()) bytes += layer.length; return bytes; }
+
+    /**
+     * Brings candidates/pending up to date from TerrainMeshes' change queue; a full rescan only after the ViewArea was replaced.
+     * A slice of the tracked keys is re-validated every frame, so chunk unloads and anything without a change event are caught
+     * within VALIDATION_SLICES frames.
+     */
+    private void refresh(WorldSink bridge) {
+        if (TerrainMeshes.generation() != generation) {
+            generation = TerrainMeshes.generation(); rescans++;
+            while (TerrainMeshes.nextChange() != null) { }
+            Set<Long> keys = new HashSet<>(candidates.keySet()); keys.addAll(sent.keySet());
+            candidates.clear();
+            for (var snapshot : TerrainMeshes.snapshots(level)) keys.add(snapshot.key());
+            for (long key : keys) consider(key, bridge);
+        } else for (Long key = TerrainMeshes.nextChange(); key != null; key = TerrainMeshes.nextChange()) consider(key, bridge);
+        if (!failedRemovals.isEmpty()) for (Long key : new ArrayList<>(failedRemovals)) consider(key, bridge);
+        if (validationCursor >= validationKeys.length) {
+            Set<Long> keys = new HashSet<>(candidates.keySet()); keys.addAll(sent.keySet());
+            validationKeys = keys.stream().mapToLong(Long::longValue).toArray(); validationCursor = 0;
+            dirty.retainAll(keys); // edits of sections that never produced geometry
+        }
+        int slice = Math.max(1, (validationKeys.length + VALIDATION_SLICES - 1) / VALIDATION_SLICES);
+        for (int end = Math.min(validationKeys.length, validationCursor + slice); validationCursor < end; validationCursor++) { consider(validationKeys[validationCursor], bridge); validations++; }
+    }
+
+    /** One section key: is its current snapshot drawable, and does the published one still match? */
+    private void consider(long key, WorldSink bridge) {
+        TerrainMeshes.Snapshot snapshot = TerrainMeshes.snapshot(key);
+        boolean valid = snapshot != null && snapshot.current() && !snapshot.empty()
+                && level.hasChunk(SectionPos.blockToSectionCoord(snapshot.origin().getX()), SectionPos.blockToSectionCoord(snapshot.origin().getZ()));
+        if (valid) candidates.put(key, snapshot); else { candidates.remove(key); snapshot = null; }
+        TerrainMeshes.Snapshot published = sent.get(key);
+        if (published != null && published != snapshot) {
+            if (bridge.send(new WorldProtocol.Remove(epoch, key))) { geometryBytes -= size(published); sent.remove(key); failedRemovals.remove(key); published = null; }
+            else failedRemovals.add(key);
+        }
+        if (snapshot != null && published != snapshot) pending.add(key);
+        else {
+            pending.remove(key); queuedAt.remove(key);
+            // A block edit marks the section before vanilla recompiles it; keep the priority until it is gone or republished.
+            if (snapshot == null) dirty.remove(key);
+        }
+    }
+
+    /**
+     * Up to MAX_PER_FRAME pending sections in publish order, from one pass with a bounded heap. Lower score first: distance,
+     * minus a bonus for waiting (no starvation), for block edits (most urgent) and for being in view.
+     */
+    private Deque<TerrainMeshes.Snapshot> select(RenderLevelStageEvent event, net.minecraft.world.phys.Vec3 position, long now) {
+        PriorityQueue<Object[]> best = new PriorityQueue<>(MAX_PER_FRAME + 1, (a, b) -> Double.compare((Double) b[0], (Double) a[0]));
+        for (long key : pending) {
+            TerrainMeshes.Snapshot candidate = candidates.get(key);
+            if (candidate == null) continue;
+            long since = queuedAt.computeIfAbsent(key, ignored -> now);
+            long opaqueBytes = triangleBytes(candidate.layers()[0].length + candidate.layers()[1].length + candidate.layers()[2].length);
+            if (sent.size() >= MAX_SECTIONS || geometryBytes + size(candidate) > GEOMETRY_LIMIT
+                    || opaqueBytes > WorldProtocol.MAX_MESH_BYTES || triangleBytes(candidate.layers()[3].length) > WorldProtocol.MAX_MESH_BYTES) continue;
+            double score = candidate.origin().distToCenterSqr(position) - Math.min(2_000_000, (now - since) / 10_000.0);
+            if (dirty.contains(key)) score -= 4_000_000;
+            else if (best.size() < MAX_PER_FRAME || score - 1_000_000 < (Double) best.peek()[0]) {
+                // The frustum test is the expensive part; only sections that could still make the cut pay for it.
+                if (event.getFrustum() == null || event.getFrustum().isVisible(candidate.chunk().getBoundingBox())) score -= 1_000_000;
+            }
+            if (best.size() < MAX_PER_FRAME) best.add(new Object[]{score, candidate});
+            else if (score < (Double) best.peek()[0]) { best.poll(); best.add(new Object[]{score, candidate}); }
+        }
+        ArrayDeque<TerrainMeshes.Snapshot> order = new ArrayDeque<>(best.size());
+        while (!best.isEmpty()) order.addFirst((TerrainMeshes.Snapshot) best.poll()[1]);
+        return order;
+    }
+
+    private void published(WorldSink bridge, TerrainMeshes.Snapshot source, long translucent) {
+        sent.put(source.key(), source); geometryBytes += size(source); queuedAt.remove(source.key()); dirty.remove(source.key()); pending.remove(source.key());
+        if (bootstrap) { if (source.key() != 0) bridge.send(new WorldProtocol.Remove(epoch, 0)); bootstrap = false; }
+        cutoutQuads += (source.layers()[1].length + source.layers()[2].length) / (4 * BLOCK_STRIDE);
+        translucentQuads += translucent;
+        if (translucent > 0) translucentMeshes++;
     }
 
     private boolean syncTextures(Minecraft mc, WorldSink bridge) {

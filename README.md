@@ -230,6 +230,65 @@ HAND 从 `AFTER_LEVEL` 到 `GameRenderer.render` 的 GUI 深度清除，保存�
 
 2026-10-26 本轮回归：资源压力、GPU Driven / push 与回退路径、世界和兼容桥像素检查、完整 Forge 场景及 `build` 均通过。新增远处/垂直 Section 覆盖、4→6→4 距离变化、退出世界缓存释放、手持物直画交换链及 GUI 回退顺序检查。主窗口启用 Khronos 与同步校验，完成 12978 帧呈现，`VALIDATION_ERRORS=0`；5485 次异步上传背压等待为零。手持物光照图按版本绑定后，同一回归流程的 uniform Descriptor 更新从 1928 次降至 6 次；这是缓存工作量计数，不代表 FPS 提升。报告位于 `run/logs/vulkanforge/world-client-smoke/report.txt` 与 `run/logs/vulkanforge/main-window-report.txt`。
 
+## OpenGL 4.6 后端（Issue #4）
+
+对应 [GL43-46 / issue #4](https://github.com/gengyoubo/VulkanForge/issues/4)。配置 `renderer.backend = "OPENGL"`、`opengl.version = "GL_4_6"`，重启后进入世界按 F8（或主菜单左下角按钮）开启。配置在窗口创建前直接读取 TOML（Forge 此时尚未加载客户端配置），所以修改需重启；`-Dvulkanforge.startup=OPENGL:GL_4_6` 可只对本次启动覆盖。目前已实现的组合只有 Vulkan 1.4 与 OpenGL 4.6：Vulkan 1.2/1.3 保留原版 GL 窗口，OpenGL 4.3–4.5 只请求对应上下文、地形仍走原版，配置界面标注“未实现”。OpenGL 后端不创建 Vulkan 主窗口，也不运行启动期 Vulkan 探测。
+
+Forge 早期窗口按 4.6 → 3.2 依次尝试，已经拿到驱动支持的最高版本；只有关闭 `earlyWindowControl` 且上下文低于 4.6 时才按 4.6 core 重建窗口。所有绘制都在游戏自己的 GL 上下文中直接画进主 framebuffer 与原版深度，不需要合成、共享图像或纹理读回：直接采样原版方块图集和光照图。
+
+| GL 版本 | 功能 | 当前用法 |
+| --- | --- | --- |
+| 4.3 | Compute Shader、SSBO、Multi Draw Indirect | `cull.comp`：原版可见性位图 + 视锥 + Hi-Z，按 solid / cutoutMipped / cutout 三层写 `DrawElementsIndirectCommand`；`hiz.comp` 构建深度金字塔 |
+| 4.4 | Buffer Storage、Persistent Mapping | 不可变存储；上传暂存、每次绘制的 UBO、半透明与实体命令、实体顶点/索引/逐绘制记录都是持久映射环形缓冲，按段 fence |
+| 4.5 | DSA | `glCreate*`、`glNamedBuffer*`、`glVertexArray*`、`glBindTextureUnit`、采样器对象；顶点池按 GPU 拷贝扩容 |
+| 4.6 | Indirect Count、SPIR-V | 每层一次 `glMultiDrawElementsIndirectCount`（GPU 计数）；着色器构建期由 shaderc 编成 GL SPIR-V（`:vulkan-lab:glSpirv`），驱动拒绝时回退同一份 GLSL 4.60 |
+
+### 地形
+
+地形直接接收原版 BLOCK 格式四边形（`WorldSink.quads`），不再展开成三角形：每个四边形 128 字节（原 168 字节），共享一份 0 1 2 / 2 3 0 索引缓冲，按 `baseVertex` 定位。三层分别使用原版的 mip 过滤与 alpha 阈值（solid 不丢弃、cutoutMipped 0.5、cutout 0.1 且不采样 mip），并接入原版雾。Clip Control 没有使用：地形与原版共享深度缓冲，改深度范围会让两边深度不一致。
+
+剔除依次为：
+
+1. **原版可见性**：每帧读取 `LevelRenderer.renderChunksInFrustum`（视锥 + 原版遮挡图洪泛），按槽位位图上传；GL 4.6 只绘制原版本帧也会绘制的 Section。此前 `cull.comp` 只做视锥剔除，实际比原版画得多（测试场景 79 个槽位中原版只保留 44 个）。读取失败时退回仅视锥。
+2. **视锥**：`cull.comp` 按 Section 包围盒测试。
+3. **Hi-Z**：`AFTER_CUTOUT_BLOCKS`（全部不透明地形已写入深度、实体尚未绘制）用 `hiz.comp` 把主 framebuffer 深度做成 R32F 最大值金字塔；下一帧用**上一帧**相机投影包围盒，选择使矩形最多覆盖 2×2 texel 的层级，盒子最近深度比该区域最远深度更远才剔除。保守规则：跨近平面、转向超过 10°、移动超过 2 格、投影变化超过 2%、分辨率变化、世界切换时该帧不使用 Hi-Z。
+
+半透明 Section 由远到近、Section 内四边形由远到近，一次 `glMultiDrawElementsIndirect`。上传时先以采集顺序写入（立即可画），之后按距离由近到远在每帧 32768 个四边形预算内排序；小幅移动后对上一次的顺序做插入排序（接近线性），移动超过 8 格才完整排序；远处 Section 的重排阈值按距离放宽；排序缓冲复用，索引直接写入持久映射暂存区。
+
+上传批处理：网格从 Java 数组直接写入持久映射暂存环形缓冲（不再经 `memAlloc` 中转），复制命令排队，源与目标都连续时合并（同一 Section 的三层、加载时连续分配的 Section），在每次地形绘制前统一发出。环形缓冲只在游标离开某段时才放 fence：`glFenceSync` 在本机每次 20–47 µs，此前每个通道每帧都会创建。
+
+### 实体与方块实体
+
+Vulkan 地形之后到 `AFTER_BLOCK_ENTITIES` 之间，`NEW_ENTITY` 格式的 `rendertype_entity_*` / `armor_cutout_no_cull` / `entity_shadow` 绘制被复制进持久映射环形缓冲；256 字节逐绘制记录（矩阵、ColorModulator、光照方向、雾）放在 SSBO，每条间接命令的 `baseInstance` 是记录下标，SSBO 每次刷新只绑定一次。不透明绘制按 GL 状态与贴图分组（首次出现顺序），混合绘制保持原顺序并放在之后，每组一次 `glMultiDrawElementsIndirect`；连续 QUADS 使用静态四边形索引，不在 CPU 写索引。其他绘制（发光、文字、输出到其他 framebuffer 等）先刷新已捕获部分再由原版绘制，保持画家顺序。Fabulous 模式不启用实体通道。
+
+GL 状态不再用 `glGet*` 查询：`GlStateCache` 按类型反射读取原版 `GlStateManager` 与 `ShaderInstance` 的缓存（生产环境字段名为 SRG），创建时与真实 GL 状态比对，不一致或布局不符则退回查询；`-Pgl46Verify` 会逐次比对（检查中 79752 次全部一致）。顶点数组不恢复，而是令 `BufferUploader` 失效，原版每次绘制前都会重新绑定。
+
+方块实体网格缓存：`coremods/block_entities.js` 改写 `BlockEntityRenderDispatcher.setupAndRender` 中唯一的渲染器调用。目前只接管原版 `ChestRenderer` 本身（不含子类），以 BlockState + 方块实体类为键：首次用单位矩阵运行一次渲染器，取得方块空间网格和该 RenderType 的 GL 状态，上传到设备本地缓存；之后每个箱子只提交一个实例（PoseStack 位姿与法线矩阵、按 `BrightnessCombiner` 计算的光照、覆盖层），同一网格的全部实例一次实例化间接绘制。盖子正在开合的箱子、无法缓存的 RenderType 仍走原版。资源重载时清空缓存。
+
+### 检查与数据
+
+```powershell
+# 平坦世界：水、玻璃、树叶、牛群、箱子、带孔石墙；GL 4.6 开 → 关（原版）→ 再开 → 飞行 → 180° 转向
+.\gradlew.bat -Pgl46Smoke runClient
+# 逐次比对 GL 状态缓存与 glGet（正确性检查，计时不具代表性）
+.\gradlew.bat -Pgl46Smoke -Pgl46Verify runClient
+# A/B 开关，逗号分隔：glsl, noHiZ, noVanillaVisibility, noBlockEntityCache, noEntities
+.\gradlew.bat -Pgl46Smoke -Pgl46Flags=noBlockEntityCache runClient
+```
+
+报告：`logs/vulkanforge/gl46-report.txt`（上下文、着色器路径、状态缓存、首帧 GL 错误、关闭统计），检查结果与截图在 `logs/vulkanforge/gl46-smoke/`。2026-10-26 本机 RTX 3050 Laptop / NVIDIA 610.78、渲染距离 4 的测试场景（以下 CPU 时间指提交 GL 命令的 CPU 耗时，不是 GPU 时间，也未测 FPS）：
+
+| 指标 | 结果 |
+| --- | --- |
+| 与原版截图差异 | 平均 0.13（0–255），超过 48 的像素 0.01–0.02% |
+| 每帧 Section | 槽位 79 → 原版可见 44 → 视锥 42 → Hi-Z 再剔除 18（43%，带孔石墙专门构造为原版遮挡图无法剔除的情形，开阔地形收益会小得多）；180° 转向帧正确跳过 Hi-Z |
+| 实体合批 | 每次 MDI 平均 5.25 个绘制，splits 0，fallbacks 0；限制主要是贴图种类，跨贴图需 bindless |
+| fence 优化前 → 后（每帧均值） | 实体刷新 110.9 → 36.2 µs，不透明地形 110.1 → 40.1 µs，半透明 53.3 → 15.6 µs |
+| 静态索引 | 实体捕获约 44 → 7 µs/帧（无阴影时） |
+| 每帧 p50 / p95 | 不透明地形 31 / 60 µs，半透明 8 / 16 µs，实体捕获 19 / 39 µs，实体刷新 31 / 72 µs |
+| 箱子网格缓存 | 26 个箱子共用 1 个缓存网格、每帧 1 次实例化绘制；渲染器调用每个 2.52 → 1.40 µs |
+| 上传批处理 | 51–79 个 Section 网格合并为 22–24 次 GPU 复制 |
+
 ## 减少 OpenGL 依赖
 
 ### 直接使用共享主目标呈现

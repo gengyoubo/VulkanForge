@@ -14,7 +14,7 @@
   "vulkanforge.launching": "Starting Vulkan test window. See logs/vulkanforge for the report.",
   "vulkanforge.busy": "A Vulkan test window is already running.",
   "vulkanforge.config.title": "VulkanForge Settings",
-  "vulkanforge.config.pending": "Saved only - not applied yet. Will take effect after a restart once implemented.",
+  "vulkanforge.config.pending": "This launch: %s | changes apply after restarting the game",
   "vulkanforge.config.backend": "Renderer",
   "vulkanforge.config.backend.vulkan": "Vulkan",
   "vulkanforge.config.backend.opengl": "OpenGL",
@@ -35,5 +35,11 @@
   "vulkanforge.config.nvidia.representative_fragment_test": "Representative fragment test",
   "vulkanforge.config.nvidia.representative_fragment_test.tooltip": "Skips redundant fragments in occlusion-query style passes.",
   "vulkanforge.config.nvidia.shading_rate_image": "Shading rate image",
-  "vulkanforge.config.nvidia.shading_rate_image.tooltip": "Variable-rate shading driven by an image; lowers shading cost in less important screen regions."
+  "vulkanforge.config.nvidia.shading_rate_image.tooltip": "Variable-rate shading driven by an image; lowers shading cost in less important screen regions.",
+  "vulkanforge.config.unimplemented": " (not implemented)",
+  "vulkanforge.gl46.status": "OpenGL 4.6 terrain | %s sections | frame %s",
+  "vulkanforge.gl46.waiting": "OpenGL 4.6 terrain | waiting for section meshes",
+  "vulkanforge.gl46.controls": "F8 toggle | GPU culling + indirect draws",
+  "vulkanforge.gl46.unavailable": "OpenGL 4.6 terrain unavailable: %s",
+  "vulkanforge.gl46.failed": "OpenGL 4.6 terrain failed and fell back to vanilla; see the log"
 }

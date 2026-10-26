@@ -115,6 +115,10 @@ public final class ClientEvents {
         }
 
         @SubscribeEvent
-        public static void setup(FMLClientSetupEvent event) { event.enqueueWork(LabLauncher::probe); }
+        public static void setup(FMLClientSetupEvent event) {
+            // The OpenGL backend never creates a Vulkan device; F9's standalone window still probes on demand.
+            if (github.com.gengyoubo.vulkanforge.config.VulkanForgeConfig.startup().backend()
+                    == github.com.gengyoubo.vulkanforge.config.VulkanForgeConfig.Backend.VULKAN) event.enqueueWork(LabLauncher::probe);
+        }
     }
 }

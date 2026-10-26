@@ -1,0 +1,93 @@
+#version 460 core
+layout(local_size_x = 64) in;
+layout(std140, binding = 0) uniform Frame {
+    mat4 viewProjection;
+    ivec4 cameraBlock;
+    vec4 cameraFraction;
+    vec4 fogColor;
+    vec4 fog;
+    uvec4 counts;  // x: section slots, y: command capacity per layer
+};
+// Previous frame's camera and depth pyramid. pyramid: x/y level-0 size, z levels, w 1 = occlusion test enabled this frame.
+layout(std140, binding = 1) uniform Occlusion {
+    mat4 previousViewProjection;
+    ivec4 previousCameraBlock;
+    vec4 previousCameraFraction;
+    ivec4 pyramid;
+};
+// draw: x first vertex of the section's opaque quads, then y solid, z cutoutMipped, w cutout quad counts.
+struct Section { ivec4 origin; vec4 minimum; vec4 maximum; uvec4 draw; };
+struct Command { uint count; uint instanceCount; uint firstIndex; int baseVertex; uint baseInstance; };
+layout(std430, binding = 0) readonly buffer Sections { Section sections[]; };
+layout(std430, binding = 1) writeonly buffer Commands { Command commands[]; };
+// drawCounts feed glMultiDrawElementsIndirectCount; the rest are statistics read back a few frames later.
+layout(std430, binding = 2) buffer Counts { uint drawCounts[3]; uint tested; uint frustumVisible; uint occluded; };
+// One bit per slot: the section is in vanilla's renderChunksInFrustum this frame (all ones when unavailable).
+layout(std430, binding = 3) readonly buffer Visibility { uint visible[]; };
+// Unit 2 (vanilla Sampler2) so GL state restore covers it; the lightmap is rebound there before the layer draws.
+layout(binding = 2) uniform sampler2D hiZ;
+
+vec3 corner(Section section, uint index) {
+    return vec3((index & 1u) == 0u ? section.minimum.x : section.maximum.x,
+                (index & 2u) == 0u ? section.minimum.y : section.maximum.y,
+                (index & 4u) == 0u ? section.minimum.z : section.maximum.z);
+}
+
+// Conservative: anything that reaches the near plane, or whose nearest depth is not behind the farthest depth stored over
+// its whole screen rectangle in last frame's terrain, stays visible.
+bool hiddenByHiZ(Section section) {
+    vec3 base = vec3(section.origin.xyz - previousCameraBlock.xyz) - previousCameraFraction.xyz;
+    vec2 lo = vec2(1.0), hi = vec2(-1.0);
+    float nearest = 1.0;
+    for (uint index = 0u; index < 8u; index++) {
+        vec4 clip = previousViewProjection * vec4(base + corner(section, index), 1.0);
+        if (clip.w <= 0.1) return false;
+        vec3 ndc = clip.xyz / clip.w;
+        lo = min(lo, ndc.xy); hi = max(hi, ndc.xy);
+        nearest = min(nearest, ndc.z * 0.5 + 0.5);
+    }
+    if (nearest <= 0.0) return false;
+    vec2 size = vec2(pyramid.xy);
+    // One level-0 texel of padding against rounding between the pyramid and the screen.
+    lo = clamp(lo * 0.5 + 0.5 - 1.0 / size, 0.0, 1.0);
+    hi = clamp(hi * 0.5 + 0.5 + 1.0 / size, 0.0, 1.0);
+    vec2 extent = (hi - lo) * size;
+    int level = clamp(int(ceil(log2(max(max(extent.x, extent.y), 1.0)))), 0, pyramid.z - 1);
+    ivec2 levelSize = max(pyramid.xy >> level, ivec2(1));
+    // At this level the rectangle spans at most two texels per axis.
+    ivec2 a = clamp(ivec2(lo * vec2(levelSize)), ivec2(0), levelSize - 1);
+    ivec2 b = clamp(ivec2(hi * vec2(levelSize)), ivec2(0), levelSize - 1);
+    float farthest = 0.0;
+    for (int y = a.y; y <= b.y; y++) for (int x = a.x; x <= b.x; x++) farthest = max(farthest, texelFetch(hiZ, ivec2(x, y), level).r);
+    return nearest > farthest;
+}
+
+// Vanilla visibility, then frustum, then (when enabled) last frame's Hi-Z; each visible layer gets a
+// DrawElementsIndirectCommand over the shared quad index buffer plus a GPU draw count.
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= counts.x) return;
+    Section section = sections[index];
+    if (section.draw.y + section.draw.z + section.draw.w == 0u) return;
+    if ((visible[index >> 5u] & (1u << (index & 31u))) == 0u) return;
+    atomicAdd(tested, 1u);
+    vec3 base = vec3(section.origin.xyz - cameraBlock.xyz) - cameraFraction.xyz;
+    uint outside = 63u;
+    for (uint c = 0u; c < 8u; c++) {
+        vec4 clip = viewProjection * vec4(base + corner(section, c), 1.0);
+        outside &= (clip.x < -clip.w ? 1u : 0u) | (clip.x > clip.w ? 2u : 0u)
+                 | (clip.y < -clip.w ? 4u : 0u) | (clip.y > clip.w ? 8u : 0u)
+                 | (clip.z < -clip.w ? 16u : 0u) | (clip.z > clip.w ? 32u : 0u);
+    }
+    if (outside != 0u) return;
+    atomicAdd(frustumVisible, 1u);
+    if (pyramid.w != 0 && hiddenByHiZ(section)) { atomicAdd(occluded, 1u); return; }
+    uint first = section.draw.x;
+    uint quads[3] = uint[3](section.draw.y, section.draw.z, section.draw.w);
+    for (uint layer = 0u; layer < 3u; layer++) {
+        if (quads[layer] == 0u) continue;
+        uint slot = atomicAdd(drawCounts[layer], 1u);
+        commands[layer * counts.y + slot] = Command(quads[layer] * 6u, 1u, 0u, int(first), index);
+        first += quads[layer] * 4u;
+    }
+}

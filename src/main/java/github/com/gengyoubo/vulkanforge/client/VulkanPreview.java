@@ -2,6 +2,8 @@ package github.com.gengyoubo.vulkanforge.client;
 
 import com.mojang.blaze3d.systems.RenderSystem;
 import github.com.gengyoubo.vulkanforge.VulkanForge;
+import github.com.gengyoubo.vulkanforge.config.VulkanForgeConfig;
+import java.util.Map;
 import dev.vulkanforge.bridge.FrameProtocol;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
@@ -29,12 +31,19 @@ final class VulkanPreview {
     private static boolean prepared,preparingAllowed;
     private static final WorldCapture WORLD = new WorldCapture();
     private static final TerrainPresenter PRESENTER = new TerrainPresenter();
+    /** OpenGL backend (issue #4): in-context GL 4.6 terrain instead of any Vulkan transport. */
+    private static Gl46Terrain gl;
+    /** True from this frame's GL opaque draw until AFTER_TRANSLUCENT_BLOCKS; vanilla skips covered sections only then. */
+    private static boolean glDrawn;
+    /** GL 4.6 entity/block-entity pass; null when it could not be created (terrain still runs). */
+    private static Gl46Entities glEntities;
 
     private VulkanPreview() { }
 
     static void toggle() {
         RenderSystem.assertOnRenderThread();
         if (enabled) close();
+        else if (VulkanForgeConfig.startup().backend() == VulkanForgeConfig.Backend.OPENGL) enableGl();
         else {
             enabled = true;
             uploaded = lastLogged = 0;
@@ -46,8 +55,102 @@ final class VulkanPreview {
         }
     }
 
+    private static void enableGl() {
+        String reason = Gl46Context.terrainUnsupported();
+        if (reason == null) {
+            GlStateCache.initialise();
+            try { gl = new Gl46Terrain(); }
+            catch (RuntimeException error) { VulkanForge.LOGGER.error("Could not create the OpenGL 4.6 terrain renderer", error); reason = error.getMessage(); }
+        }
+        if (gl == null) {
+            VulkanForge.LOGGER.warn("OpenGL 4.6 terrain unavailable: {}", reason);
+            Gl46Context.report("TERRAIN_UNAVAILABLE=" + reason);
+            notifyPlayer(Component.translatable("vulkanforge.gl46.unavailable", String.valueOf(reason)));
+            return;
+        }
+        enabled = true; direct = false; sink = gl;
+        uploaded = lastLogged = 0;
+        if (!Boolean.getBoolean("vulkanforge.gl46.noEntities")) {
+            try { glEntities = new Gl46Entities(); }
+            catch (RuntimeException error) { VulkanForge.LOGGER.error("GL 4.6 entity pass unavailable; entities stay on vanilla", error); Gl46Context.report("ENTITY_UNAVAILABLE=" + error); }
+        }
+        VulkanForge.LOGGER.info("Terrain transport: in-context OpenGL 4.6 (compute culling + multi-draw indirect count)");
+        WORLD.invalidate();
+    }
+    private static void notifyPlayer(Component message) {
+        if (Minecraft.getInstance().player != null) Minecraft.getInstance().player.displayClientMessage(message, false);
+    }
+    /** First chunk-layer draw of the frame (after compileChunks and terrain fog setup), or AFTER_CUTOUT_BLOCKS as a fallback. */
+    private static void glOpaque() {
+        glDrawn = false;
+        if (captureEvent == null || Minecraft.getInstance().level == null) return;
+        try {
+            long updateStart = System.nanoTime();
+            WORLD.update(captureEvent, sink);
+            UPDATE_TIMER.sample(Math.max(1, System.nanoTime() - updateStart));
+            // Draw exactly what vanilla's occlusion graph keeps this frame (plus frustum and Hi-Z on top).
+            boolean known = !Boolean.getBoolean("vulkanforge.gl46.noVanillaVisibility") && VanillaVisibility.available();
+            gl.beginVisibility(known);
+            if (known) VanillaVisibility.forEach(Minecraft.getInstance().levelRenderer, gl::markVisible);
+            gl.view(captureEvent.getCamera().getYRot(), captureEvent.getCamera().getXRot(), captureEvent.getProjectionMatrix());
+            int[] textures = glTextures();
+            glDrawn = gl.drawOpaque(textures[0], textures[1]) && gl.epoch() == WORLD.epoch();
+            if (glDrawn) { uploadedEpoch = WORLD.epoch(); uploaded = gl.frames(); }
+        } catch (RuntimeException error) { glFailed(error); }
+    }
+    /** Vanilla's own block atlas and lightmap: the GL path never reads textures back. */
+    private static int[] glTextures() {
+        Minecraft mc = Minecraft.getInstance();
+        mc.gameRenderer.lightTexture().turnOnLightLayer();
+        return new int[]{mc.getTextureManager().getTexture(net.minecraft.world.inventory.InventoryMenu.BLOCK_ATLAS).getId(), RenderSystem.getShaderTexture(2)};
+    }
+    /** BlockEntityMeshes hook; failures disable the entity pass like capture failures. */
+    static boolean gl46BlockEntity(net.minecraft.client.renderer.blockentity.BlockEntityRenderer<?> renderer, net.minecraft.world.level.block.entity.BlockEntity entity,
+                                   float partial, com.mojang.blaze3d.vertex.PoseStack pose, int light, int overlay) {
+        if (glEntities == null) return false;
+        try { return glEntities.blockEntity(renderer, entity, partial, pose, light, overlay); }
+        catch (RuntimeException error) { glEntitiesFailed(error); return false; }
+    }
+    static long[] gl46BlockEntityStats() { return glEntities != null ? glEntities.blockEntityStats() : new long[7]; }
+    /** EntityDraws hook; an entity-pass failure only disables that pass. */
+    static boolean gl46Entity(com.mojang.blaze3d.vertex.BufferBuilder.RenderedBuffer rendered) {
+        if (glEntities == null) return false;
+        try { return Gl46Entities.take(rendered); }
+        catch (RuntimeException error) { glEntitiesFailed(error); return false; }
+    }
+    private static void glEntitiesEnd() {
+        if (glEntities == null) return;
+        try { glEntities.end(); } catch (RuntimeException error) { glEntitiesFailed(error); }
+    }
+    private static void glEntitiesFailed(RuntimeException error) {
+        VulkanForge.LOGGER.error("OpenGL 4.6 entity pass failed; entities return to vanilla until F8 restarts it", error);
+        Gl46Context.report("ENTITY_FAILED=" + error);
+        Gl46Entities failed = glEntities; glEntities = null;
+        failed.close();
+    }
+    static long[] gl46EntityStats() { return glEntities != null ? glEntities.stats() : new long[7]; }
+    static Map<String, Long> gl46EntityFallbacks() { return glEntities != null ? glEntities.fallbacks() : Map.of(); }
+    private static void glFailed(RuntimeException error) {
+        VulkanForge.LOGGER.error("OpenGL 4.6 terrain failed; vanilla terrain rendering resumes", error);
+        Gl46Context.report("TERRAIN_FAILED=" + error);
+        notifyPlayer(Component.translatable("vulkanforge.gl46.failed"));
+        close();
+    }
+
     static void terrain(net.minecraftforge.client.event.RenderLevelStageEvent event) {
         if (!enabled || sink == null) return;
+        if (gl != null) {
+            if (preparingAllowed && !prepared) glOpaque();
+            prepared = false; preparingAllowed = false;
+            if (glDrawn) {
+                var target = Minecraft.getInstance().getMainRenderTarget();
+                try { gl.buildHiZ(target.getDepthTextureId(), target.width, target.height); }
+                catch (RuntimeException error) { glFailed(error); return; }
+            }
+            // Entities and block entities follow; only frames whose terrain ran on GL 4.6 replay them there.
+            if (glDrawn && glEntities != null) glEntities.begin();
+            return;
+        }
         translucentPending = false;
         EntityDraws.cancel();
         // P10: the next frame's sky may be captured only while this frame's terrain composite covers the screen.
@@ -107,14 +210,26 @@ final class VulkanPreview {
     /** ViewportEvent.ComputeFogColor: LevelRenderer is about to clear and draw the sky. */
     static void skyBegin() { if (enabled && direct) EntityDraws.openSky(); }
     /** AFTER_SKY: captured sky waits for this frame's terrain submit. */
-    static void skyEnd(net.minecraftforge.client.event.RenderLevelStageEvent event) { EntityDraws.closeSky();captureEvent=event;prepared=false;preparingAllowed=true; }
+    static void skyEnd(net.minecraftforge.client.event.RenderLevelStageEvent event) {
+        EntityDraws.closeSky();captureEvent=event;prepared=false;preparingAllowed=true;
+        long now = System.nanoTime();
+        if (lastSky != 0 && enabled && gl != null) FRAME_TIMER.sample(now - lastSky);
+        lastSky = now;
+    }
+    /** GL 4.6 diagnostics: interval between consecutive frames' AFTER_SKY (whole frame), and WorldCapture.update CPU. */
+    static final Gl46Timer FRAME_TIMER = new Gl46Timer(), UPDATE_TIMER = new Gl46Timer();
+    private static long lastSky;
     static void prepareTerrain(){
+        if (gl != null) { if (enabled && preparingAllowed && !prepared) { prepared = true; glOpaque(); } return; }
         if(!preparingAllowed||prepared||!nativeTerrain()||sink==null||captureEvent==null||!NativeMainWindow.worldVisible())return;
         WORLD.update(captureEvent,sink);renderShared();prepared=true;
     }
 
     /** AFTER_BLOCK_ENTITIES: replay captured entity/block-entity draws in Vulkan and composite them with depth. */
-    static void entities() { overlay(EntityDraws.Window.ENTITIES, EntityDraws.Window.EFFECTS); }
+    static void entities() {
+        if (gl != null) { glEntitiesEnd(); return; }
+        overlay(EntityDraws.Window.ENTITIES, EntityDraws.Window.EFFECTS);
+    }
     /** AFTER_TRIPWIRE_BLOCKS: the next thing vanilla draws is ParticleEngine.render (P9). */
     static void particlesBegin() { overlay(EntityDraws.Window.EFFECTS,EntityDraws.Window.PARTICLES); }
     /** AFTER_PARTICLES: composite particles, then capture rain/snow until AFTER_WEATHER. */
@@ -131,18 +246,33 @@ final class VulkanPreview {
 
     /** AFTER_TRANSLUCENT_BLOCKS: after GL entities and the (partially skipped) vanilla translucent layer. */
     static void translucent() {
+        if (gl != null) {
+            glEntitiesEnd(); // normally already closed at AFTER_BLOCK_ENTITIES
+            try {
+                if (enabled && glDrawn && !Minecraft.useShaderTransparency()) {
+                    int[] textures = glTextures();
+                    gl.drawTranslucent(textures[0], textures[1]); translucentComposites++;
+                }
+            } catch (RuntimeException error) { glFailed(error); }
+            glDrawn = false;
+            return;
+        }
         EntityDraws.flushCurrent();
         if (!translucentPending) return;
         translucentPending = false;
         try { PRESENTER.drawTranslucent(sharedTranslucent, sharedTranslucentDepth); translucentComposites++; }
         catch (Exception error) { VulkanForge.LOGGER.error("Could not composite Vulkan translucent terrain", error); close(); }
     }
-    /** Fabulous uses its shared translucent target and preserves the vanilla transparency chain's layer/depth inputs. */
-    static boolean replacesTranslucent(net.minecraft.core.BlockPos origin) { return translucentPending && replacesSection(origin); }
+    /** Fabulous mode renders translucency into its own target for the transparency post chain; leave that to vanilla. */
+    static boolean replacesTranslucent(net.minecraft.core.BlockPos origin) {
+        if (gl != null) return !Minecraft.useShaderTransparency() && replacesSection(origin);
+        return translucentPending && replacesSection(origin);
+    }
+
     static long translucentComposites() { return translucentComposites; }
     static long translucentQuads() { return WORLD.translucentQuads(); }
     static long translucentMeshes() { return WORLD.translucentMeshes(); }
-    static void invalidateWorld() { WORLD.invalidate(); }
+    static void invalidateWorld() { WORLD.invalidate(); if (glEntities != null) glEntities.invalidateBlockEntities(); }
     static void markDirty(int x, int y, int z) { if (enabled) WORLD.markDirty(x, y, z); }
     static void toggleInset() { inset = !inset; }
     static long worldEpoch() { return uploadedEpoch == WORLD.epoch() ? uploadedEpoch : 0; }
@@ -154,10 +284,28 @@ final class VulkanPreview {
     static long lightUpdates() { return WORLD.lightUpdates(); }
     static int capturedCutoutQuads() { return WORLD.cutoutQuads(); }
     static boolean replacesSection(net.minecraft.core.BlockPos origin) {
+        if (gl != null) return enabled && glDrawn && WORLD.covers(origin);
         return enabled && direct && !inset && sharedDepth > 0 && TerrainPresenter.depthReady()
                 && uploadedEpoch != 0 && uploadedEpoch == WORLD.epoch() && WORLD.covers(origin);
     }
     static boolean directWorld() { return enabled && direct; }
+    static boolean gl46World() { return enabled && gl != null; }
+    /** Outside the frame (e.g. from a tick): would the next GL 4.6 frame draw this section instead of vanilla? */
+    static boolean gl46Covers(net.minecraft.core.BlockPos origin) {
+        return gl46World() && gl.frames() > 0 && uploadedEpoch == WORLD.epoch() && WORLD.covers(origin);
+    }
+    /** See Gl46Terrain.stats(). */
+    /** Per-frame CPU percentiles of each GL 4.6 pass. */
+    static String gl46Timers() {
+        return "terrainOpaque{" + (gl != null ? gl.opaqueTimer : "-") + "} terrainTranslucent{" + (gl != null ? gl.translucentTimer : "-")
+                + "} entityCapture{" + (glEntities != null ? glEntities.captureTimer : "-") + "} entityFlush{" + (glEntities != null ? glEntities.flushTimer : "-") + "}";
+    }
+    static long[] gl46CullStats() { return gl != null ? gl.cullStats() : new long[9]; }
+    static long[] gl46GrowStats() { return gl != null ? gl.growStats() : new long[3]; }
+    static long[] gl46SortStats() { return gl != null ? gl.sortStats() : new long[4]; }
+    static long[] gl46Phases() { return gl != null ? gl.phases() : new long[5]; }
+    static long[] gl46EntityPhases() { return glEntities != null ? glEntities.phases() : new long[4]; }
+    static long[] gl46Stats() { return gl != null ? gl.stats() : new long[11]; }
     static long[] directWorldStats() { return directWorld() ? NativeMainWindow.worldStats() : new long[25]; }
     static int saveWorldFrame(java.nio.file.Path path) throws java.io.IOException {
         RenderSystem.assertOnRenderThread();
@@ -220,6 +368,15 @@ final class VulkanPreview {
         if (!enabled || sink == null) return;
         RenderSystem.assertOnRenderThread();
         Minecraft minecraft = Minecraft.getInstance();
+        if (gl != null) {
+            if (minecraft.level == null) { WORLD.leave(sink); return; }
+            graphics.fill(4, 4, 222, 27, 0xc0111828);
+            graphics.drawString(minecraft.font, gl.frames() > 0 && uploadedEpoch == WORLD.epoch()
+                    ? Component.translatable("vulkanforge.gl46.status", gl.sections(), gl.frames())
+                    : Component.translatable("vulkanforge.gl46.waiting"), 7, 7, 0xffaaddff);
+            graphics.drawString(minecraft.font, Component.translatable("vulkanforge.gl46.controls"), 7, 17, 0xffa0aabb);
+            return;
+        }
         try {
             if (direct) {
                 if (minecraft.level == null) { WORLD.leave(sink); renderShared(); }
@@ -259,6 +416,9 @@ final class VulkanPreview {
         GuiDraws.reset();
         EntityDraws.reset();
         if (direct) NativeMainWindow.closeWorld();
+        if (glEntities != null) { glEntities.close(); glEntities = null; }
+        if (gl != null) { gl.close(); gl = null; }
+        glDrawn = false;
         EntityTextures.reset();
         PRESENTER.close();
         uploaded = 0;

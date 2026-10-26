@@ -14,7 +14,7 @@
   "vulkanforge.launching": "正在启动 Vulkan 测试窗口，报告保存在 logs/vulkanforge。",
   "vulkanforge.busy": "已有 Vulkan 测试窗口正在运行。",
   "vulkanforge.config.title": "VulkanForge 设置",
-  "vulkanforge.config.pending": "仅保存设置，暂未生效；实现后需重启游戏才会应用。",
+  "vulkanforge.config.pending": "本次启动：%s | 修改在重启游戏后生效",
   "vulkanforge.config.backend": "渲染器",
   "vulkanforge.config.backend.vulkan": "Vulkan",
   "vulkanforge.config.backend.opengl": "OpenGL",
@@ -35,5 +35,11 @@
   "vulkanforge.config.nvidia.representative_fragment_test": "代表性片元测试",
   "vulkanforge.config.nvidia.representative_fragment_test.tooltip": "在遮挡查询类 Pass 中跳过多余片元。",
   "vulkanforge.config.nvidia.shading_rate_image": "着色率图像",
-  "vulkanforge.config.nvidia.shading_rate_image.tooltip": "由图像控制的可变速率着色，降低次要屏幕区域的着色开销。"
+  "vulkanforge.config.nvidia.shading_rate_image.tooltip": "由图像控制的可变速率着色，降低次要屏幕区域的着色开销。",
+  "vulkanforge.config.unimplemented": "（未实现）",
+  "vulkanforge.gl46.status": "OpenGL 4.6 地形 | %s 分区 | 第 %s 帧",
+  "vulkanforge.gl46.waiting": "OpenGL 4.6 地形 | 等待区块网格",
+  "vulkanforge.gl46.controls": "F8 开关 | GPU 剔除 + 间接绘制",
+  "vulkanforge.gl46.unavailable": "OpenGL 4.6 地形不可用：%s",
+  "vulkanforge.gl46.failed": "OpenGL 4.6 地形出错，已回退原版绘制；详见日志"
 }

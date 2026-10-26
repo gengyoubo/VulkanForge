@@ -9,6 +9,7 @@ import net.minecraftforge.fml.loading.FMLPaths;
 import org.lwjgl.glfw.GLFW;
 import org.lwjgl.glfw.GLFWNativeWin32;
 import org.lwjgl.opengl.GL;
+import github.com.gengyoubo.vulkanforge.config.VulkanForgeConfig;
 import github.com.gengyoubo.vulkanforge.interop.GlInterop;
 import org.slf4j.Logger;
 import java.lang.reflect.*;
@@ -34,6 +35,14 @@ public final class NativeMainWindow {
 
     public static long createWindow(IntSupplier width, IntSupplier height, Supplier<String> title, LongSupplier monitor) {
         long legacy = ImmediateWindowHandler.setupMinecraftWindow(width, height, title, monitor);
+        var startup = VulkanForgeConfig.startup();
+        LOGGER.info("VulkanForge startup renderer: {}", startup);
+        if (startup.backend() == VulkanForgeConfig.Backend.OPENGL)
+            return Gl46Context.window(legacy, startup.openGLVersion(), width, height, title, monitor);
+        if (!startup.vulkanMainWindow()) {
+            LOGGER.warn("Vulkan {} is not implemented yet; keeping the original OpenGL window", startup.vulkanVersion().label);
+            return legacy;
+        }
         if (!System.getProperty("vulkanforge.directPresent", "true").equalsIgnoreCase("true")
                 || !System.getProperty("os.name").startsWith("Windows")) return legacy;
         try {
@@ -56,11 +65,15 @@ public final class NativeMainWindow {
             renderWorld = type.getMethod("renderWorld", int.class, int.class); worldStats = type.getMethod("worldStats");
             renderWorldWithSky = type.getMethod("renderWorldWithSky", int.class, int.class, Object[].class, boolean.class);
             nativeComposite=type.getMethod("nativeComposite",int.class,int.class,int.class,int.class,Object[].class);
+            // Optional until the backend implements it; PostEffects falls back to vanilla post passes on false.
+            try { nativePost = type.getMethod("nativePost", Object[].class); } catch (NoSuchMethodException missing) { nativePost = null; }
+
             nativePost=type.getMethod("nativePost",Object[].class);
             createRenderTarget=type.getMethod("createRenderTarget",int.class,int.class,int.class);
             destroyRenderTarget=type.getMethod("destroyRenderTarget",int.class);
             renderTargetStats=type.getMethod("renderTargetStats");
             presentationStats=type.getMethod("presentationStats");
+
             finishWorldFrame = type.getMethod("finishWorldFrame"); closeWorld = type.getMethod("closeWorld");
             renderOverlay = type.getMethod("renderOverlay", Object[].class, boolean.class); finishOverlay = type.getMethod("finishOverlay");
             memoryStats = type.getMethod("memoryStats"); guiBindingStats = type.getMethod("guiBindingStats");
@@ -189,6 +202,7 @@ public final class NativeMainWindow {
         int framebuffer=org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL30.GL_DRAW_FRAMEBUFFER_BINDING);
         return (Boolean)call(nativeComposite,framebuffer,viewport[2],viewport[3],kind,(Object)packets);
     }
+    static boolean nativePost(Object[] pass) { return active() && nativePost != null && (Boolean) call(nativePost, (Object) pass); }
     static boolean nativePost(Object[] packet) { return active() && (Boolean) call(nativePost, (Object) packet); }
     static int[] createRenderTarget(int framebuffer, int width, int height) { return active() ? (int[]) call(createRenderTarget, framebuffer, width, height) : null; }
     static void destroyRenderTarget(int framebuffer) { if (active()) call(destroyRenderTarget, framebuffer); }

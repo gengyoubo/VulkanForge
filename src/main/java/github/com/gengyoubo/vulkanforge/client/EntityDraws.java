@@ -105,6 +105,7 @@ public final class EntityDraws {
     /** Tesselator.end() and LevelRenderer's direct uploads - and every such draw outside a capture window. */
     public static void drawImmediate(BufferBuilder.RenderedBuffer rendered) {
         if (GuiDraws.active() && RenderSystem.isOnRenderThread()) { GuiDraws.draw(rendered); return; }
+        if (VulkanPreview.gl46Entity(rendered)) return;
         if (open != null && RenderSystem.isOnRenderThread() && capture(rendered)) return;
         split();
         BufferUploader.drawWithShader(rendered);

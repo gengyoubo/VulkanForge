@@ -42,11 +42,11 @@ public final class VulkanForgeConfigScreen extends Screen {
                 .withValues(Backend.values()).withInitialValue(backend)
                 .create(left, y, column * 2 + gap, 20, Component.translatable("vulkanforge.config.backend"), (button, value) -> { backend = value; refreshActive(); }));
         y += 24;
-        vulkanButton = addRenderableWidget(CycleButton.<VulkanVersion>builder(value -> Component.literal(value.label))
+        vulkanButton = addRenderableWidget(CycleButton.<VulkanVersion>builder(value -> versionLabel(Component.literal(value.label), value.implemented))
                 .withValues(VulkanVersion.values()).withInitialValue(vulkanVersion)
                 .create(left, y, column, 20, Component.translatable("vulkanforge.config.vulkan_version"), (button, value) -> vulkanVersion = value));
-        openGLButton = addRenderableWidget(CycleButton.<OpenGLVersion>builder(value -> value == OpenGLVersion.DEFAULT
-                        ? Component.translatable("vulkanforge.config.opengl_version.default") : Component.literal(value.label))
+        openGLButton = addRenderableWidget(CycleButton.<OpenGLVersion>builder(value -> versionLabel(value == OpenGLVersion.DEFAULT
+                        ? Component.translatable("vulkanforge.config.opengl_version.default") : Component.literal(value.label), value.implemented))
                 .withValues(OpenGLVersion.values()).withInitialValue(openGLVersion)
                 .create(right, y, column, 20, Component.translatable("vulkanforge.config.opengl_version"), (button, value) -> openGLVersion = value));
         extensionLabelY = y + 28;
@@ -67,6 +67,10 @@ public final class VulkanForgeConfigScreen extends Screen {
         refreshActive();
     }
 
+    private static Component versionLabel(Component label, boolean implemented) {
+        return implemented ? label : label.copy().append(Component.translatable("vulkanforge.config.unimplemented"));
+    }
+
     private void refreshActive() {
         boolean vulkan = backend == Backend.VULKAN;
         vulkanButton.active = vulkan; openGLButton.active = !vulkan;
@@ -84,7 +88,7 @@ public final class VulkanForgeConfigScreen extends Screen {
     @Override public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
         renderBackground(graphics);
         graphics.drawCenteredString(font, title, width / 2, 12, 0xffffff);
-        graphics.drawCenteredString(font, Component.translatable("vulkanforge.config.pending"), width / 2, 24, 0xffaa55);
+        graphics.drawCenteredString(font, Component.translatable("vulkanforge.config.pending", VulkanForgeConfig.startup().toString()), width / 2, 24, 0xffaa55);
         graphics.drawCenteredString(font, Component.translatable("vulkanforge.config.nvidia"), width / 2, extensionLabelY, backend == Backend.VULKAN ? 0xa0c8ff : 0x707070);
         super.render(graphics, mouseX, mouseY, partialTick);
     }
