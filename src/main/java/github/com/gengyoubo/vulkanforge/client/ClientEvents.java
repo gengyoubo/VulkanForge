@@ -111,7 +111,7 @@ public final class ClientEvents {
 
         @SubscribeEvent
         public static void reload(RegisterClientReloadListenersEvent event) {
-            event.registerReloadListener((ResourceManagerReloadListener) resources -> VulkanPreview.invalidateWorld());
+            event.registerReloadListener((ResourceManagerReloadListener) resources -> { VulkanPreview.invalidateWorld(); PostEffects.reset(); });
         }
 
         @SubscribeEvent

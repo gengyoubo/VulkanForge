@@ -40,6 +40,7 @@ public final class MainWindowBackend implements AutoCloseable {
     private PrintWriter report;
     private GpuTimers timers;
     private SharedWorldRenderer world;
+    private SharedRenderTargets renderTargets;
     private Function<long[], Consumer<int[]>> terrainImporter;
     private final Function<long[], Consumer<int[]>> importer;
     private final Runnable finishGL;
@@ -131,7 +132,7 @@ public final class MainWindowBackend implements AutoCloseable {
     private SharedWorldRenderer world() {
         if (world == null) {
             if (terrainImporter == null) throw new IllegalStateException("Missing host GL terrain importer");
-            world = new SharedWorldRenderer(context, terrainImporter, finishGL, this::log);
+            world = new SharedWorldRenderer(context, terrainImporter, finishGL, this::log, targets());
             for (Object[] t : mirroredTextures.values()) world.entityTexture((Integer) t[0], (Integer) t[1], (Integer) t[2], (Integer) t[3], (byte[]) t[4]);
         }
         return world;
@@ -151,6 +152,14 @@ public final class MainWindowBackend implements AutoCloseable {
         var list=new java.util.ArrayList<Object[]>();for(Object packet:packets)list.add((Object[])packet);
         return world.composeNative(framebuffer,width,height,kind,list);
     }
+    private SharedRenderTargets targets() {
+        if (renderTargets == null) renderTargets = new SharedRenderTargets(context, terrainImporter, finishGL, this::log);
+        return renderTargets;
+    }
+    public int[] createRenderTarget(int framebuffer, int width, int height) { return targets().create(framebuffer, width, height); }
+    public void destroyRenderTarget(int framebuffer) { if (renderTargets != null) renderTargets.destroy(framebuffer); }
+    public long[] renderTargetStats() { return renderTargets == null ? new long[6] : renderTargets.stats(); }
+    public boolean nativePost(Object[] packet) { return world != null && world.postNative(packet); }
     /** Captured GUI packets, consumed exactly once by the next present (including skipped/minimized frames). */
     public void gui(Object[] packets) {
         var list = new java.util.ArrayList<Object[]>(packets.length);
@@ -433,6 +442,7 @@ public final class MainWindowBackend implements AutoCloseable {
     @Override public void close() {
         if (context.device != null) {
             closeWorld();
+            if (renderTargets != null) { renderTargets.close(); renderTargets = null; }
             finishGL.run(); drainAcquired(); check(vkDeviceWaitIdle(context.device), "wait presentation shutdown");
             if (timers != null) { timers.collectAll(); timers.report(this::log); timers.close(); }
             if (gui != null) { log("GUI_SWAPCHAIN_PASSES=" + gui.passes()); log("HAND_SWAPCHAIN_PASSES=" + gui.handPasses()); log("GUI_BINDINGS=" + java.util.Arrays.toString(gui.bindingStats())); gui.close(); gui = null; }

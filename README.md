@@ -9,7 +9,7 @@ Minecraft **1.20.1 / Forge 47.4.28 / Java 17** 客户端 Vulkan 渲染实验。
 - 游戏主窗口预览：同进程 Vulkan 绘制旋转三角形 → 导出共享 GPU 图像 → 原有 GL 上下文采样 → 主菜单 / HUD 显示。
 - 世界不透明和镂空方块：采集原版烘焙模型、贴图 UV、染色、环境遮蔽与光照坐标 → 分区顶点缓冲 → Vulkan 图集/光照图采样、相机变换、alpha 丢弃、D32 深度测试 → 在原版 cutout 阶段之后合成。
 
-**这是混合渲染原型。主窗口的最终呈现已交给 Vulkan；Windows 主窗口路径中的 WorldScene 已接入同一个 Vulkan 后端，solid、cutout、cutoutMipped 地形通过共享 GPU 纹理合成，正常地形帧不经过 CPU 像素读回或 FrameProtocol。** Vulkan 覆盖范围内的半透明方块与水也由 Vulkan 绘制（P6 第一步），常见实体、方块实体和告示牌文字（P7/P8）、粒子和雨雪（P9）以及云（P10）由 Vulkan 叠加层通道回放，天空在地形提交中由 Vulkan 先行绘制（P10）；范围外地形、Fabulous 模式下的半透明层、不支持的着色器仍在隐藏的 OpenGL 上下文中绘制。受支持的手持物与 GUI/HUD 在 framebuffer blit 后依次直接画进 Swapchain（P11），不再经 GL 合成。关闭主窗口 Vulkan 路径时保留旧的子进程读回预览作为兼容路径。
+**这是混合渲染原型。主窗口的最终呈现已交给 Vulkan；Windows 主窗口路径中的 WorldScene 已接入同一个 Vulkan 后端，solid、cutout、cutoutMipped 地形通过共享 GPU 纹理合成，正常地形帧不经过 CPU 像素读回或 FrameProtocol。** Vulkan 覆盖范围内的半透明方块与水也由 Vulkan 绘制（含 Fabulous 的独立透明目标），常见实体、方块实体和告示牌文字（P7/P8）、粒子和雨雪（P9）以及云（P10）由 Vulkan 通道回放，天空在地形提交中由 Vulkan 先行绘制（P10）。主颜色/深度及透明后处理目标使用 Vulkan 分配、GL 导入的共享图像；受支持的世界通道直接在这些目标上绘制，不再逐通道复制 GL framebuffer。范围外地形、不支持的着色器和状态仍在隐藏的 OpenGL 上下文中绘制。受支持的手持物与 GUI/HUD 在最终 framebuffer blit 后依次直接画进 Swapchain（P11）。关闭主窗口 Vulkan 路径时保留旧的子进程读回预览作为兼容路径。
 
 ## 构建和启动
 
@@ -74,7 +74,7 @@ IntelliJ IDEA：导入根目录的 `build.gradle`，将 **Gradle JVM** 和 **Pro
 
 `SharedWorldRenderer` 使用两个独立颜色/深度目标和 fence。Vulkan 完成绘制后释放图像所有权并发出外部信号量；游戏现有 LWJGL 的 GL 回调等待后采样。GL 地形合成及小窗绘制结束后发出完成信号，Vulkan 下一次重用该图像前等待并取回所有权。每帧没有 RGBA 数组、管道传输、staging 读回或 `glTexSubImage2D` 地形上传。显式保存诊断截图时仍会下载像素；方块图集/光照图目前仍从 GL 读取并上传到 Vulkan。
 
-网格替换、删除、图集更新和场景重置会先等待引用旧资源的地形 fence，防止提前销毁。缩放与关闭前结束 GL 采样、完成 GL 工作并等待地形 fence；F8 关闭会释放整个地形渲染器，重新开启时重建。原版 solid/cutout 绘制及深度仍保留，P4 接管尚未开始。
+网格替换、删除、图集更新和场景重置会先等待引用旧资源的地形 fence，防止提前销毁。缩放与关闭前结束 GL 采样、完成 GL 工作并等待地形 fence；F8 关闭会释放整个地形渲染器，重新开启时重建。已接纳的 solid/cutout Section 跳过原版绘制；GL 回退继续写入共享颜色/深度，后续 Vulkan 通道读取同一份结果。
 
 ## 验证命令
 
@@ -124,7 +124,7 @@ java -jar vulkan-lab/build/libs/vulkan-lab.jar --probe --require-validation
 
 GL 侧在 `AFTER_TRANSLUCENT_BLOCKS` 阶段合成，即原版实体和方块实体之后：使用预乘混合，并写入 `gl_FragDepth`，与 GL 深度做 LEQUAL 测试。实体位于水面前方时，会遮住该像素的半透明层；位于水下时，水面会混合在实体之上。原版 translucent 层只在同一帧确实会合成 Vulkan 结果的覆盖分区中跳过。
 
-Fabulous 图形模式会把半透明层画进独立目标供透明后处理链使用，这种情况仍交给原版绘制。雾和水下视角的雾色尚未接入 Vulkan 地形；实体见 P7/P8，GUI 见 P11。
+Fabulous 图形模式将半透明层合成进共享的 `translucent` 目标，保留其预乘颜色和最近表面深度，供原版透明排序后处理使用；受支持的后处理程序也由 Vulkan 执行。未接入共享目标时继续使用原版透明层。雾和水下视角的雾色尚未接入 Vulkan 地形；实体见 P7/P8，GUI 见 P11。
 
 ## 方块实体与实体（P7 / P8）
 
@@ -141,7 +141,7 @@ Fabulous 图形模式会把半透明层画进独立目标供透明后处理链�
 
 `EntityPass` 的 Vulkan 着色器移植自原版 `rendertype_entity_*` / `rendertype_text`：双光源漫反射、覆盖层与光照图 texelFetch、四种片元分支和线性/柱形雾。每次绘制的矩阵、颜色调制、光照方向和雾参数放在 256 字节的动态 uniform 中。顶点、索引和 uniform 使用每槽位环形缓冲，四边形使用与原版相同顺序的共享索引缓冲；管线按格式与混合/深度/剔除状态缓存。
 
-地形提交时把不透明深度复制到每槽位私有的 Vulkan 深度图。`AFTER_BLOCK_ENTITIES` 时第二次提交：把它复制进共享叠加层深度，在其上回放实体，然后把以预乘 alpha 清屏后的颜色和深度交给 GL。GL 侧用与半透明相同的合成着色器，写入 `gl_FragDepth` 并与 GL 深度测试，因此 GL 回退的实体和范围外地形仍能正确遮挡。没有捕获到绘制的窗口不提交。与半透明一样，Fabulous 模式不启用。
+默认路径直接向对应的共享 framebuffer 颜色/深度回放实体，包含 GL 回退在前一通道写入的深度；Fabulous 下按实际 framebuffer 分别回放到主目标、itemEntity 等目标。绘制按连续目标分组，保持 A → B → A 的原始顺序。没有捕获到绘制的窗口不提交。旧的小窗/GL 合成兼容路径仍从不透明地形深度复制出叠加层，再将预乘颜色和深度交给 GL 合成。
 
 尚未完成：附魔光效（`glint`）、实体阴影、发光轮廓、末影/蜘蛛眼（加法混合）、`translucentCullBlockSheet` 中的物品实体（这些在 `AFTER_BLOCK_ENTITIES` 之后才刷新）、破坏裂纹以及模组自定义着色器。
 
@@ -231,14 +231,28 @@ HAND 从 `AFTER_LEVEL` 到 `GameRenderer.render` 的 GUI 深度清除，保存�
 
 ## 减少 OpenGL 依赖
 
+### 共享世界目标与原生后处理
+
+`coremods/render_targets.js` 为 `RenderTarget` 加入纹理 ID 访问器，并在实际 framebuffer 检查及销毁处接入生命周期。`NativeRenderTargets` 保留原版 framebuffer ID、尺寸和纹理查询接口，将颜色/深度存储换为后端 `SharedRenderTargets` 的 RGBA8 / D32 共享分配；GL 回退可继续清屏、采样、绘制和复制深度。带 stencil 的目标保留原来的 GL 分配。缩放、透明模式切换和销毁先完成 GL 与引用该目标的 Vulkan 工作，进口对象仅由导入器删除，避免原版重复删除纹理 ID。目标生命周期独立于 F8 世界渲染器的开关。
+
+`DepthComposite` 和实体回放直接获取目标图像所有权、加载颜色/深度附件并写回，再通过外部 semaphore 交还 GL；已共享的目标不再执行每通道的 framebuffer 往返复制。最终 GL 主目标到呈现共享图像的复制、原版透明层的深度复制以及未接管的 GL 绘制仍保留。
+
+`PostEffects` 翻译当前资源包的 post GLSL、sampler 与 uniform，`NativePost` 按世界槽位和通道隔离描述符及 uniform 缓冲。颜色与深度 sampler 直接引用共享图像，同一目标的多个 sampler 只交接一次。Fabulous 的 transparency / blit 链保持原有层排序算法。未支持的程序、采样来源、自反馈或混合状态会在写入前回退 GL；资源重载会重新读取程序。此路径不等于通用的自定义 core Shader 或独立模组渲染引擎支持。
+
+`SHARED_RENDER_TARGETS=[created, destroyed, live, directCompositePasses, copiedCompositePasses, nativePostPasses]` 记录目标生命周期和实际通道，正常关闭时 `live=0`。`-Dvulkanforge.legacyTargets=true` 可在重启后保留原 GL 分配进行对照；`-Dvulkanforge.legacyComposite=true` 使用旧的合成路径。
+
+`smokePresent` 增加真实 GPU 颜色/深度读写、GL 回退顺序、重复颜色/深度 sampler、post 像素、双槽位、缩放、程序拒绝和目标回收检查。`-PworldSmoke runClient` 增加 Fabulous/Fancy 往返、透明 Section 接管、原生 post 通道、最终截图与无 framebuffer 合成复制断言。
+
+2026-10-26 本轮 RTX 3050 Laptop 回归：`build`、`smokePresent` 与完整 Forge 世界检查通过；Khronos / 同步校验启用，7,570 帧呈现，`VALIDATION_ERRORS=0`。43 个共享目标全部回收，31,270 次直接目标通道、0 次 framebuffer 合成复制、1,120 次原生 post 通道；包含 alpha blit 像素、Fabulous/Fancy 切换和 stencil 目标回退。世界报告保存在 `build/validated-world-client-report.txt`、`build/validated-world-main-window-report.txt`，测试截图在 `run/logs/vulkanforge/world-client-smoke/`。这些计数用于验证路径，不表示 FPS 收益。
+
 | 优先级 | 路径 | 当前状态 |
 | --- | --- | --- |
 | P0 | 覆盖范围外地形 | 已取消固定相机立方体；使用实际 ViewArea 的水平距离与全部垂直层，逐步上传原版已经编译的非空 Section |
-| P0 | Vulkan 结果的 GL 合成 | 手持物已迁到最终交换链，与 GUI 共用呈现提交；地形、实体、透明与天气的中途 GL 深度合成仍保留 |
+| P0 | 世界颜色/深度与 Vulkan 合成 | 主目标及 Fabulous 目标使用 Vulkan 共享分配；地形/实体/透明/天气直接写目标，保留非共享目标的复制兼容路径与最终呈现复制 |
 | P1 | 重复区块构建 | 已复用原版上传前网格，保留原版构建调度；Vulkan 转换/发布在单独的有界帧预算内推进 |
 | P1 | 图集、光照、实体纹理 | 仍使用异步 PBO 镜像；后续从 CPU 上传源接入，保留无法捕获上传源时的读回 |
 | P1 | 特殊 RenderType / Glint / 阴影 | 继续逐项移植，当前不支持的状态仍走 GL |
-| P2 | 裂纹、轮廓、特效、Fabulous 和后处理 | 后续增加对应 Vulkan Pass，保持原版顺序和深度语义 |
+| P2 | 裂纹、轮廓、特效、Fabulous 和后处理 | Fabulous 透明层与共享目标 post 程序已接入；特殊目标/状态及通用 Shader 兼容仍需扩展 |
 | P2 / 长期 | 自定义 Shader、独立渲染器、GL 资源生命周期 | 通用捕获兼容与专用适配并行，逐步替换资源所有者 |
 
 网格快照只从成功的原版 RebuildTask 提交取得；index-only 半透明排序不会误当作顶点更新。原版 RenderChunk 池换坐标、ViewArea 重建/释放、世界切换都会淘汰旧数据。GL 跳过绘制前同时核对原版 compiled 对象、Section 坐标和 Vulkan 已接纳的快照，未接纳的 Section 继续由 GL 绘制。CPU 上传副本缓存限额 128 MiB，已发布网格逻辑预算 192 MiB，最多 65534 个非空 Section；超过限制的部分保持 GL 路径，不能据此宣称所有场景已完全脱离 GL。缓存快照和转换输出有独立的生命周期，预算不等于进程总内存上限。

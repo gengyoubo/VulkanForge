@@ -93,6 +93,7 @@ public final class NativePresentSmoke {
             boolean timing = backend.gpuTimingsEnabled();
             GuiPassSmoke.run(backend, source, output);
             SharedWorldSmoke.run(backend);
+            SharedTargetsSmoke.run(backend);
             backend.beginFrame(640, 480); // Closing must consume this acquired-but-unsubmitted frame.
             backend.close();
             if (backend.validationErrors() != 0) throw new AssertionError("Vulkan validation errors: " + backend.validationErrors());

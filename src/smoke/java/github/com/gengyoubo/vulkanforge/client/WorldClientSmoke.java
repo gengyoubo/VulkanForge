@@ -335,6 +335,38 @@ public final class WorldClientSmoke {
             } else if (stage == 22 && ++ticks > 60 && VulkanPreview.worldEpoch() > 0 && VulkanPreview.capturedSections() > 0) {
                 require(VulkanPreview.directWorldStats()[2] == VulkanPreview.capturedSections() && OffscreenBridge.launches() == bridgeLaunches, "F8 reopen did not restore same-process sections");
                 log("PASS F8 shared world release/reopen, sections=" + VulkanPreview.capturedSections());
+                long[] targets = NativeMainWindow.renderTargetStats();
+                require(targets[0] > 0 && targets[3] > 0 && targets[4] == 0, "World target still uses framebuffer copy composites: " + java.util.Arrays.toString(targets));
+                log("PASS shared world color/depth targets without framebuffer composite copies: " + java.util.Arrays.toString(targets));
+                var stencil=new com.mojang.blaze3d.pipeline.TextureTarget(32,32,true,Minecraft.ON_OSX);
+                try {
+                    require(NativeRenderTargets.shared(stencil),"TextureTarget was not shared");
+                    stencil.enableStencil();
+                    require(stencil.isStencilEnabled()&&!NativeRenderTargets.shared(stencil),"Stencil target did not retain GL storage");
+                }finally{stencil.destroyBuffers();mc.getMainRenderTarget().bindWrite(true);}
+                log("PASS shared TextureTarget -> GL stencil storage lifecycle");
+                screenBaseline = PostEffects.stats()[0]; fallbackBaseline = TerrainPasses.stats()[3]; glyphBaseline = targets[1];
+                mc.options.graphicsMode().set(net.minecraft.client.GraphicsStatus.FABULOUS);
+                mc.levelRenderer.allChanged();
+                var server=mc.getSingleplayerServer();var uuid=mc.player.getUUID();
+                server.execute(()->server.getPlayerList().getPlayer(uuid).teleportTo(server.overworld(),.5,68,9,180,18));
+                stage = 23; ticks = 0;
+            } else if (stage == 23 && ++ticks > 100 && VulkanPreview.worldEpoch() > 0 && VulkanPreview.capturedSections() > 0) {
+                require(Minecraft.useShaderTransparency(), "Fabulous transparency chain is inactive");
+                require(PostEffects.stats()[0] > screenBaseline, "Fabulous post chain was not executed by Vulkan");
+                require(TerrainPasses.stats()[3] > fallbackBaseline, "Fabulous translucent terrain stayed on GL");
+                require(NativeMainWindow.renderTargetStats()[4] == 0, "Fabulous composite copied framebuffer targets");
+                NativeMainWindow.captureNext(report.resolve("fabulous-swapchain.png"));
+                log("PASS Fabulous translucent terrain, shared layer/depth targets and native post passes=" + PostEffects.stats()[0]);
+                stage = 24; ticks = 0;
+            } else if (stage == 24 && ++ticks > 10) {
+                verifyCapture(report.resolve("fabulous-swapchain.png"), mc.getWindow().getWidth(), mc.getWindow().getHeight());
+                mc.options.graphicsMode().set(net.minecraft.client.GraphicsStatus.FANCY);
+                mc.levelRenderer.allChanged();
+                stage = 25; ticks = 0;
+            } else if (stage == 25 && ++ticks > 80 && VulkanPreview.worldEpoch() > 0) {
+                require(!Minecraft.useShaderTransparency() && NativeMainWindow.renderTargetStats()[1] > glyphBaseline, "Fabulous targets were not released on mode change");
+                log("PASS Fabulous/Fancy target lifecycle round trip");
                 leaveWorld(mc);
             } else if (stage == 18 && mc.level == null && mc.screen instanceof TitleScreen && ++ticks > 20) {
                 require(VulkanPreview.worldEpoch() == 0, "Vulkan world state survived leaving the world");

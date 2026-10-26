@@ -61,7 +61,8 @@ final class VulkanPreview {
                     PRESENTER.draw(sharedTexture.getId(), sharedDepth);
                     composited = true;
                     translucentPending = sharedTranslucent > 0 && sharedTranslucentDepth > 0 && TerrainPresenter.translucentReady()
-                            && !Minecraft.useShaderTransparency();
+                            && (!Minecraft.useShaderTransparency() || nativeTerrain()
+                            && NativeRenderTargets.shared(Minecraft.getInstance().levelRenderer.getTranslucentTarget()));
                     // P7/P8: entity and block-entity draws until AFTER_BLOCK_ENTITIES go to the Vulkan entity pass when supported.
                     if (translucentPending) { EntityTextures.poll(); EntityDraws.beginFrame(RenderSystem.getShaderTexture(2), PRESENTER); }
                 }
@@ -136,7 +137,7 @@ final class VulkanPreview {
         try { PRESENTER.drawTranslucent(sharedTranslucent, sharedTranslucentDepth); translucentComposites++; }
         catch (Exception error) { VulkanForge.LOGGER.error("Could not composite Vulkan translucent terrain", error); close(); }
     }
-    /** Fabulous mode renders translucency into its own target for the transparency post chain; leave that to vanilla. */
+    /** Fabulous uses its shared translucent target and preserves the vanilla transparency chain's layer/depth inputs. */
     static boolean replacesTranslucent(net.minecraft.core.BlockPos origin) { return translucentPending && replacesSection(origin); }
     static long translucentComposites() { return translucentComposites; }
     static long translucentQuads() { return WORLD.translucentQuads(); }
