@@ -413,6 +413,12 @@ public final class WorldClientSmoke {
             log("PASS memory pool: " + java.util.Arrays.toString(NativeMainWindow.memoryStats()));
             require(NativeMainWindow.guiBindingStats()[2] < 128, "Lightmap updates repeatedly invalidated GUI uniform descriptors");
             log("PASS GUI descriptor/batch counters: " + java.util.Arrays.toString(NativeMainWindow.guiBindingStats()));
+            long[] present = NativeMainWindow.presentationStats();
+            require(present[0] == NativeMainWindow.presentedFrames() && present[1] == 0 && present[2] == 0,
+                    "Presentation still copies the main target or allocates compatibility images: " + java.util.Arrays.toString(present));
+            log("PASS direct shared main-target presentation without GL copy or Vulkan blit: " + java.util.Arrays.toString(present));
+            require(NativeMainWindow.skippedScreenBlits() >= NativeMainWindow.presentedFrames(), "Main target is still drawn into the hidden GL screen");
+            log("PASS bypassed hidden GL screen blits=" + NativeMainWindow.skippedScreenBlits());
             log("PASS acquire before input=" + NativeMainWindow.acquiresBeforeInput() + ", fallback acquire after render=" + NativeMainWindow.acquiresAfterRender());
         }
         log("STATUS=OK"); stage = 99;
