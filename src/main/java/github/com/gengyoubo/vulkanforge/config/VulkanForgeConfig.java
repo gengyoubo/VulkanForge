@@ -95,11 +95,21 @@ public final class VulkanForgeConfig {
 
     /**
      * Minecraft creates its Window before Forge loads client configs, so the first call reads the TOML file directly.
-     * Missing files or invalid values fall back to the spec defaults.
+     * Missing files or invalid values fall back to the spec defaults. -Dvulkanforge.startup=OPENGL:GL_4_6 (or VULKAN:V1_4)
+     * overrides the file for this launch only, e.g. for smoke runs.
      */
     public static synchronized Startup startup() {
-        if (startup == null) startup = read(FMLPaths.CONFIGDIR.get().resolve("vulkanforge-client.toml"));
+        if (startup == null) startup = override(read(FMLPaths.CONFIGDIR.get().resolve("vulkanforge-client.toml")), System.getProperty("vulkanforge.startup"));
         return startup;
+    }
+
+    private static Startup override(Startup file, String value) {
+        if (value == null || value.isBlank()) return file;
+        String[] parts = value.split(":", 2);
+        Backend backend = value(parts[0], file.backend());
+        String version = parts.length > 1 ? parts[1] : null;
+        return backend == Backend.VULKAN ? new Startup(backend, value(version, file.vulkanVersion()), file.openGLVersion())
+                : new Startup(backend, file.vulkanVersion(), value(version, file.openGLVersion()));
     }
 
     private static Startup read(Path file) {

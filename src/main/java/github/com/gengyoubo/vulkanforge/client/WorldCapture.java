@@ -114,7 +114,7 @@ final class WorldCapture {
                     long since = queuedAt.computeIfAbsent(key, ignored -> frameStart);
                     long opaqueBytes = triangleBytes(candidate.layers()[0].length + candidate.layers()[1].length + candidate.layers()[2].length);
                     if (sent.size() >= MAX_SECTIONS || geometryBytes + size(candidate) > GEOMETRY_LIMIT
-                            || opaqueBytes > WorldProtocol.MAX_MESH_BYTES) continue;
+                            || opaqueBytes > WorldProtocol.MAX_MESH_BYTES || triangleBytes(candidate.layers()[3].length) > WorldProtocol.MAX_MESH_BYTES) continue;
                     BlockPos origin = candidate.origin();
                     boolean visible = event.getFrustum() == null || event.getFrustum().isVisible(candidate.chunk().getBoundingBox());
                     double score = origin.distToCenterSqr(position) - Math.min(2_000_000, (frameStart - since) / 10_000.0)
@@ -122,6 +122,14 @@ final class WorldCapture {
                     if (score < best) { best = score; selected = candidate; }
                 }
                 if (selected == null) break;
+                if (bridge.rawQuads()) {
+                    // Same-context sink: vanilla's immutable BLOCK quads are uploaded as they are, no triangle conversion.
+                    BlockPos origin = selected.origin();
+                    if (!bridge.quads(epoch, selected.key(), origin.getX(), origin.getY(), origin.getZ(), selected.layers())) { deferredPublishes++; break; }
+                    published(bridge, selected, selected.layers()[3].length / (4 * BLOCK_STRIDE));
+                    completed++; completedBuilds++;
+                    continue;
+                }
                 build = new Build(selected);
             }
             if (!build.step(deadline)) break;
@@ -129,17 +137,21 @@ final class WorldCapture {
             if (!bridge.send(new WorldProtocol.Mesh(epoch, source.key(), origin.getX(), origin.getY(), origin.getZ(), build.opaque, build.translucent))) {
                 deferredPublishes++; break;
             }
-            sent.put(source.key(), source); geometryBytes += size(source); queuedAt.remove(source.key()); dirty.remove(source.key());
-            if (bootstrap) { if (source.key() != 0) bridge.send(new WorldProtocol.Remove(epoch, 0)); bootstrap = false; }
-            cutoutQuads += (source.layers()[1].length + source.layers()[2].length) / (4 * BLOCK_STRIDE);
-            translucentQuads += build.translucent.length / (6 * WorldProtocol.STRIDE);
-            if (build.translucent.length > 0) translucentMeshes++;
+            published(bridge, source, build.translucent.length / (6 * WorldProtocol.STRIDE));
             build = null; completed++; completedBuilds++;
         }
         long elapsed = System.nanoTime() - frameStart;
         maxFrameBuildNanos = Math.max(maxFrameBuildNanos, elapsed); maxCompletedPerFrame = Math.max(maxCompletedPerFrame, completed);
         frameSamples[frameSampleCursor++ & (frameSamples.length - 1)] = elapsed;
         frameSampleCount = Math.min(frameSampleCount + 1, frameSamples.length);
+    }
+
+    private void published(WorldSink bridge, TerrainMeshes.Snapshot source, long translucent) {
+        sent.put(source.key(), source); geometryBytes += size(source); queuedAt.remove(source.key()); dirty.remove(source.key());
+        if (bootstrap) { if (source.key() != 0) bridge.send(new WorldProtocol.Remove(epoch, 0)); bootstrap = false; }
+        cutoutQuads += (source.layers()[1].length + source.layers()[2].length) / (4 * BLOCK_STRIDE);
+        translucentQuads += translucent;
+        if (translucent > 0) translucentMeshes++;
     }
 
     private boolean syncTextures(Minecraft mc, WorldSink bridge) {

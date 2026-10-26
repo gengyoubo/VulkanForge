@@ -1,12 +1,12 @@
 #version 460 core
-// Shared by opaque (MultiDrawArraysIndirectCount) and translucent (MultiDrawElementsIndirect) draws: baseInstance is the section slot.
+// Shared by the three opaque layers (MultiDrawElementsIndirectCount) and translucent (MultiDrawElementsIndirect): baseInstance is the section slot.
 layout(std140, binding = 0) uniform Frame {
     mat4 viewProjection;
     ivec4 cameraBlock;
     vec4 cameraFraction;
     vec4 fogColor;
-    vec4 fog;      // start, end, shape (0 sphere, 1 cylinder)
-    uvec4 counts;  // x: section slots
+    vec4 fog;      // start, end, shape (0 sphere, 1 cylinder), alpha cutoff (fragment)
+    uvec4 counts;  // x: section slots, y: command capacity per layer
 };
 struct Section { ivec4 origin; vec4 minimum; vec4 maximum; uvec4 draw; };
 layout(std430, binding = 0) readonly buffer Sections { Section sections[]; };

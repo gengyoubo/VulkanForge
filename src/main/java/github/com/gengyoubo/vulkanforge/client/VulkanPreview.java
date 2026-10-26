@@ -3,6 +3,7 @@ package github.com.gengyoubo.vulkanforge.client;
 import com.mojang.blaze3d.systems.RenderSystem;
 import github.com.gengyoubo.vulkanforge.VulkanForge;
 import github.com.gengyoubo.vulkanforge.config.VulkanForgeConfig;
+import java.util.Map;
 import dev.vulkanforge.bridge.FrameProtocol;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
@@ -34,6 +35,8 @@ final class VulkanPreview {
     private static Gl46Terrain gl;
     /** True from this frame's GL opaque draw until AFTER_TRANSLUCENT_BLOCKS; vanilla skips covered sections only then. */
     private static boolean glDrawn;
+    /** GL 4.6 entity/block-entity pass; null when it could not be created (terrain still runs). */
+    private static Gl46Entities glEntities;
 
     private VulkanPreview() { }
 
@@ -66,6 +69,10 @@ final class VulkanPreview {
         }
         enabled = true; direct = false; sink = gl;
         uploaded = lastLogged = 0;
+        if (!Boolean.getBoolean("vulkanforge.gl46.noEntities")) {
+            try { glEntities = new Gl46Entities(); }
+            catch (RuntimeException error) { VulkanForge.LOGGER.error("GL 4.6 entity pass unavailable; entities stay on vanilla", error); Gl46Context.report("ENTITY_UNAVAILABLE=" + error); }
+        }
         VulkanForge.LOGGER.info("Terrain transport: in-context OpenGL 4.6 (compute culling + multi-draw indirect count)");
         WORLD.invalidate();
     }
@@ -89,6 +96,24 @@ final class VulkanPreview {
         mc.gameRenderer.lightTexture().turnOnLightLayer();
         return new int[]{mc.getTextureManager().getTexture(net.minecraft.world.inventory.InventoryMenu.BLOCK_ATLAS).getId(), RenderSystem.getShaderTexture(2)};
     }
+    /** EntityDraws hook; an entity-pass failure only disables that pass. */
+    static boolean gl46Entity(com.mojang.blaze3d.vertex.BufferBuilder.RenderedBuffer rendered) {
+        if (glEntities == null) return false;
+        try { return Gl46Entities.take(rendered); }
+        catch (RuntimeException error) { glEntitiesFailed(error); return false; }
+    }
+    private static void glEntitiesEnd() {
+        if (glEntities == null) return;
+        try { glEntities.end(); } catch (RuntimeException error) { glEntitiesFailed(error); }
+    }
+    private static void glEntitiesFailed(RuntimeException error) {
+        VulkanForge.LOGGER.error("OpenGL 4.6 entity pass failed; entities return to vanilla until F8 restarts it", error);
+        Gl46Context.report("ENTITY_FAILED=" + error);
+        Gl46Entities failed = glEntities; glEntities = null;
+        failed.close();
+    }
+    static long[] gl46EntityStats() { return glEntities != null ? glEntities.stats() : new long[5]; }
+    static Map<String, Long> gl46EntityFallbacks() { return glEntities != null ? glEntities.fallbacks() : Map.of(); }
     private static void glFailed(RuntimeException error) {
         VulkanForge.LOGGER.error("OpenGL 4.6 terrain failed; vanilla terrain rendering resumes", error);
         Gl46Context.report("TERRAIN_FAILED=" + error);
@@ -101,6 +126,8 @@ final class VulkanPreview {
         if (gl != null) {
             if (preparingAllowed && !prepared) glOpaque();
             prepared = false; preparingAllowed = false;
+            // Entities and block entities follow; only frames whose terrain ran on GL 4.6 replay them there.
+            if (glDrawn && glEntities != null) glEntities.begin();
             return;
         }
         translucentPending = false;
@@ -169,7 +196,10 @@ final class VulkanPreview {
     }
 
     /** AFTER_BLOCK_ENTITIES: replay captured entity/block-entity draws in Vulkan and composite them with depth. */
-    static void entities() { overlay(EntityDraws.Window.ENTITIES, EntityDraws.Window.EFFECTS); }
+    static void entities() {
+        if (gl != null) { glEntitiesEnd(); return; }
+        overlay(EntityDraws.Window.ENTITIES, EntityDraws.Window.EFFECTS);
+    }
     /** AFTER_TRIPWIRE_BLOCKS: the next thing vanilla draws is ParticleEngine.render (P9). */
     static void particlesBegin() { overlay(EntityDraws.Window.EFFECTS,EntityDraws.Window.PARTICLES); }
     /** AFTER_PARTICLES: composite particles, then capture rain/snow until AFTER_WEATHER. */
@@ -187,6 +217,7 @@ final class VulkanPreview {
     /** AFTER_TRANSLUCENT_BLOCKS: after GL entities and the (partially skipped) vanilla translucent layer. */
     static void translucent() {
         if (gl != null) {
+            glEntitiesEnd(); // normally already closed at AFTER_BLOCK_ENTITIES
             try {
                 if (enabled && glDrawn && !Minecraft.useShaderTransparency()) {
                     int[] textures = glTextures();
@@ -227,6 +258,13 @@ final class VulkanPreview {
                 && uploadedEpoch != 0 && uploadedEpoch == WORLD.epoch() && WORLD.covers(origin);
     }
     static boolean directWorld() { return enabled && direct; }
+    static boolean gl46World() { return enabled && gl != null; }
+    /** Outside the frame (e.g. from a tick): would the next GL 4.6 frame draw this section instead of vanilla? */
+    static boolean gl46Covers(net.minecraft.core.BlockPos origin) {
+        return gl46World() && gl.frames() > 0 && uploadedEpoch == WORLD.epoch() && WORLD.covers(origin);
+    }
+    /** {frames, sections, slots, vertexCapacity, vertexGrows, uploadedBytes, stagingWaits, translucentDraws, sorts}. */
+    static long[] gl46Stats() { return gl != null ? gl.stats() : new long[9]; }
     static long[] directWorldStats() { return directWorld() ? NativeMainWindow.worldStats() : new long[25]; }
     static int saveWorldFrame(java.nio.file.Path path) throws java.io.IOException {
         RenderSystem.assertOnRenderThread();
@@ -337,6 +375,7 @@ final class VulkanPreview {
         GuiDraws.reset();
         EntityDraws.reset();
         if (direct) NativeMainWindow.closeWorld();
+        if (glEntities != null) { glEntities.close(); glEntities = null; }
         if (gl != null) { gl.close(); gl = null; }
         glDrawn = false;
         EntityTextures.reset();

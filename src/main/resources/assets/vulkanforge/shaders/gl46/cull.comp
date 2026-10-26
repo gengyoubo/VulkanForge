@@ -6,19 +6,21 @@ layout(std140, binding = 0) uniform Frame {
     vec4 cameraFraction;
     vec4 fogColor;
     vec4 fog;
-    uvec4 counts;
+    uvec4 counts;  // x: section slots, y: command capacity per layer
 };
+// draw: x first vertex of the section's opaque quads, then y solid, z cutoutMipped, w cutout quad counts.
 struct Section { ivec4 origin; vec4 minimum; vec4 maximum; uvec4 draw; };
-struct Command { uint count; uint instanceCount; uint first; uint baseInstance; };
+struct Command { uint count; uint instanceCount; uint firstIndex; int baseVertex; uint baseInstance; };
 layout(std430, binding = 0) readonly buffer Sections { Section sections[]; };
 layout(std430, binding = 1) writeonly buffer Commands { Command commands[]; };
-layout(std430, binding = 2) buffer Count { uint drawCount; };
-// Frustum test per section slot; visible sections are compacted into DrawArraysIndirectCommand + GPU draw count.
+layout(std430, binding = 2) buffer Counts { uint drawCounts[3]; };
+// Frustum test per section slot; each visible layer gets a DrawElementsIndirectCommand over the shared quad index buffer
+// in that layer's command list, plus a GPU draw count for glMultiDrawElementsIndirectCount.
 void main() {
     uint index = gl_GlobalInvocationID.x;
     if (index >= counts.x) return;
     Section section = sections[index];
-    if (section.draw.x == 0u) return;
+    if (section.draw.y + section.draw.z + section.draw.w == 0u) return;
     vec3 base = vec3(section.origin.xyz - cameraBlock.xyz) - cameraFraction.xyz;
     uint outside = 63u;
     for (uint corner = 0u; corner < 8u; corner++) {
@@ -31,5 +33,12 @@ void main() {
                  | (clip.z < -clip.w ? 16u : 0u) | (clip.z > clip.w ? 32u : 0u);
     }
     if (outside != 0u) return;
-    commands[atomicAdd(drawCount, 1u)] = Command(section.draw.x, 1u, section.draw.y, index);
+    uint first = section.draw.x;
+    uint quads[3] = uint[3](section.draw.y, section.draw.z, section.draw.w);
+    for (uint layer = 0u; layer < 3u; layer++) {
+        if (quads[layer] == 0u) continue;
+        uint slot = atomicAdd(drawCounts[layer], 1u);
+        commands[layer * counts.y + slot] = Command(quads[layer] * 6u, 1u, 0u, int(first), index);
+        first += quads[layer] * 4u;
+    }
 }

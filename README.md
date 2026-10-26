@@ -229,6 +229,32 @@ HAND 从 `AFTER_LEVEL` 到 `GameRenderer.render` 的 GUI 深度清除，保存�
 
 2026-10-26 本轮回归：资源压力、GPU Driven / push 与回退路径、世界和兼容桥像素检查、完整 Forge 场景及 `build` 均通过。新增远处/垂直 Section 覆盖、4→6→4 距离变化、退出世界缓存释放、手持物直画交换链及 GUI 回退顺序检查。主窗口启用 Khronos 与同步校验，完成 12978 帧呈现，`VALIDATION_ERRORS=0`；5485 次异步上传背压等待为零。手持物光照图按版本绑定后，同一回归流程的 uniform Descriptor 更新从 1928 次降至 6 次；这是缓存工作量计数，不代表 FPS 提升。报告位于 `run/logs/vulkanforge/world-client-smoke/report.txt` 与 `run/logs/vulkanforge/main-window-report.txt`。
 
+## OpenGL 4.6 后端（Issue #4）
+
+对应 [GL43-46 / issue #4](https://github.com/gengyoubo/VulkanForge/issues/4)。配置 `renderer.backend = "OPENGL"`、`opengl.version = "GL_4_6"`，重启后进入世界按 F8（或主菜单左下角按钮）开启。配置在窗口创建前直接读取 TOML（Forge 此时尚未加载客户端配置），所以修改需重启；`-Dvulkanforge.startup=OPENGL:GL_4_6` 可只对本次启动覆盖。目前已实现的组合只有 Vulkan 1.4 与 OpenGL 4.6：Vulkan 1.2/1.3 保留原版 GL 窗口，OpenGL 4.3–4.5 只请求对应上下文、地形仍走原版，配置界面标注“未实现”。OpenGL 后端不创建 Vulkan 主窗口，也不运行启动期 Vulkan 探测。
+
+Forge 早期窗口按 4.6 → 3.2 依次尝试，已经拿到驱动支持的最高版本；只有关闭 `earlyWindowControl` 且上下文低于 4.6 时才按 4.6 core 重建窗口。所有绘制都在游戏自己的 GL 上下文中直接画进主 framebuffer 与原版深度，不需要合成、共享图像或纹理读回：直接采样原版方块图集和光照图。
+
+| GL 版本 | 功能 | 当前用法 |
+| --- | --- | --- |
+| 4.3 | Compute Shader、SSBO、Multi Draw Indirect | `cull.comp` 对 Section SSBO 做视锥测试，按 solid / cutoutMipped / cutout 三层写 `DrawElementsIndirectCommand` |
+| 4.4 | Buffer Storage、Persistent Mapping | 不可变存储；上传暂存、每次绘制的 UBO、半透明与实体命令、实体顶点/索引/逐绘制记录都是持久映射环形缓冲，按段 fence |
+| 4.5 | DSA | `glCreate*`、`glNamedBuffer*`、`glVertexArray*`、`glBindTextureUnit`、采样器对象；顶点池按 GPU 拷贝扩容 |
+| 4.6 | Indirect Count、SPIR-V | 每层一次 `glMultiDrawElementsIndirectCount`（GPU 计数）；着色器构建期由 shaderc 编成 GL SPIR-V（`:vulkan-lab:glSpirv`），驱动拒绝时回退同一份 GLSL 4.60 |
+
+地形直接接收原版 BLOCK 格式四边形（`WorldSink.quads`），不再展开成三角形：每个四边形 128 字节（原 168 字节），共享一份 0 1 2 / 2 3 0 索引缓冲，按 `baseVertex` 定位。三层分别使用原版的 mip 过滤与 alpha 阈值（solid 不丢弃、cutoutMipped 0.5、cutout 0.1 且不采样 mip），并接入原版雾。半透明 Section 由远到近、Section 内四边形由远到近（CPU 排序，每帧最多重排 16 个），一次 `glMultiDrawElementsIndirect`。Clip Control 没有使用：地形与原版共享深度缓冲，改深度范围会让两边深度不一致。
+
+实体与方块实体（P0）：Vulkan 地形之后到 `AFTER_BLOCK_ENTITIES` 之间，`NEW_ENTITY` 格式的 `rendertype_entity_*` / `armor_cutout_no_cull` 绘制被复制进持久映射环形缓冲，256 字节逐绘制记录（矩阵、ColorModulator、光照方向、雾）放在 SSBO，由 `gl_DrawID` 索引。相同 GL 状态与纹理的连续绘制合并成一次 `glMultiDrawElementsIndirect`；其他绘制（发光、阴影、文字、输出到其他 framebuffer 等）先刷新已捕获的部分，再由原版绘制，保持画家顺序。原版 `BufferSource` 已按 RenderType/纹理合批，所以目前每次 MDI 通常只含一个绘制，节省的是逐绘制的缓冲孤立与 uniform 上传；跨纹理合并需要 bindless（后续）。`-Dvulkanforge.gl46.noEntities=true` 可只关闭实体通道。
+
+```powershell
+# 平坦世界：水、玻璃、树叶、箱子、牛；GL 4.6 开 → 关（原版）→ 再开，对比两张截图并检查 GL 错误与关闭报告
+.\gradlew.bat -Pgl46Smoke runClient
+# 强制使用 GLSL 而非 SPIR-V
+.\gradlew.bat -Pgl46Smoke '-Dvulkanforge.gl46.glsl=true' runClient
+```
+
+报告：`logs/vulkanforge/gl46-report.txt`（上下文、着色器路径、首帧 GL 错误、关闭统计），检查结果在 `logs/vulkanforge/gl46-smoke/`。2026-10-26 本机 RTX 3050 Laptop / NVIDIA 610.78：三个程序与实体程序均以 SPIR-V 加载，首帧无 GL 错误；同一视角 GL 4.6 与原版截图平均差 0.14（0–255），超过 48 的像素占 0.01%；实体通道捕获 12633 次、回退 0 次。这是功能对齐检查，未测量 FPS。
+
 ## 减少 OpenGL 依赖
 
 | 优先级 | 路径 | 当前状态 |

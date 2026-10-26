@@ -38,6 +38,11 @@ minecraft {
                 property 'vulkanforge.worldSmoke', 'true'
                 mods { vulkanforge { source sourceSets.smoke } }
             }
+            if (project.hasProperty('gl46Smoke')) {
+                property 'vulkanforge.gl46Smoke', 'true'
+                property 'vulkanforge.startup', 'OPENGL:GL_4_6'
+                mods { vulkanforge { source sourceSets.smoke } }
+            }
         }
         server { args '--nogui' }
     }
@@ -65,6 +70,21 @@ tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
 tasks.register('runProbe') { dependsOn ':vulkan-lab:runProbe' }
 tasks.register('runTriangle') { dependsOn ':vulkan-lab:runTriangle' }
 
+if (project.hasProperty('gl46Smoke')) {
+    tasks.matching { it.name == 'runClient' }.configureEach {
+        doFirst {
+            def report = file('run/logs/vulkanforge/gl46-smoke/report.txt')
+            report.parentFile.mkdirs()
+            report.text = 'STATUS=RUNNING\n'
+        }
+        doLast {
+            def report = file('run/logs/vulkanforge/gl46-smoke/report.txt')
+            if (!report.exists() || !report.text.contains('STATUS=OK') || report.text.contains('EXIT_TIMEOUT')) {
+                throw new GradleException('GL 4.6 smoke did not finish successfully; see run/logs/vulkanforge/gl46-smoke/report.txt')
+            }
+        }
+    }
+}
 if (project.hasProperty('worldSmoke')) {
     tasks.matching { it.name == 'runClient' }.configureEach {
         doFirst {
