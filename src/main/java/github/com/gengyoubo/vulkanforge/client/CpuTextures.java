@@ -23,7 +23,7 @@ public final class CpuTextures {
         glTexImage2D(target,level,internal,width,height,border,format,type,data);
         if(target!=GL_TEXTURE_2D||level!=0)return;
         int id=glGetInteger(GL_TEXTURE_BINDING_2D);forget(id);targets.remove(id);
-        if(width>0&&height>0&&width<=4096&&height<=4096&&(long)width*height*4+bytes<=LIMIT&&format!=GL_DEPTH_COMPONENT){
+        if(width>0&&height>0&&width<=dev.vulkanforge.bridge.WorldProtocol.MAX_ATLAS_DIMENSION&&height<=dev.vulkanforge.bridge.WorldProtocol.MAX_ATLAS_DIMENSION&&(long)width*height*4+bytes<=LIMIT&&format!=GL_DEPTH_COMPONENT){
             Page page=new Page(width,height);pages.put(id,page);bytes+=page.rgba.length;
             if(data!=null)capture(id,0,0,width,height,format,type,MemoryUtil.memAddress(data));
         }

@@ -6,10 +6,15 @@ import java.io.*;
 public final class WorldProtocol {
     public static final int STRIDE = 28;
     public static final int MAX_MESH_BYTES = 8 * 1024 * 1024;
-    public static final int MAX_ATLAS_BYTES = 64 * 1024 * 1024;
+    public static final int MAX_ATLAS_DIMENSION = 8192;
+    public static final int MAX_ATLAS_BYTES = MAX_ATLAS_DIMENSION * MAX_ATLAS_DIMENSION * 4;
     public sealed interface Command permits Reset, Atlas, Mesh, Remove, Camera, TexturePatch { long epoch(); }
     public record Reset(long epoch) implements Command { }
-    public record Atlas(long epoch, int width, int height, byte[] rgba) implements Command { }
+    public record Atlas(long epoch, int width, int height, byte[] rgba) implements Command {
+        public Atlas {
+            if (rgba == null || !validPixels(width, height, rgba.length)) throw new IllegalArgumentException("Invalid atlas dimensions or RGBA byte count");
+        }
+    }
     /** vertices: solid/cutout triangles drawn opaque; translucent: triangles (6 vertices per source quad) sorted back to front. */
     public record Mesh(long epoch, long key, int x, int y, int z, byte[] vertices, byte[] translucent) implements Command {
         public Mesh(long epoch, long key, int x, int y, int z, byte[] vertices) { this(epoch, key, x, y, z, vertices, new byte[0]); }
@@ -18,7 +23,29 @@ public final class WorldProtocol {
     public record Camera(long epoch, double x, double y, double z, float[] matrix, float red, float green, float blue) implements Command { }
     public static final int BLOCK_ATLAS = 0, LIGHT_MAP = 1;
     /** target=0 updates an atlas subregion; target=1 carries the complete 16x16 vanilla lightmap. */
-    public record TexturePatch(long epoch, int target, int x, int y, int width, int height, byte[] rgba) implements Command { }
+    public record TexturePatch(long epoch, int target, int x, int y, int width, int height, byte[] rgba) implements Command {
+        public TexturePatch {
+            if (rgba == null || !validPatch(target, x, y, width, height, rgba.length)) throw new IllegalArgumentException("Invalid texture patch");
+        }
+    }
+
+    /** Checked before allocating a capture buffer, including on the in-process bridge path. */
+    public static int atlasBytes(int width, int height) {
+        if (!validPixels(width, height, (long) width * height * 4))
+            throw new IllegalArgumentException("Unsupported atlas dimensions: " + width + "x" + height + " (maximum " + MAX_ATLAS_DIMENSION + ")");
+        return width * height * 4;
+    }
+
+    private static boolean validPixels(int width, int height, long size) {
+        return width > 0 && height > 0 && width <= MAX_ATLAS_DIMENSION && height <= MAX_ATLAS_DIMENSION
+                && size == (long) width * height * 4 && size <= MAX_ATLAS_BYTES;
+    }
+
+    private static boolean validPatch(int target, int x, int y, int width, int height, int size) {
+        return (target == BLOCK_ATLAS || target == LIGHT_MAP) && x >= 0 && y >= 0 && validPixels(width, height, size)
+                && (long) x + width <= MAX_ATLAS_DIMENSION && (long) y + height <= MAX_ATLAS_DIMENSION
+                && (target != LIGHT_MAP || (x == 0 && y == 0 && width == 16 && height == 16));
+    }
 
     private WorldProtocol() { }
 
@@ -75,7 +102,7 @@ public final class WorldProtocol {
             case 1 -> new Reset(epoch);
             case 2 -> {
                 int width = in.readInt(), height = in.readInt(), size = in.readInt();
-                if (width < 1 || height < 1 || (long) width * height * 4 != size || size > MAX_ATLAS_BYTES) throw new IOException("Invalid atlas dimensions");
+                if (!validPixels(width, height, size)) throw new IOException("Invalid atlas dimensions");
                 byte[] data = new byte[size]; in.readFully(data);
                 yield new Atlas(epoch, width, height, data);
             }
@@ -100,10 +127,8 @@ public final class WorldProtocol {
             }
             case 6 -> {
                 int target = in.readInt(), x = in.readInt(), y = in.readInt(), width = in.readInt(), height = in.readInt(), size = in.readInt();
-                if ((target != BLOCK_ATLAS && target != LIGHT_MAP) || x < 0 || y < 0 || width < 1 || height < 1 ||
-                        (long) width * height * 4 != size || size > MAX_ATLAS_BYTES || (long) x + width > 4096 || (long) y + height > 4096)
+                if (!validPatch(target, x, y, width, height, size))
                     throw new IOException("Invalid texture patch");
-                if (target == LIGHT_MAP && (x != 0 || y != 0 || width != 16 || height != 16)) throw new IOException("Lightmap must be 16x16");
                 byte[] data = new byte[size]; in.readFully(data);
                 yield new TexturePatch(epoch, target, x, y, width, height, data);
             }

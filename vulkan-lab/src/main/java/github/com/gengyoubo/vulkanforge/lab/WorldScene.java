@@ -296,7 +296,7 @@ final class WorldScene implements AutoCloseable {
             updateDescriptor(0, next, sampler);
             atlas = next;
             log.accept("WORLD_ATLAS=" + pixels.width() + "x" + pixels.height());
-        } catch (Throwable error) { next.close(); throw error; }
+        } catch (Throwable error) { context.uploads.drain(); next.close(); throw error; }
     }
 
     private void updateTexture(WorldProtocol.TexturePatch patch) {
@@ -318,24 +318,30 @@ final class WorldScene implements AutoCloseable {
     }
 
     private void uploadPixels(GpuImage image, int x, int y, int width, int height, byte[] rgba, boolean fresh) {
-        context.uploads.submit(rgba, (upload, staging, offset, stack) -> {
-            var barrier = VkImageMemoryBarrier2.calloc(1, stack).sType$Default()
-                    .srcStageMask(fresh ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT)
-                    .srcAccessMask(fresh ? 0 : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)
-                    .dstStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).dstAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
-                    .oldLayout(fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
-                    .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).image(image.image)
-                    .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
-            var dependency = VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barrier);
-            vkCmdPipelineBarrier2(upload, dependency);
-            var region = VkBufferImageCopy.calloc(1, stack).bufferOffset(offset).imageSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1))
-                    .imageOffset(o -> o.set(x, y, 0)).imageExtent(e -> e.set(width, height, 1));
-            vkCmdCopyBufferToImage(upload, staging.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
-            barrier.srcStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).srcAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
-                    .dstStageMask(VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT).dstAccessMask(VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)
-                    .oldLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            vkCmdPipelineBarrier2(upload, dependency);
-        });
+        int rowBytes = width * 4, rowsPerBatch = Math.max(1, AsyncUploads.BATCH_BYTES / rowBytes);
+        for (int row = 0; row < height; row += rowsPerBatch) {
+            int firstRow = row, rows = Math.min(rowsPerBatch, height - row);
+            boolean first = row == 0, last = row + rows == height;
+            context.uploads.submit(rgba, row * rowBytes, rows * rowBytes, (upload, staging, offset, stack) -> {
+                var barrier = VkImageMemoryBarrier2.calloc(1, stack).sType$Default()
+                        .srcStageMask(fresh ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT)
+                        .srcAccessMask(fresh ? 0 : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)
+                        .dstStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).dstAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
+                        .oldLayout(fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                        .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).image(image.image)
+                        .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
+                var dependency = VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barrier);
+                // One layout transition for the entire image, even when rows span several queue submissions.
+                if (first) vkCmdPipelineBarrier2(upload, dependency);
+                var region = VkBufferImageCopy.calloc(1, stack).bufferOffset(offset).imageSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1))
+                        .imageOffset(o -> o.set(x, y + firstRow, 0)).imageExtent(e -> e.set(width, rows, 1));
+                vkCmdCopyBufferToImage(upload, staging.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+                barrier.srcStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).srcAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
+                        .dstStageMask(VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT).dstAccessMask(VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)
+                        .oldLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                if (last) vkCmdPipelineBarrier2(upload, dependency);
+            });
+        }
     }
 
     private void updateDescriptor(int binding, GpuImage image, long imageSampler) {

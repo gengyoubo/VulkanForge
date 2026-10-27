@@ -2,6 +2,7 @@ package github.com.gengyoubo.vulkanforge.client;
 
 import com.mojang.blaze3d.platform.GlStateManager;
 import com.mojang.blaze3d.platform.NativeImage;
+import dev.vulkanforge.bridge.WorldProtocol;
 import static org.lwjgl.opengl.GL11.*;
 import static org.lwjgl.opengl.GL12.*;
 import static org.lwjgl.opengl.GL15.glBindBuffer;
@@ -30,9 +31,8 @@ final class TextureCapture {
             try {
                 GlStateManager._bindTexture(texture);
                 width = glGetTexLevelParameteri(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH); height = glGetTexLevelParameteri(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT);
-                if (width < 1 || height < 1 || width > 4096 || height > 4096) throw new IllegalStateException("Unsupported texture dimensions: " + width + "x" + height);
+                int size = WorldProtocol.atlasBytes(width, height);
                 if (buffer == 0) buffer = glGenBuffers(); glBindBuffer(GL_PIXEL_PACK_BUFFER, buffer);
-                int size = width * height * 4;
                 if (capacity != size) { glBufferData(GL_PIXEL_PACK_BUFFER, size, GL_STREAM_READ); capacity = size; }
                 glPixelStorei(GL_PACK_ALIGNMENT, 1); glPixelStorei(GL_PACK_ROW_LENGTH, 0);
                 glPixelStorei(GL_PACK_SKIP_ROWS, 0); glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
@@ -80,7 +80,7 @@ final class TextureCapture {
             glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
             glPixelStorei(GL_PACK_ROW_LENGTH, 0); glPixelStorei(GL_PACK_SKIP_ROWS, 0); glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
             int width = glGetTexLevelParameteri(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH), height = glGetTexLevelParameteri(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT);
-            if (width < 1 || height < 1 || width > 4096 || height > 4096) throw new IllegalStateException("Unsupported Minecraft texture dimensions: " + width + "x" + height);
+            WorldProtocol.atlasBytes(width, height);
             try (NativeImage image = new NativeImage(width, height, false)) {
                 image.downloadTexture(0, false);
                 int[] pixels = image.getPixelsRGBA();

@@ -3,6 +3,7 @@
 *.iml
 **/build/
 run/
+run-native/
 run-data/
 .bootstrap/
 hs_err_pid*

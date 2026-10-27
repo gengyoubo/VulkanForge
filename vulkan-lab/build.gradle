@@ -86,6 +86,15 @@ tasks.register('smokePresent', JavaExec) {
     }
 }
 
+// Native WSI kernel only: the isolated launcher rejects all OpenGL/interop class loads.
+tasks.register('smokeNativeWindow', JavaExec) {
+    dependsOn 'testClasses'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.lab.VkWindowOnlyLauncher'
+    systemProperty 'vulkanforge.smokeReportDir', rootProject.file(rootProject.findProperty('vulkanforge.smokeReportDir') ?: 'build/reports/native-window').absolutePath
+    if (rootProject.hasProperty('validationSmoke')) systemProperty 'vulkanforge.requireValidation', 'true'
+}
+
 tasks.register('smokeResources', JavaExec) {
     dependsOn 'testClasses'
     classpath = sourceSets.test.runtimeClasspath
@@ -140,6 +149,16 @@ tasks.register('smokeGlTail', JavaExec) {
     systemProperty 'vulkanforge.glTailCompatibility', 'true'
     systemProperty 'vulkanforge.disableValidation', 'true'
     systemProperty 'vulkanforge.smokeReportDir', rootProject.file(rootProject.findProperty('vulkanforge.smokeReportDir') ?: 'build/reports/gl-tail-smoke').absolutePath
+}
+
+tasks.register('smokeLargeAtlas', JavaExec) {
+    dependsOn 'testClasses'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.lab.LargeAtlasSmoke'
+    maxHeapSize = '2g'
+    systemProperty 'vulkanforge.smokeReportDir', rootProject.file(rootProject.findProperty('vulkanforge.smokeReportDir') ?: 'build/reports/large-atlas').absolutePath
+    if (rootProject.hasProperty('legacyGpuSmoke')) systemProperty 'vulkanforge.disableUploadTimeline', 'true'
+    if (rootProject.hasProperty('validationSmoke')) systemProperty 'vulkanforge.requireValidation', 'true'
 }
 
 tasks.register('benchmarkBindings', JavaExec) {

@@ -16,6 +16,7 @@ def run(java,case,phase,folder,guard,args,preflight=False,version='1.4',*,jvm_pr
         if jvm_properties:cmd += ['-D'+key+'='+str(value) for key,value in jvm_properties.items()]
         if gl:cmd+=['github.com.gengyoubo.vulkanforge.client.GlOffscreenBenchmark','4.6',str(scene)]
         elif native:cmd+=['-Dbench.scene='+str(scene),'github.com.gengyoubo.vulkanforge.lab.VkOnlyLauncher']
+        elif case=='GLVK_GL_TAIL':cmd+=['-Dbench.scene='+str(scene),'github.com.gengyoubo.vulkanforge.lab.GlTailPipelineBenchmark']
         else:cmd+=['-Dvulkanforge.noInteropOptimizations=false','-Dbench.scene='+str(scene),'github.com.gengyoubo.vulkanforge.lab.NativePipelineBenchmark']
         (folder/'command.json').write_text(json.dumps(cmd,indent=2));print(('PREFLIGHT ' if preflight else 'MEASURE ')+str(folder.relative_to(ROOT)),flush=True)
         with (folder/'stdout.txt').open('w') as log:
@@ -40,7 +41,11 @@ def run(java,case,phase,folder,guard,args,preflight=False,version='1.4',*,jvm_pr
     raise RuntimeError('Repeated concurrent GPU benchmark interference')
 
 def validate(folder,reference,expected,case,phase):
-    alias={'GL46_NATIVE':'CUSTOM_GL46','GLVK_HYBRID':'VK14_AFTER','GLVK_INTERVAL':'NATIVE_PRIVATE','VK_NATIVE_OFFSCREEN':'NATIVE_PRIVATE'}[case]
+    alias={'GL46_NATIVE':'CUSTOM_GL46','GLVK_HYBRID':'VK14_AFTER','GLVK_INTERVAL':'NATIVE_PRIVATE','GLVK_GL_TAIL':'NATIVE_PRIVATE','VK_NATIVE_OFFSCREEN':'NATIVE_PRIVATE'}[case]
+    if case=='GLVK_GL_TAIL':
+        audit=common.props(folder/'pipeline-audit.txt')
+        for i,value in {0:1,1:1,2:0,3:0,4:1,5:2,6:0,7:0,8:8}.items():
+            assert float(audit[f'COUNTER_{i}_PER_FRAME'])==value,(case,phase,i,audit,value)
     if case=='GLVK_INTERVAL':
         audit=common.props(folder/'pipeline-audit.txt');posts=PHASES[phase]
         wanted=[1,1,int(posts>0),posts,2,4 if posts else 2,1,2,8 if posts else 4]
@@ -62,7 +67,7 @@ def summarize(out,runs):
         except(ValueError,IndexError):pass
     summary=[];lines=['# 三种模式：共享 Vulkan 内核，分离跨 API 成本','',
     '1920×1080，RGBA8 / D32F，两帧槽；同一实际 Section/四边形 Draw ID 清单、相机、纹理、光照和透明顺序；五轮随机顺序、独立 JVM。不是完整游戏 FPS。',
-    'GL46_NATIVE 使用生产 Gl46Terrain；GLVK_HYBRID 使用共享图像的生产混合执行器；VK_NATIVE_OFFSCREEN 使用同一 VulkanSceneCore / WorldScene / GpuCuller / NativePost，全部图像私有，帧内一次 VK 提交。',
+    'GL46_NATIVE 使用生产 Gl46Terrain；GLVK_HYBRID 是旧交错计划；GLVK_GL_TAIL 使用生产 GL Tail 地形，GL 深度合成与 GL 后处理、私有 GL 最终目标，每帧一次 VK 提交、两次 GL 组调用。尾部合成使用等价全屏三角形和相同 alpha/深度/混合语义，不包含 Minecraft ShaderInstance/VertexBuffer 的 CPU 开销；不是完整游戏计时。VK_NATIVE_OFFSCREEN 使用同一 VulkanSceneCore / WorldScene / GpuCuller / NativePost，全部图像私有，帧内一次 VK 提交。',
     '每个原生样本均由隔离类加载器禁止加载 OpenGL、GLFW 和 GlInterop，任何加载尝试都会失败；不仅仅是把 GL 绘制关掉。Native 的私有设备没有启用 Win32 外部内存/信号量扩展。硬件地形输入装配顶点数逐帧核对为 699024。',
     'GPU ms：GL/混合由同一 GL 时钟首尾计时（包含交接等待），Native 由 VK 时钟覆盖完整绘制命令缓冲。两种时钟不相减；Native 数值不包含 CPU 提交/查询，不代表 GPU 活跃百分比。FPS 均计入最终排空。',
     'Native 的颜色与深度仅在计时外读回，并翻转行以对齐 GL 抓图约定；被计时的路径没有 GL 或图像读回。','']
@@ -79,10 +84,16 @@ def summarize(out,runs):
     (out/'summary.json').write_text(json.dumps(summary,indent=2));(out/'summary.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--java',required=True);p.add_argument('--rounds',type=int,default=5);p.add_argument('--seconds',type=float,default=6);p.add_argument('--warmup',type=int,default=1000);p.add_argument('--preflight-only',action='store_true');p.add_argument('--output',default='build/reports/three-modes');args=p.parse_args()
+    global CASES
+    p=argparse.ArgumentParser();p.add_argument('--java',required=True);p.add_argument('--rounds',type=int,default=5);p.add_argument('--seconds',type=float,default=6);p.add_argument('--warmup',type=int,default=1000);p.add_argument('--preflight-only',action='store_true');p.add_argument('--gl-tail',action='store_true');p.add_argument('--output',default='build/reports/three-modes');args=p.parse_args()
+    if args.gl_tail:CASES=['GL46_NATIVE','GLVK_GL_TAIL','VK_NATIVE_OFFSCREEN']
+    hybrid=CASES[1]
     out=(ROOT/args.output).resolve();assert out.is_relative_to(ROOT);out.mkdir(parents=True,exist_ok=True)
     if (out/'runs.json').exists():raise RuntimeError('Choose a new output directory')
     common.archive(out);manifest=json.loads((out/'kernel-manifest.json').read_text());path=Path(__file__).resolve();relative=path.relative_to(ROOT);target=out/'runtime-snapshot'/relative;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(path.read_bytes());manifest['sha256'][str(relative)]=hashlib.sha256(path.read_bytes()).hexdigest();(out/'kernel-manifest.json').write_text(json.dumps(manifest,indent=2))
+    scene=ROOT/'build/reports/offscreen-performance/matched-scene.bin'
+    (out/'scene-sha256.txt').write_text(hashlib.sha256(scene.read_bytes()).hexdigest())
+    (out/'arguments.json').write_text(json.dumps(vars(args),indent=2))
     expected=(ROOT/'build/reports/offscreen-performance/expected-workload.txt').read_text();(out/'expected-workload.txt').write_text(expected);guard=Guard();runs=[];rng=random.Random(20261028)
     with (out/'telemetry.csv').open('w') as log:
         monitor=subprocess.Popen(['nvidia-smi','--query-gpu=timestamp,index,utilization.gpu,memory.used,temperature.gpu,clocks.gr','--format=csv,noheader,nounits','--loop-ms=200'],stdout=log,stderr=subprocess.STDOUT)
@@ -91,9 +102,9 @@ def main():
                 reference=out/'preflight'/phase/'GL46_NATIVE'
                 for case in CASES:
                     folder=out/'preflight'/phase/case;run(args.java,case,phase,folder,guard,args,True);validate(folder,reference,expected,case,phase);print('PREFLIGHT PASS '+phase+' '+case,flush=True)
-                compare_vulkan(out/'preflight'/phase/'VK_NATIVE_OFFSCREEN',out/'preflight'/phase/'GLVK_HYBRID')
+                compare_vulkan(out/'preflight'/phase/'VK_NATIVE_OFFSCREEN',out/'preflight'/phase/hybrid)
                 for version in ['1.2','1.3']:
-                    folder=out/'api-preflight'/version/phase;run(args.java,'VK_NATIVE_OFFSCREEN',phase,folder,guard,args,True,version);validate(folder,reference,expected,'VK_NATIVE_OFFSCREEN',phase);compare_vulkan(folder,out/'preflight'/phase/'GLVK_HYBRID');print('NATIVE API PASS '+version+' '+phase,flush=True)
+                    folder=out/'api-preflight'/version/phase;run(args.java,'VK_NATIVE_OFFSCREEN',phase,folder,guard,args,True,version);validate(folder,reference,expected,'VK_NATIVE_OFFSCREEN',phase);compare_vulkan(folder,out/'preflight'/phase/hybrid);print('NATIVE API PASS '+version+' '+phase,flush=True)
             (out/'preflight-pass.txt').write_text('PASS three execution modes, native VK1.2/1.3/1.4, GL-free class loading, actual Draw IDs and vertices, color/depth agreement\n')
             if args.preflight_only:return
             schedule=[]
@@ -101,7 +112,7 @@ def main():
                 jobs=[(phase,case) for phase in PHASES for case in CASES];rng.shuffle(jobs);schedule.append(dict(round=n,jobs=jobs));(out/'schedule.json').write_text(json.dumps(schedule,indent=2))
                 for phase,case in jobs:
                     folder=out/f'round-{n:02d}'/phase/case;row=run(args.java,case,phase,folder,guard,args);validate(folder,out/'preflight'/phase/'GL46_NATIVE',expected,case,phase)
-                    if case=='VK_NATIVE_OFFSCREEN':compare_vulkan(folder,out/'preflight'/phase/'GLVK_HYBRID')
+                    if case=='VK_NATIVE_OFFSCREEN':compare_vulkan(folder,out/'preflight'/phase/hybrid)
                     row['round']=n;runs.append(row);(out/'runs.json').write_text(json.dumps(runs,indent=2));print('PASS '+str(n)+' '+phase+' '+case+' FPS='+str(row['FPS']),flush=True)
         finally:monitor.terminate();monitor.wait(timeout=10);guard.close();(out/'other-java-benchmarks.json').write_text(json.dumps(guard.events,indent=2))
     summarize(out,runs)

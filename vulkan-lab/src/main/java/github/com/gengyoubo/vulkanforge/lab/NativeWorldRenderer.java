@@ -32,7 +32,7 @@ final class NativeWorldRenderer implements AutoCloseable {
     private final ArrayDeque<Retired> retired=new ArrayDeque<>();
     private long pool,timestamps,statistics,submitted,completed,postPasses;
     private long prepareNanos,recordNanos,submitNanos,fenceNanos,queryNanos,boundaryNanos;
-    private final double period;private final int bits;final int width,height;
+    private final double period;private final int bits;int width,height;
     NativeWorldRenderer(VulkanContext context,int width,int height,Consumer<String> log) {
         this(context,width,height,log,null);
     }
@@ -58,6 +58,41 @@ final class NativeWorldRenderer implements AutoCloseable {
     }
     void apply(WorldProtocol.Command command){if(command instanceof WorldProtocol.Reset||command instanceof WorldProtocol.Atlas)drain();world.apply(command);}
     int nextSlot(){return (int)(submitted%SLOTS);}
+    /** The caller must order its sampling submission after frame(), then finish sampling before reusing this slot. */
+    VulkanRenderImage output(int index) {
+        if (boundary != null) throw new IllegalStateException("Private Vulkan presentation cannot consume an interop boundary");
+        Slot slot = slots[index];
+        if (slot.serial == 0) throw new IllegalStateException("Native frame has not been submitted");
+        return slot.colors[slot.result];
+    }
+    /** Resize only private attachments, preserving the live world's meshes, atlas and camera. */
+    void resize(int width, int height) {
+        if (boundary != null) throw new IllegalStateException("Interop attachments belong to their boundary");
+        if (width <= 0 || height <= 0) throw new IllegalArgumentException("Native target extent must be positive");
+        if (this.width == width && this.height == height) return;
+        drain();
+        // Also covers the subsequent presentation submission sampling the old color attachment.
+        check(vkDeviceWaitIdle(context.device), "wait private target resize");
+        GpuImage[][] colors = new GpuImage[SLOTS][2], depths = new GpuImage[SLOTS][2];
+        try {
+            for (int s = 0; s < SLOTS; s++) for (int i = 0; i < 2; i++) {
+                colors[s][i] = new GpuImage(context,width,height,VK_FORMAT_R8G8B8A8_UNORM,VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT,VK_IMAGE_ASPECT_COLOR_BIT);
+                depths[s][i] = new GpuImage(context,width,height,VK_FORMAT_D32_SFLOAT,VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT,VK_IMAGE_ASPECT_DEPTH_BIT);
+            }
+        } catch (RuntimeException | Error error) {
+            for (int s = 0; s < SLOTS; s++) for (int i = 0; i < 2; i++) {
+                if (colors[s][i] != null) colors[s][i].close();
+                if (depths[s][i] != null) depths[s][i].close();
+            }
+            throw error;
+        }
+        for (int s = 0; s < SLOTS; s++) for (int i = 0; i < 2; i++) {
+            slots[s].colors[i].close(); slots[s].depths[i].close();
+            slots[s].colors[i] = colors[s][i]; slots[s].depths[i] = depths[s][i];
+        }
+        for (Slot slot : slots) { slot.serial = 0; slot.result = 0; }
+        this.width = width; this.height = height;
+    }
     RenderMode mode(){return boundary==null?RenderMode.VK:RenderMode.GL_VK;}
     void frame(NativeFramePlan plan) {
         long prepareStart=System.nanoTime();

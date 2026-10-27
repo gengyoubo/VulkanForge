@@ -2,6 +2,8 @@
 
 Minecraft **1.20.1 / Forge 47.4.28 / Java 17** 客户端 Vulkan 渲染实验。
 
+**整个游戏进程无 OpenGL 的 `VK` 模式尚未接入 Minecraft。** 已新增独立的私有 Vulkan 地形 → Vulkan Swapchain 后端及禁止加载 GL/互操作实现的 GPU 检查：`.\gradlew.bat :vulkan-lab:smokeNativeWindow`。它验证后端，不代表可用的纯 Vulkan 游戏；启动、资源和实体/GUI 的剩余迁移见 [原生游戏渲染状态](docs/native-game-rendering.md)。
+
 **GL-VK 默认使用 GL 尾部兼容计划**：Vulkan 批量绘制地形，GL 负责兼容绘制、后处理、GUI/HUD 与最终输出。配置页的“GL-VK 执行计划”对应 `renderer.glVkPlan`，可在 `GL_TAIL` 与原 `INTERLEAVED` 之间切换，重启生效。下述 Vulkan Swapchain、实体/GUI 回放说明针对原交错计划。
 
 当前已经打通四条路径：
@@ -37,6 +39,8 @@ IntelliJ IDEA：导入根目录的 `build.gradle`，将 **Gradle JVM** 和 **Pro
 主窗口接管在启动时完成；F8 控制地形/三角形预览，独立于主窗口的呈现方式。窗口缩放、全屏尺寸变化和 VSync 设置变化会重建 Swapchain；最小化时跳过呈现，恢复后继续。
 
 当前 GL-VK 默认的 `GL_TAIL` 保留可见 OpenGL 窗口与最终 GL 输出，让 Vulkan 批量生成地形，GL 按原顺序执行合成、实体、后处理、手持物和 HUD。它不创建 Vulkan Swapchain；不透明与透明结果一组交接，帧末归还。无需额外 JVM 参数；旧的 `-Dvulkanforge.glTailCompatibility=true/false` 仍可临时覆盖配置。合同、限制和验证命令见 [GL 尾部兼容模式](docs/gl-tail-compatibility.md)。
+
+Vulkan 方块图集支持最大 **8192×8192 RGBA8**，包括超过 4096 坐标的动画补丁；整图按最多 16 MiB 分块上传，保持现有在途预算。尺寸限制、内存开销和测试命令见 [大图集支持](docs/large-atlas.md)。
 
 启动期间继续显示 Forge 加载窗口；新窗口先隐藏，完成 Surface/Swapchain 和实际尺寸共享图像的准备，并等待 Vulkan 第一帧完成后才显示，避免提前显示空白窗口。
 

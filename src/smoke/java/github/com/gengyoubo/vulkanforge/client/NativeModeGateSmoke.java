@@ -9,6 +9,7 @@ public final class NativeModeGateSmoke {
         try{NativeModeAvailability.rejectIncompleteGameLaunch(report);throw new AssertionError("Incomplete VK game launch was accepted");}
         catch(UnsupportedOperationException expected){if(!expected.getMessage().contains("Compatibility report"))throw new AssertionError("No report location");}
         String data=Files.readString(report);if(!data.contains("REJECTED_INCOMPLETE_COVERAGE")||!data.contains("\"hybridExecutorEntered\": false")||!data.contains("\"glFallbackAllowed\": false"))throw new AssertionError("Incorrect native gate report");
+        if(!data.contains("IMPLEMENTED_NOT_CONNECTED")||!data.contains("NATIVE_GAME_RENDER_LOOP")||!data.contains("MINECRAFT_RESOURCES_WITHOUT_GL"))throw new AssertionError("Backend availability was confused with full-game coverage");
         System.out.println("NATIVE_MODE_GATE_SMOKE=OK (explicit rejection, compatibility report, no hybrid fallback)");
     }
 }

@@ -38,6 +38,7 @@ public final class NativeMainWindow {
     private NativeMainWindow() { }
 
     public static long createWindow(IntSupplier width, IntSupplier height, Supplier<String> title, LongSupplier monitor) {
+        if (NativeGameWindow.enabled()) return NativeGameWindow.create(width,height,title,monitor);
         var startup = VulkanForgeConfig.startup();
         if(startup.mode()==dev.vulkanforge.bridge.RenderMode.VK)NativeModeAvailability.rejectIncompleteGameLaunch(FMLPaths.GAMEDIR.get().resolve("logs/vulkanforge/vk-native-compatibility.json"));
         long legacy = ImmediateWindowHandler.setupMinecraftWindow(width, height, title, monitor);
@@ -137,11 +138,13 @@ public final class NativeMainWindow {
     /** Active execution plan, selected only after the Vulkan/GL interop probe succeeds. */
     public static boolean glTailCompatibility() { return active() && glTail; }
     public static boolean positionWindow(java.util.Optional<Object> monitor, IntConsumer width, IntConsumer height, IntConsumer x, IntConsumer y) {
+        if (NativeGameWindow.enabled()) return false;
         return (!active() || glTail) && ImmediateWindowHandler.positionWindow(monitor, width, height, x, y);
     }
-    public static void makeContextCurrent(long window) { GLFW.glfwMakeContextCurrent(active() && !glTail && window == mainWindow ? hiddenContext : window); }
+    public static void makeContextCurrent(long window) { if(NativeGameWindow.enabled()){if(window!=NativeGameWindow.handle())throw new IllegalStateException("Unexpected native game window");return;} GLFW.glfwMakeContextCurrent(active() && !glTail && window == mainWindow ? hiddenContext : window); }
     /** Window.shouldClose is called at the start of Minecraft.runTick, before timer/ticks/mouse.turnPlayer. */
     public static boolean shouldClose(Window window) {
+        if (NativeGameWindow.enabled()) { GLFW.glfwPollEvents();NativeGameWindow.beginFrame();GLFW.glfwPollEvents();return GLFW.glfwWindowShouldClose(window.getWindow()); }
         if (GLX._shouldClose(window)) return true;
         if (active() && !glTail && window.getWindow() == mainWindow) {
             // Process close/minimize/resize before a WSI wait; then sample again after the wait.
@@ -157,6 +160,7 @@ public final class NativeMainWindow {
         return GLX._shouldClose(window);
     }
     public static void swapBuffers(long window) {
+        if (NativeGameWindow.enabled()) { NativeGameWindow.present(); return; }
         TailFrameProfiler.begin(TailFrameProfiler.SWAP);
         try { swapBuffersImpl(window); }
         finally { TailFrameProfiler.end(TailFrameProfiler.SWAP); TailFrameProfiler.endFrame(); }
@@ -196,6 +200,7 @@ public final class NativeMainWindow {
     }
     /** Vulkan presentation samples the target directly; the GL tail keeps Minecraft's normal final blit. */
     public static void blitToScreen(com.mojang.blaze3d.pipeline.RenderTarget target, int width, int height) {
+        if (NativeGameWindow.enabled() && target == Minecraft.getInstance().getMainRenderTarget()) return;
         if (active() && !glTail && target == Minecraft.getInstance().getMainRenderTarget()) { skippedScreenBlits++; return; }
         target.blitToScreen(width, height);
     }
@@ -282,6 +287,7 @@ public final class NativeMainWindow {
         call(capture, path.toAbsolutePath().toString());
     }
     public static void destroyWindow(long window) {
+        if (NativeGameWindow.enabled() && window == NativeGameWindow.handle()) { NativeGameWindow.close();GLFW.glfwDestroyWindow(window);return; }
         if (window == mainWindow && active()) {
             makeContextCurrent(window); boolean tail = glTail; releaseBackend();
             GLFW.glfwDestroyWindow(window); if (!tail) GLFW.glfwDestroyWindow(hiddenContext);

@@ -14,6 +14,12 @@ final class GpuImage implements VulkanRenderImage {
         this.context = context;
         this.width = width; this.height = height;
         try (MemoryStack stack = MemoryStack.stackPush()) {
+            var imageProps = VkImageFormatProperties.calloc(stack);
+            check(vkGetPhysicalDeviceImageFormatProperties(context.physical, format, VK_IMAGE_TYPE_2D,
+                    VK_IMAGE_TILING_OPTIMAL, usage, 0, imageProps), "query GPU image limits");
+            if (width < 1 || height < 1 || width > imageProps.maxExtent().width() || height > imageProps.maxExtent().height())
+                throw new IllegalArgumentException("GPU does not support " + width + "x" + height + " image; format/usage limit is "
+                        + imageProps.maxExtent().width() + "x" + imageProps.maxExtent().height());
             var props = VkFormatProperties.calloc(stack);
             vkGetPhysicalDeviceFormatProperties(context.physical, format, props);
             if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT && (props.optimalTilingFeatures() & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) == 0) throw new IllegalStateException("D32 depth attachment is unsupported");

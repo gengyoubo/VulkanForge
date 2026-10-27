@@ -16,6 +16,10 @@ final class PresentPass implements AutoCloseable {
     private final long[] sets = new long[2];
 
     PresentPass(VulkanContext context, int format) {
+        this(context, format, "/shaders/composite.vert", "/shaders/present.frag");
+    }
+
+    PresentPass(VulkanContext context, int format, String vertex, String fragment) {
         this.context = context;
         try (var stack = MemoryStack.stackPush()) {
             var handle = stack.mallocLong(1);
@@ -31,7 +35,7 @@ final class PresentPass implements AutoCloseable {
             check(vkCreateSampler(context.device, VkSamplerCreateInfo.calloc(stack).sType$Default().minFilter(VK_FILTER_NEAREST).magFilter(VK_FILTER_NEAREST)
                     .addressModeU(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE).addressModeV(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
                     .addressModeW(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE), null, handle), "presentation sampler"); sampler = handle.get(0);
-            pipeline = GraphicsPipeline.create(context, layout, format, "/shaders/composite.vert", "/shaders/present.frag", false, false, stack);
+            pipeline = GraphicsPipeline.create(context, layout, format, vertex, fragment, false, false, stack);
         } catch (Throwable error) { close(); throw error; }
     }
 

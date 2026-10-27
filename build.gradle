@@ -11,6 +11,7 @@ java.toolchain.languageVersion = JavaLanguageVersion.of(17)
 sourceSets.main.java.srcDir 'bridge-protocol/src/main/java'
 sourceSets.main.java.srcDir 'gl-interop/src/main/java'
 sourceSets {
+    nativeBootstrap { }
     smoke {
         java.srcDir 'benchmark-support/src/main/java'
         compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
@@ -28,6 +29,16 @@ minecraft {
             mods { vulkanforge { source sourceSets.main } }
         }
         client {
+            if (project.hasProperty('nativeGame')) {
+                workingDirectory project.file('run-native')
+                property 'vulkanforge.startup', 'VK:' + (project.findProperty('nativeApi') ?: 'V1_4')
+                jvmArg '-javaagent:' + project.file('build/libs/vulkanforge-native-bootstrap.jar').absolutePath
+                if (project.hasProperty('nativeGameSmoke')) {
+                    property 'vulkanforge.nativeGameSmoke', 'true'
+                    if (project.hasProperty('nativeMenuOnly')) property 'vulkanforge.nativeMenuOnly', 'true'
+                    mods { vulkanforge { source sourceSets.smoke } }
+                }
+            }
             ['vulkanforge.entityProfile', 'vulkanforge.entityLegacyBatch', 'vulkanforge.noInteropOptimizations', 'vulkanforge.earlyGlInputFlush', 'vulkanforge.glTailCompatibility'].each { key ->
                 if (System.getProperty(key) != null) property key, System.getProperty(key)
             }
@@ -96,6 +107,33 @@ minecraft {
 
 dependencies {
     minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+    nativeBootstrapImplementation 'org.ow2.asm:asm-tree:9.5'
+}
+
+tasks.register('nativeBootstrapJar', Jar) {
+    dependsOn 'nativeBootstrapClasses'
+    archiveFileName = 'vulkanforge-native-bootstrap.jar'
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from sourceSets.nativeBootstrap.output
+    from { configurations.nativeBootstrapRuntimeClasspath.collect { it.isDirectory() ? it : zipTree(it) } }
+    manifest { attributes 'Premain-Class': 'dev.vulkanforge.bootstrap.NativeBootstrap' }
+    exclude 'module-info.class', 'META-INF/versions/**/module-info.class'
+}
+if (project.hasProperty('nativeGame')) tasks.matching { it.name == 'runClient' }.configureEach {
+    dependsOn 'nativeBootstrapJar'
+    doFirst {
+        def directory=file('run-native'); directory.mkdirs()
+        if (project.hasProperty('nativeGameSmoke')) {
+            file('run-native/options.txt').text='renderDistance:3\nsimulationDistance:5\nguiScale:2\nmaxFps:60\nenableVsync:false\nonboardAccessibility:false\n'
+            def result=file('run-native/logs/vulkanforge/native-game-smoke/result.txt');result.parentFile.mkdirs();result.text='STATUS=RUNNING\n'
+        }
+    }
+    doLast {
+        if (project.hasProperty('nativeGameSmoke')) {
+            def result=file('run-native/logs/vulkanforge/native-game-smoke/result.txt')
+            if (!result.exists() || !result.text.contains('STATUS=OK')) throw new GradleException('Native game smoke failed; see run-native logs')
+        }
+    }
 }
 
 // The lab's LWJGL and native libraries are deliberately outside Minecraft's classpath.
@@ -128,6 +166,22 @@ tasks.register('smokeRenderModeConfig', JavaExec) {
     classpath = sourceSets.smoke.runtimeClasspath
     mainClass = 'github.com.gengyoubo.vulkanforge.config.RenderModeConfigSmoke'
     javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+}
+
+tasks.register('smokeNativeModeGate', JavaExec) {
+    dependsOn 'compileSmokeJava'
+    classpath = sourceSets.smoke.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.client.NativeModeGateSmoke'
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+}
+
+tasks.register('smokeLargeTextureCapture', JavaExec) {
+    dependsOn 'compileSmokeJava', 'processResources'
+    classpath = sourceSets.smoke.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.client.LargeTextureCaptureSmoke'
+    maxHeapSize = '2g'
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+    systemProperty 'log4j.configurationFile', file('src/smoke/resources/offscreen-log4j2.xml').absolutePath
 }
 if (project.hasProperty('configSmoke')) {
     tasks.matching { it.name == 'runClient' }.configureEach {

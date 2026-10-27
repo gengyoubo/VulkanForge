@@ -51,7 +51,7 @@ final class CaptureBuffer implements AutoCloseable {
         {
                 var data = storage.hostView(size);
                 var image = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
-                boolean bgra = format == VK_FORMAT_B8G8R8A8_UNORM;
+                boolean bgra = format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
                 for (int y = 0; y < height; y++) for (int x = 0; x < width; x++) {
                     int i = (y * width + x) * 4;
                     int r = data.get(i + (bgra ? 2 : 0)) & 255, g = data.get(i + 1) & 255, b = data.get(i + (bgra ? 0 : 2)) & 255;

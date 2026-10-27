@@ -41,6 +41,7 @@ final class VulkanPreview {
     private VulkanPreview() { }
 
     static void toggle() {
+        if (NativeGameWindow.enabled()) return;
         RenderSystem.assertOnRenderThread();
         if (enabled) close();
         else if (VulkanForgeConfig.startup().mode() == dev.vulkanforge.bridge.RenderMode.GL) enableGl();

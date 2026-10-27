@@ -108,7 +108,7 @@ public final class ClientEvents {
         @SubscribeEvent
         public static void setup(FMLClientSetupEvent event) {
             // The OpenGL backend never creates a Vulkan device; F9's standalone window still probes on demand.
-            if (github.com.gengyoubo.vulkanforge.config.VulkanForgeConfig.startup().mode().usesVulkan()) event.enqueueWork(LabLauncher::probe);
+            if (!NativeGameWindow.enabled() && github.com.gengyoubo.vulkanforge.config.VulkanForgeConfig.startup().mode().usesVulkan()) event.enqueueWork(LabLauncher::probe);
         }
     }
 }

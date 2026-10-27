@@ -67,6 +67,7 @@ public final class TerrainMeshes {
 
     /** Only ChunkRenderDispatcher's upload call is redirected here, before vanilla releases/reuses the builder. */
     public static void upload(VertexBuffer buffer, BufferBuilder.RenderedBuffer rendered) {
+        if (NativeGameWindow.enabled()) { buffer.upload(rendered); return; }
         RenderSystem.assertOnRenderThread();
         var state = rendered.drawState();
         if (state.indexOnly()) indexUpdates++; // Vanilla transparency resort changes no positions, colors, UVs or lighting.

@@ -20,7 +20,8 @@ final class AsyncUploads implements AutoCloseable {
     @FunctionalInterface interface Recorder { void record(VkCommandBuffer command, GpuBuffer staging, long offset, MemoryStack stack); }
     private static final int SLOTS = 8, ALIGNMENT = 256;
     /** Bytes in flight before admission refuses / submit waits; a batch closes early once it holds BATCH_BYTES. */
-    private static final long BYTE_BUDGET = 64L << 20, BATCH_BYTES = 16L << 20;
+    static final int BATCH_BYTES = 16 << 20;
+    private static final long BYTE_BUDGET = 64L << 20;
     /** used: staging write offset; pending: payload bytes counted against BYTE_BUDGET until the batch completes. */
     private static final class Slot { VkCommandBuffer command; GpuBuffer staging; long fence, ticket, pending; int used, uploads; boolean open; }
     private final VulkanContext context;
@@ -58,18 +59,24 @@ final class AsyncUploads implements AutoCloseable {
     }
 
     long submit(byte[] data, Recorder recorder) {
+        return submit(data, 0, data.length, recorder);
+    }
+
+    /** Upload a slice without allocating a second heap array for large atlas rows. */
+    long submit(byte[] data, int sourceOffset, int length, Recorder recorder) {
+        Objects.checkFromIndexSize(sourceOffset, length, data.length);
         poll();
         Slot slot = slots[cursor];
-        if (slot.open && slot.uploads > 0 && slot.used + data.length > Math.max(BATCH_BYTES, slot.staging.mapped.capacity())) { flush(); slot = slots[cursor]; }
+        if (slot.open && slot.uploads > 0 && slot.used + length > Math.max(BATCH_BYTES, slot.staging.mapped.capacity())) { flush(); slot = slots[cursor]; }
         if (!slot.open) {
             if (slot.ticket > completed) { backpressure++; waitFor(slot.ticket); }
-            if (pendingBytes != 0 && pendingBytes + data.length > BYTE_BUDGET) { backpressure++; drain(); }
-            open(slot, data.length);
-        } else if (slot.used + data.length > slot.staging.mapped.capacity()) grow(slot, data.length);
+            if (pendingBytes != 0 && pendingBytes + length > BYTE_BUDGET) { backpressure++; drain(); }
+            open(slot, length);
+        } else if (slot.used + length > slot.staging.mapped.capacity()) grow(slot, length);
         int offset = slot.used;
-        slot.staging.mapped.position(offset); slot.staging.mapped.put(data).clear();
+        slot.staging.mapped.position(offset); slot.staging.mapped.put(data, sourceOffset, length).clear();
         try (MemoryStack stack = MemoryStack.stackPush()) { recorder.record(slot.command, slot.staging, offset, stack); }
-        slot.used = align(offset + data.length); slot.uploads++; slot.pending += data.length; pendingBytes += data.length; bytes += data.length; uploads++;
+        slot.used = align(offset + length); slot.uploads++; slot.pending += length; pendingBytes += length; bytes += length; uploads++;
         return slot.ticket;
     }
 

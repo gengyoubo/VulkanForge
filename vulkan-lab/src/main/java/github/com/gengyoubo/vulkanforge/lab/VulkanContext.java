@@ -43,6 +43,8 @@ final class VulkanContext implements AutoCloseable {
     private final AtomicInteger validationErrors = new AtomicInteger();
     private boolean interop;
     private byte[] deviceUUID;
+    private long nativeHwnd, nativeHinstance;
+    boolean nativePresentFences;
 
     VulkanContext() { this(requestedApiVersion()); }
 
@@ -76,13 +78,25 @@ final class VulkanContext implements AutoCloseable {
     }
     boolean interopEnabled(){return interop;}
 
+    /** Create the surface before device selection, without GLFW or an OpenGL device/UUID probe. */
+    void initializeNativeWin32(long hwnd, long hinstance, boolean requireValidation) {
+        if (instance != null) throw new IllegalStateException("Vulkan context already initialized");
+        if (interop) throw new IllegalStateException("A native window cannot use an interop context");
+        if (hwnd == 0 || hinstance == 0) throw new IllegalArgumentException("Native Win32 handles must be nonzero");
+        nativeHwnd = hwnd; nativeHinstance = hinstance;
+        initialize(0, VK.getInstanceVersionSupported(), requireValidation);
+    }
+
+    private void createWin32Surface(long hwnd, long hinstance, MemoryStack stack) {
+        var info = VkWin32SurfaceCreateInfoKHR.calloc(stack).sType$Default().hwnd(hwnd).hinstance(hinstance);
+        var handle = stack.mallocLong(1);
+        check(org.lwjgl.vulkan.KHRWin32Surface.vkCreateWin32SurfaceKHR(instance, info, null, handle), "vkCreateWin32SurfaceKHR");
+        surface = handle.get(0);
+    }
+
     void attachWin32(long hwnd, long hinstance) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            var info = VkWin32SurfaceCreateInfoKHR.calloc(stack).sType$Default().hwnd(hwnd)
-                    .hinstance(hinstance);
-            var handle = stack.mallocLong(1);
-            check(org.lwjgl.vulkan.KHRWin32Surface.vkCreateWin32SurfaceKHR(instance, info, null, handle), "vkCreateWin32SurfaceKHR(main window)");
-            surface = handle.get(0);
+            createWin32Surface(hwnd, hinstance, stack);
             var supported = stack.ints(0);
             check(vkGetPhysicalDeviceSurfaceSupportKHR(physical, queueFamily, surface, supported), "main window present support");
             if (supported.get(0) == 0) throw new IllegalStateException("Selected GPU cannot present to the Minecraft window");
@@ -93,7 +107,7 @@ final class VulkanContext implements AutoCloseable {
         if(instance!=null)throw new IllegalStateException("Vulkan context already initialized");
         if (loaderVersion < apiVersion)
             throw new IllegalStateException("Vulkan " + version(apiVersion) + " loader required; found " + version(loaderVersion));
-        boolean offscreen = window == NULL;
+        boolean offscreen = window == NULL && nativeHwnd == 0;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             boolean validation = !Boolean.getBoolean("vulkanforge.disableValidation") && hasLayer(stack, "VK_LAYER_KHRONOS_validation");
             if (requireValidation && !validation) throw new IllegalStateException("VK_LAYER_KHRONOS_validation is not installed (install Vulkan SDK)");
@@ -101,11 +115,17 @@ final class VulkanContext implements AutoCloseable {
             if (requireValidation && !debug) throw new IllegalStateException("VK_EXT_debug_utils is unavailable");
             System.out.println("VALIDATION=" + (debug ? "ENABLED" : "UNAVAILABLE"));
 
-            PointerBuffer glfwExtensions = interop ? stack.pointers(stack.UTF8(VK_KHR_SURFACE_EXTENSION_NAME), stack.UTF8(org.lwjgl.vulkan.KHRWin32Surface.VK_KHR_WIN32_SURFACE_EXTENSION_NAME))
+            PointerBuffer glfwExtensions = interop || nativeHwnd != 0 ? stack.pointers(stack.UTF8(VK_KHR_SURFACE_EXTENSION_NAME), stack.UTF8(org.lwjgl.vulkan.KHRWin32Surface.VK_KHR_WIN32_SURFACE_EXTENSION_NAME))
                     : offscreen ? null : glfwGetRequiredInstanceExtensions();
             if (!offscreen && glfwExtensions == null) throw new IllegalStateException("GLFW Vulkan surface extensions are unavailable");
-            PointerBuffer extensions = stack.mallocPointer((glfwExtensions == null ? 0 : glfwExtensions.remaining()) + (debug ? 1 : 0));
+            boolean nativeWindow = nativeHwnd != 0;
+            if (nativeWindow && (!hasInstanceExtension(stack, EXTSurfaceMaintenance1.VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME)
+                    || !hasInstanceExtension(stack, KHRGetSurfaceCapabilities2.VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)))
+                throw new IllegalStateException("Native window requires VK_EXT_surface_maintenance1 and VK_KHR_get_surface_capabilities2 for presentation resource retirement");
+            PointerBuffer extensions = stack.mallocPointer((glfwExtensions == null ? 0 : glfwExtensions.remaining()) + (debug ? 1 : 0) + (nativeWindow ? 2 : 0));
             if (glfwExtensions != null) extensions.put(glfwExtensions);
+            if (nativeWindow) extensions.put(stack.UTF8(EXTSurfaceMaintenance1.VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME))
+                    .put(stack.UTF8(KHRGetSurfaceCapabilities2.VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME));
             if (debug) extensions.put(stack.UTF8(VK_EXT_DEBUG_UTILS_EXTENSION_NAME));
             extensions.flip();
 
@@ -136,7 +156,9 @@ final class VulkanContext implements AutoCloseable {
                 check(vkCreateDebugUtilsMessengerEXT(instance, debugInfo, null, handle), "vkCreateDebugUtilsMessengerEXT");
                 messenger = handle.get(0);
             }
-            if (!offscreen) {
+            if (nativeHwnd != 0) {
+                createWin32Surface(nativeHwnd, nativeHinstance, stack);
+            } else if (!offscreen) {
                 check(glfwCreateWindowSurface(instance, window, null, handle), "glfwCreateWindowSurface");
                 surface = handle.get(0);
             }
@@ -173,14 +195,21 @@ final class VulkanContext implements AutoCloseable {
                 pipelineStatisticsEnabled=supported.pipelineStatisticsQuery();core.pipelineStatisticsQuery(pipelineStatisticsEnabled);
             }
             nvidia = NvidiaExtensions.select(physical, stack, requestedNvidia, name -> hasDeviceExtension(physical, stack, name));
+            long featureChain = nvidia.chain(stack, enabled11.address());
+            if (nativeWindow) {
+                featureChain = VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT.calloc(stack).sType$Default()
+                        .swapchainMaintenance1(true).pNext(featureChain).address();
+                nativePresentFences = true;
+            }
             VkDeviceCreateInfo deviceInfo = VkDeviceCreateInfo.calloc(stack).sType$Default().pQueueCreateInfos(queueInfo)
-                    .pNext(nvidia.chain(stack, enabled11.address())).pEnabledFeatures(core);
+                    .pNext(featureChain).pEnabledFeatures(core);
             java.util.List<String> deviceExtensions = new java.util.ArrayList<>();
             if (apiVersion < VK_API_VERSION_1_3) {
                 deviceExtensions.add(KHRDynamicRendering.VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
                 deviceExtensions.add(KHRSynchronization2.VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
             }
             if (!offscreen || interop) deviceExtensions.add(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+            if (nativeWindow) deviceExtensions.add(EXTSwapchainMaintenance1.VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);
             if (interop) {
                 deviceExtensions.add(org.lwjgl.vulkan.KHRExternalMemoryWin32.VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
                 deviceExtensions.add(org.lwjgl.vulkan.KHRExternalSemaphoreWin32.VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
@@ -251,6 +280,16 @@ final class VulkanContext implements AutoCloseable {
                 presentation = formats && count.get(0) > 0;
             }
             boolean suitable = api && family >= 0 && dynamicRendering && synchronization2 && (offscreen || (swapchain && presentation));
+            if (nativeHwnd != 0) {
+                boolean maintenance = hasDeviceExtension(candidate, stack, EXTSwapchainMaintenance1.VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);
+                if (maintenance) {
+                    var feature = VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT.calloc(stack).sType$Default();
+                    vkGetPhysicalDeviceFeatures2(candidate, VkPhysicalDeviceFeatures2.calloc(stack).sType$Default().pNext(feature.address()));
+                    maintenance = feature.swapchainMaintenance1();
+                }
+                suitable &= maintenance;
+                System.out.println("  nativeSwapchainPresentFences=" + maintenance);
+            }
             if (interop) {
                 var id = VkPhysicalDeviceIDProperties.calloc(stack).sType$Default();
                 var properties2 = VkPhysicalDeviceProperties2.calloc(stack).sType$Default().pNext(id.address());
@@ -273,7 +312,8 @@ final class VulkanContext implements AutoCloseable {
                 selected = props.deviceNameString();
             }
         }
-        if (physical == null) throw new IllegalStateException("No eligible Vulkan " + version(apiVersion) + " GPU. Requires dynamicRendering, synchronization2 and a graphics queue; window tests also require VK_KHR_swapchain and presentation. Update the GPU driver or use a supported GPU.");
+        if (physical == null) throw new IllegalStateException("No eligible Vulkan " + version(apiVersion) + " GPU. Requires dynamicRendering, synchronization2 and a graphics queue; window tests also require VK_KHR_swapchain and presentation."
+                + (nativeHwnd != 0 ? " Native windows additionally require VK_EXT_swapchain_maintenance1 with swapchainMaintenance1." : "") + " Update the GPU driver or use a supported GPU.");
         System.out.println("SELECTED_GPU=" + selected);
     }
 
