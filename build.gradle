@@ -71,7 +71,7 @@ minecraft {
             if (project.hasProperty('vulkan13Smoke')) property 'vulkanforge.startup', 'VULKAN:V1_3'
             property 'vulkanforge.directPresent', System.getProperty('vulkanforge.directPresent', 'true')
             property 'vulkanforge.legacyPresent', System.getProperty('vulkanforge.legacyPresent', 'false')
-            ['counterInterval', 'skipEmptyLayers', 'diffState'].each { option ->
+            ['counterInterval', 'skipEmptyLayers', 'diffState', 'profileGpu', 'profileInterval'].each { option ->
                 def key = 'vulkanforge.gl46.' + option
                 if (System.getProperty(key) != null) property key, System.getProperty(key)
             }
@@ -98,6 +98,7 @@ minecraft {
             }
             if (project.hasProperty('glTailFromConfig')) property 'vulkanforge.glTailFromConfig', 'true'
             if (project.hasProperty('gl46Smoke') || project.hasProperty('gl46Move')) {
+                if (project.hasProperty('isolatedGl46')) workingDirectory project.file('run-gl46')
                 // -Pgl46Smoke: feature/parity check in a flat world; -Pgl46Move: fast flight through a generated world.
                 property(project.hasProperty('gl46Move') ? 'vulkanforge.gl46Move' : 'vulkanforge.gl46Smoke', 'true')
                 property 'vulkanforge.startup', 'OPENGL:GL_4_6'
@@ -298,6 +299,8 @@ tasks.register('smokeTailDiagnosticsTransform', JavaExec) {
         systemProperty 'log4j.configurationFile', file('src/smoke/resources/offscreen-log4j2.xml').toURI().toString()
         systemProperty 'vulkanforge.gl46.counterInterval', interval
         systemProperty 'vulkanforge.gl46.diffState', 'true'
+        systemProperty 'vulkanforge.gl46.profileGpu', 'true'
+        systemProperty 'vulkanforge.gl46.profileInterval', '1'
         systemProperty 'bench.output', file('build/reports/terrain-opt-smoke/interval-' + interval).absolutePath
     }
 }
@@ -345,9 +348,15 @@ tasks.register('smokeOffscreenVersions') {
 }
 
 if (project.hasProperty('gl46Smoke') || project.hasProperty('gl46Move')) {
-    def gl46Report = project.hasProperty('gl46Move') ? 'run/logs/vulkanforge/gl46-move/report.txt' : 'run/logs/vulkanforge/gl46-smoke/report.txt'
+    def gl46Directory = project.hasProperty('isolatedGl46') ? 'run-gl46' : 'run'
+    def gl46Report = gl46Directory + '/logs/vulkanforge/' + (project.hasProperty('gl46Move') ? 'gl46-move/report.txt' : 'gl46-smoke/report.txt')
     tasks.matching { it.name == 'runClient' }.configureEach {
         doFirst {
+            if (project.hasProperty('isolatedGl46')) {
+                def options = file(gl46Directory + '/options.txt')
+                options.parentFile.mkdirs()
+                if (!options.exists()) options.text = 'renderDistance:4\nsimulationDistance:5\nguiScale:2\nmaxFps:260\nenableVsync:false\nonboardAccessibility:false\n'
+            }
             def report = file(gl46Report)
             report.parentFile.mkdirs()
             report.text = 'STATUS=RUNNING\n'

@@ -66,6 +66,8 @@ public final class GlOffscreenSmoke {
                 atlas(atlas, 255); light(light, 32); draw(terrain, atlas, light); pixel(32, 0, 0, "lightmap update without mesh rebuild");
                 light(light, 255);
                 terrain.buildHiZ(depth, SIZE, SIZE); draw(terrain, atlas, light); pixel(255, 0, 0, "Hi-Z compute pipeline");
+                resizePyramid(terrain);
+                terrain.buildHiZ(depth, SIZE, SIZE);
                 camera(terrain, 1, 10); draw(terrain, atlas, light); pixel(0, 0, 0, "camera change culls sections");
                 camera(terrain, 1, 0); terrain.send(new WorldProtocol.Remove(1, 1));
                 draw(terrain, atlas, light); pixel(0, 0, 255, "section removal reveals far geometry");
@@ -89,6 +91,22 @@ public final class GlOffscreenSmoke {
             results.forEach(System.out::println);
             if (debug != null) { glDebugMessageCallback(null, 0); debug.free(); }
             if (window != 0) glfwDestroyWindow(window); glfwTerminate();
+        }
+    }
+    private static void resizePyramid(Gl46Terrain terrain) throws Exception {
+        var handle=Gl46Terrain.class.getDeclaredField("pyramid");handle.setAccessible(true);
+        // 65 and 66 share the same ceil(size/2), but require different source-size parameters.
+        for(int size:new int[]{65,66}) {
+            int source=texture(size,GL_DEPTH_COMPONENT32F);
+            try {
+                float[] data=new float[size*size];Arrays.fill(data,.1f);data[data.length-1]=.9f;
+                glBindTexture(GL_TEXTURE_2D,source);glTexSubImage2D(GL_TEXTURE_2D,0,0,0,size,size,GL_DEPTH_COMPONENT,GL_FLOAT,data);
+                terrain.buildHiZ(source,size,size);
+                glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
+                int base=(size+1)/2;float[] pixels=new float[base*base];
+                glBindTexture(GL_TEXTURE_2D,handle.getInt(terrain));glGetTexImage(GL_TEXTURE_2D,0,GL_RED,GL_FLOAT,pixels);
+                require(Math.abs(pixels[pixels.length-1]-.9f)<.0001f,"Hi-Z retains odd/even border at size "+size);
+            } finally {glDeleteTextures(source);}
         }
     }
     private static void camera(Gl46Terrain terrain, long epoch, float x) {

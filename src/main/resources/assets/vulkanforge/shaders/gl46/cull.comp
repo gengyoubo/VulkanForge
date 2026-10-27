@@ -6,7 +6,7 @@ layout(std140, binding = 0) uniform Frame {
     vec4 cameraFraction;
     vec4 fogColor;
     vec4 fog;
-    uvec4 counts;  // x: section slots, y: command capacity per layer
+    uvec4 counts;  // x: section slots, y: command capacity per layer, z: collect diagnostic counters
 };
 // Previous frame's camera and depth pyramid. pyramid: x/y level-0 size, z levels, w 1 = occlusion test enabled this frame.
 layout(std140, binding = 1) uniform Occlusion {
@@ -70,7 +70,7 @@ void main() {
     Section section = sections[index];
     if (section.draw.y + section.draw.z + section.draw.w == 0u) return;
     if ((visible[index >> 5u] & (1u << (index & 31u))) == 0u) return;
-    atomicAdd(tested, 1u);
+    if (counts.z != 0u) atomicAdd(tested, 1u);
     vec3 base = vec3(section.origin.xyz - cameraBlock.xyz) - cameraFraction.xyz;
     uint outside = 63u;
     for (uint c = 0u; c < 8u; c++) {
@@ -80,8 +80,8 @@ void main() {
                  | (clip.z < -clip.w ? 16u : 0u) | (clip.z > clip.w ? 32u : 0u);
     }
     if (outside != 0u) return;
-    atomicAdd(frustumVisible, 1u);
-    if (pyramid.w != 0 && hiddenByHiZ(section)) { atomicAdd(occluded, 1u); return; }
+    if (counts.z != 0u) atomicAdd(frustumVisible, 1u);
+    if (pyramid.w != 0 && hiddenByHiZ(section)) { if (counts.z != 0u) atomicAdd(occluded, 1u); return; }
     uint first = section.draw.x;
     uint quads[3] = uint[3](section.draw.y, section.draw.z, section.draw.w);
     for (uint layer = 0u; layer < 3u; layer++) {

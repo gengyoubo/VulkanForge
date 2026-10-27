@@ -25,7 +25,7 @@ final class GlStateCache {
     private static Object[] textures;
     private static boolean trusted;
     private static String problem = "not initialised";
-    private static long verified;
+    private static long verified, reads, queries, invalidations;
 
     private GlStateCache() { }
 
@@ -46,6 +46,8 @@ final class GlStateCache {
     static boolean trusted() { return trusted; }
     static boolean verifying() { return VERIFY; }
     static long verified() { return verified; }
+    /** Lifetime counters: {cache reads, real GL snapshots, verified boundaries, invalidations}. */
+    static long[] stats() { return new long[]{reads, queries, verified, invalidations}; }
 
     /** Current state: cache reads when trusted (and, with -Dvulkanforge.gl46.verifyState, checked against GL), else glGet. */
     static Snapshot snapshot() {
@@ -70,6 +72,7 @@ final class GlStateCache {
     }
     static Snapshot actualSnapshot() { return query(); }
     private static void invalidate(String reason) {
+        invalidations++;
         trusted = false; problem = reason;
         Gl46Context.report("STATE_CACHE=INVALIDATED " + reason + " (using real GL snapshots)");
     }
@@ -119,6 +122,7 @@ final class GlStateCache {
     private static boolean enabled(Field state, Object owner) throws IllegalAccessException { return booleanEnabled.getBoolean(state.get(owner)); }
 
     private static Snapshot read() throws IllegalAccessException {
+        reads++;
         int program = lastProgram.getInt(null);
         return new Snapshot(Math.max(program, 0), enabled(blendMode, blend), blendSrcRgb.getInt(blend), blendDstRgb.getInt(blend),
                 blendSrcAlpha.getInt(blend), blendDstAlpha.getInt(blend), enabled(depthMode, depth), depthFunc.getInt(depth), depthMask.getBoolean(depth),
@@ -128,6 +132,7 @@ final class GlStateCache {
     }
 
     private static Snapshot query() {
+        queries++;
         boolean maskAll;
         try (var stack = org.lwjgl.system.MemoryStack.stackPush()) {
             var mask = stack.malloc(4); glGetBooleanv(GL_COLOR_WRITEMASK, mask);

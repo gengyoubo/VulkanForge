@@ -18,12 +18,20 @@ public final class GlTerrainOptimizationSmoke {
         Path output=Path.of(System.getProperty("bench.output","build/reports/terrain-opt-smoke"));Files.createDirectories(output);
         System.setProperty("vulkanforge.offscreenReportDir",output.toAbsolutePath().toString());
         RenderSystem.initRenderThread();
+        Gl46Timer timer = new Gl46Timer(); timer.sample(0); timer.sample(1000);
+        check(timer.frames()==2&&timer.percentiles()[0]==0&&timer.percentiles()[3]==1,"explicit zero-duration samples counted");
         if(!glfwInit()) throw new AssertionError("GLFW init failed");
         long window=0;
         try {
             glfwDefaultWindowHints();glfwWindowHint(GLFW_VISIBLE,GLFW_FALSE);glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR,4);glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR,6);glfwWindowHint(GLFW_OPENGL_PROFILE,GLFW_OPENGL_CORE_PROFILE);
             window=glfwCreateWindow(32,32,"Hidden optimization check",0,0);if(window==0)throw new AssertionError("Context failed");
             glfwMakeContextCurrent(window);GL.createCapabilities();Gl46Context.select(OpenGLVersion.GL_4_6);
+            if(Boolean.getBoolean("vulkanforge.gl46.profileGpu")&&Integer.getInteger("vulkanforge.gl46.profileInterval",60)==1) {
+                try(Gl46GpuTimer gpu=new Gl46GpuTimer()) {
+                    for(int i=0;i<8;i++){gpu.begin();gpu.end();}
+                    glFinish();check(gpu.toString().startsWith("samples=8 "),"all completed GPU timestamp pairs counted, including zero duration");
+                }
+            }
             int color=texture(64,GL_RGBA8,-1),depth=texture(64,GL_DEPTH_COMPONENT32F,0);
             int target=glGenFramebuffers();glBindFramebuffer(GL_FRAMEBUFFER,target);glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,color,0);glFramebufferTexture2D(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_TEXTURE_2D,depth,0);
             check(glCheckFramebufferStatus(GL_FRAMEBUFFER)==GL_FRAMEBUFFER_COMPLETE,"FBO complete");glViewport(0,0,64,64);
@@ -49,12 +57,42 @@ public final class GlTerrainOptimizationSmoke {
                 check(terrain.submissionStats()[4]-calls==1,"epoch reset clears residency and pending samples");
                 report.add("SUBMISSIONS="+Arrays.toString(terrain.submissionStats()));
             }
+            ringPressure();
             if(Gl46State.differential()) stateRestoration(atlas,light);
             bindlessProbe();
             glDeleteTextures(atlas);glDeleteTextures(light);glDeleteTextures(color);glDeleteTextures(depth);glDeleteFramebuffers(target);
             check(glGetError()==GL_NO_ERROR,"GL_ERRORS=0");report.add("STATUS=OK");
         } catch(Throwable error) {report.add("STATUS=FAILED "+error);throw error;}
         finally {Files.write(output.resolve("report.txt"),report);report.forEach(System.out::println);if(window!=0)glfwDestroyWindow(window);glfwTerminate();}
+    }
+    private static void ringPressure() {
+        final int copies = 2048, bytes = 32;
+        int destination = Gl46Buffers.immutable((long) copies * bytes, GL_DYNAMIC_STORAGE_BIT);
+        try (Gl46Buffers.Ring ring = new Gl46Buffers.Ring(bytes, 3)) {
+            for (int i=0;i<3;i++) {
+                int offset=ring.allocate(bytes,16);
+                check(offset==i*bytes,"deferred ring segment "+i);
+                ring.mapped.putInt(offset,0x12340000+i);
+            }
+            check(ring.allocate(4,4)==-1,"unsubmitted readers are never overwritten");
+            for(int i=0;i<3;i++)check(ring.mapped.getInt(i*bytes)==0x12340000+i,"deferred bytes retained "+i);
+            ring.submit();
+            for(int i=0;i<copies;i++) {
+                int offset=ring.allocate(bytes,16);
+                if(offset<0){ring.submit();offset=ring.allocate(bytes,16);}
+                if(offset<0)throw new AssertionError("Ring retry failed");
+                for(int word=0;word<bytes/4;word++)ring.mapped.putInt(offset+word*4,i*31+word);
+                GlCompat.glCopyNamedBufferSubData(ring.buffer,destination,offset,(long)i*bytes,bytes);
+                ring.submit();
+            }
+            glFinish();
+            int[] data=new int[copies*bytes/4];glGetNamedBufferSubData(destination,0,data);
+            for(int i=0;i<copies;i++)for(int word=0;word<bytes/4;word++)
+                if(data[i*bytes/4+word]!=i*31+word)throw new AssertionError("Ring corruption after wrap at "+i);
+            check(ring.allocate(bytes+1,1)==-1,"oversized request rejected");
+            long[] stats=ring.stats();check(stats[7]>0&&stats[8]>copies-3,"ring pressure exercised deferral and wraps");
+            report.add("RING_PRESSURE="+Arrays.toString(stats));
+        } finally {glDeleteBuffers(destination);}
     }
     private static void stateRestoration(int first,int second) {
         RenderSystem.disableCull();RenderSystem.enableCull();RenderSystem.disableDepthTest();RenderSystem.enableDepthTest();RenderSystem.depthFunc(GL_LESS);RenderSystem.depthFunc(GL_LEQUAL);
@@ -71,6 +109,10 @@ public final class GlTerrainOptimizationSmoke {
                 Gl46State.glUseProgram(program.id());Gl46State.glEnable(GL_CULL_FACE);Gl46State.glDisable(GL_DEPTH_TEST);Gl46State.glDepthMask(false);Gl46State.glDepthFunc(GL_ALWAYS);
                 Gl46State.glEnable(GL_BLEND);Gl46State.glBlendFuncSeparate(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA,GL_ONE,GL_ONE_MINUS_SRC_ALPHA);
                 Gl46State.glBindSampler(0,0);GlCompat.glBindTextureUnit(0,first);
+                long avoided=Gl46State.stats()[5];
+                Gl46State.glUseProgram(program.id());Gl46State.glEnable(GL_CULL_FACE);Gl46State.glDepthFunc(GL_ALWAYS);
+                Gl46State.glBindSampler(0,0);GlCompat.glBindTextureUnit(0,first);
+                check(Gl46State.stats()[5]>=avoided+5,"duplicate owned state calls skipped");
             }
             check(!GlStateCache.trusted(),"foreign raw GL invalidates vanilla cache trust");
             check(saved.equals(GlStateCache.actualSnapshot())&&glGetIntegeri(GL_SAMPLER_BINDING,0)==sampler,"real boundary including foreign sampler restored");

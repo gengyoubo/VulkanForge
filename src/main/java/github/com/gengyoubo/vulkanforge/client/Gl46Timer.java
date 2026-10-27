@@ -3,8 +3,8 @@ package github.com.gengyoubo.vulkanforge.client;
 import java.util.Arrays;
 
 /**
- * Per-frame CPU time of one GL 4.6 pass over the last {@link #WINDOW} frames. Driver queue stalls make means noisy, so reports
- * use percentiles plus the worst frame. Measures the CPU cost of issuing GL commands, not GPU time.
+ * Duration samples over the last {@link #WINDOW} frames. Callers supply either CPU elapsed time or explicit GPU timestamp
+ * differences; a timer never mixes clocks. Reports use window percentiles and the lifetime worst sample.
  */
 final class Gl46Timer {
     private static final int WINDOW = 4096;
@@ -16,12 +16,15 @@ final class Gl46Timer {
     /** Closes the current frame's sample (skipped when the pass did nothing). */
     void frame() {
         if (pending == 0) return;
+        commit();
+    }
+    private void commit() {
         samples[(int) (frames++ % WINDOW)] = pending;
         worst = Math.max(worst, pending);
         pending = 0;
     }
     /** One whole sample, e.g. a frame interval. */
-    void sample(long nanos) { add(nanos); frame(); }
+    void sample(long nanos) { add(nanos); commit(); }
     void reset() { frames = pending = worst = 0; }
     /** {p50, p95, p99, max} in microseconds (max over the timer's lifetime, percentiles over the window). */
     double[] percentiles() {

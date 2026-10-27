@@ -67,6 +67,14 @@ final class Gl46Entities implements AutoCloseable {
     private final Map<String, Long> fallbacks = new TreeMap<>();
     private final Matrix3f rotation = new Matrix3f();
     private final float[] values = new float[64];
+    private final float[] rotationColumns = new float[9], lastValues = new float[64];
+    private java.nio.FloatBuffer recordFloats;
+    private int lastRecord = -1;
+    private long recordUploads, reusedRecords, vertexBytesUploaded, indexBytesUploaded;
+    private final Map<Key, Integer> groupIndices = new LinkedHashMap<>();
+    private final List<List<Draw>> groups = new ArrayList<>();
+    private final List<Draw> orderedDraws = new ArrayList<>(), blendedDraws = new ArrayList<>();
+    private final Gl46Timer orderCpu = new Gl46Timer();
     private boolean open;
     private long captured, flushes, multiDraws, splits, rejected, captureNanos, flushNanos;
 
@@ -76,6 +84,7 @@ final class Gl46Entities implements AutoCloseable {
             vertices = new Gl46Buffers.Ring(STRIDE << 18, 4); // segments stay multiples of the vertex stride (baseVertex)
             indices = new Gl46Buffers.Ring(4 << 20, 4);
             records = new Gl46Buffers.Ring(RECORD << 12, 4);
+            recordFloats = records.mapped.asFloatBuffer();
             commands = new Gl46Buffers.Ring(COMMAND << 12, 4);
             listVao = vertexArray(); quadVao = vertexArray();
             quadIndices = quadIndexBuffer();
@@ -135,13 +144,20 @@ final class Gl46Entities implements AutoCloseable {
     static Integer variant(ShaderInstance shader) { return VARIANTS.get(shader.getName()); }
     /** A record for {@code shader} with the current RenderSystem state; byte offset in the records ring, or -1. */
     int record(ShaderInstance shader, int variant) {
+        fillRecord(shader, variant);
+        // Only within the pending batch: a record in an older submitted segment must not acquire new readers.
+        if (lastRecord >= 0 && Arrays.equals(values, lastValues)) { reusedRecords++; return lastRecord; }
         int offset = allocate(records, RECORD, RECORD);
-        if (offset >= 0) writeRecord(shader, offset, variant);
+        if (offset >= 0) {
+            recordFloats.put(offset / 4, values);
+            System.arraycopy(values, 0, lastValues, 0, values.length);
+            lastRecord = offset; recordUploads++;
+        }
         return offset;
     }
 
     /** After this frame's GL 4.6 opaque terrain: entities and block entities come next. */
-    void begin() { pending.clear(); open = !Minecraft.useShaderTransparency(); }
+    void begin() { pending.clear(); lastRecord = -1; open = !Minecraft.useShaderTransparency(); }
     /** AFTER_BLOCK_ENTITIES. */
     void end() { flush(); open = false; captureTimer.frame(); flushTimer.frame(); }
     final Gl46Timer captureTimer = new Gl46Timer(), flushTimer = new Gl46Timer();
@@ -166,11 +182,11 @@ final class Gl46Entities implements AutoCloseable {
         boolean quads = state.mode() == VertexFormat.Mode.QUADS && state.sequentialIndex() && state.vertexCount() / 4 <= MAX_QUADS;
         int indexCount = state.mode() == VertexFormat.Mode.QUADS && state.sequentialIndex() ? state.vertexCount() / 4 * 6
                 : state.sequentialIndex() ? state.vertexCount() : state.indexCount();
-        int vertexOffset = allocate(vertices, vertexBytes, STRIDE), indexOffset = quads ? 0 : allocate(indices, indexCount * 4, 4), record = allocate(records, RECORD, RECORD);
+        int vertexOffset = allocate(vertices, vertexBytes, STRIDE), indexOffset = quads ? 0 : allocate(indices, indexCount * 4, 4), record = record(shader, variant);
         if (vertexOffset < 0 || indexOffset < 0 || record < 0) return reject(shader, "ring");
         MemoryUtil.memCopy(MemoryUtil.memAddress(rendered.vertexBuffer()), MemoryUtil.memAddress(vertices.mapped) + vertexOffset, vertexBytes);
         if (!quads) writeIndices(rendered, state, indexOffset, indexCount);
-        writeRecord(shader, record, variant);
+        vertexBytesUploaded += vertexBytes; if (!quads) indexBytesUploaded += indexCount * 4L;
         pending.add(new Draw(key, quads, record, indexCount, indexOffset / 4, vertexOffset / STRIDE));
         rendered.release();
         captured++;
@@ -229,13 +245,12 @@ final class Gl46Entities implements AutoCloseable {
     }
 
     /** Same uniform values vanilla's ShaderInstance would upload for this draw. */
-    private void writeRecord(ShaderInstance shader, int offset, int variant) {
+    private void fillRecord(ShaderInstance shader, int variant) {
         Arrays.fill(values, 0);
         RenderSystem.getProjectionMatrix().get(values, 0);
         RenderSystem.getModelViewMatrix().get(values, 16);
-        float[] columns = new float[9];
-        rotation.set(RenderSystem.getInverseViewRotationMatrix()).get(columns);
-        for (int column = 0; column < 3; column++) System.arraycopy(columns, column * 3, values, 32 + column * 4, 3);
+        rotation.set(RenderSystem.getInverseViewRotationMatrix()).get(rotationColumns);
+        for (int column = 0; column < 3; column++) System.arraycopy(rotationColumns, column * 3, values, 32 + column * 4, 3);
         System.arraycopy(RenderSystem.getShaderColor(), 0, values, 44, 4);
         RenderSystem.setupShaderLights(shader);
         if (shader.LIGHT0_DIRECTION != null) shader.LIGHT0_DIRECTION.getFloatBuffer().get(0, values, 48, 3);
@@ -243,8 +258,6 @@ final class Gl46Entities implements AutoCloseable {
         System.arraycopy(RenderSystem.getShaderFogColor(), 0, values, 56, 4);
         values[60] = RenderSystem.getShaderFogStart(); values[61] = RenderSystem.getShaderFogEnd();
         values[62] = RenderSystem.getShaderFogShape().getIndex(); values[63] = variant;
-        ByteBuffer out = records.mapped;
-        for (int i = 0; i < values.length; i++) out.putFloat(offset + i * 4, values[i]);
     }
 
     /** Null when GL 4.6 cannot reproduce the state exactly (offset, scissor, logic op, partial color mask, odd blend/cull). */
@@ -280,8 +293,16 @@ final class Gl46Entities implements AutoCloseable {
     private void submit() {
         List<Draw> ordered = order();
         int instanced = blockEntities == null ? 0 : blockEntities.pendingCommands(), total = ordered.size() + instanced;
-        int offset = commands.allocate(total * COMMAND, 4);
-        if (offset < 0) { commands.submit(); offset = commands.allocate(total * COMMAND, 4); }
+        int commandBytes = Math.multiplyExact(total, COMMAND);
+        if (commandBytes > commands.segmentSize()) {
+            int size = commands.segmentSize();
+            while (size < commandBytes && size < MAX_SEGMENT) size *= 2;
+            if (size < commandBytes) throw new IllegalStateException("Entity command batch exceeds ring budget");
+            Gl46Buffers.Ring replacement = new Gl46Buffers.Ring(size, 4);
+            retired.add(commands.stats()); commands.close(); commands = replacement; grows++;
+        }
+        int offset = commands.allocate(commandBytes, 4);
+        if (offset < 0) { commands.submit(); offset = commands.allocate(commandBytes, 4); }
         if (offset < 0) throw new IllegalStateException("Entity command ring too small for " + total + " draws");
         ByteBuffer out = commands.mapped;
         for (int i = 0; i < ordered.size(); i++) {
@@ -321,6 +342,7 @@ final class Gl46Entities implements AutoCloseable {
         vertices.submit(); indices.submit(); records.submit(); commands.submit();
         phases[3] += System.nanoTime() - t4;
         pending.clear();
+        lastRecord = -1;
         flushes++;
     }
 
@@ -330,20 +352,30 @@ final class Gl46Entities implements AutoCloseable {
      * ...); this turns those alternations into one run per key. Blended draws now see all opaque depth, the usual order.
      */
     private List<Draw> order() {
-        Map<Key, List<Draw>> opaque = new LinkedHashMap<>();
-        List<Draw> blended = new ArrayList<>(), result = new ArrayList<>(pending.size());
+        long start = System.nanoTime();
+        groupIndices.clear(); orderedDraws.clear(); blendedDraws.clear();
+        for (List<Draw> group : groups) group.clear();
         for (Draw draw : pending) {
-            if (draw.key().blend()) blended.add(draw);
-            else opaque.computeIfAbsent(draw.key(), key -> new ArrayList<>()).add(draw);
+            if (draw.key().blend()) blendedDraws.add(draw);
+            else {
+                Integer index = groupIndices.get(draw.key());
+                if (index == null) {
+                    index = groupIndices.size(); groupIndices.put(draw.key(), index);
+                    if (index == groups.size()) groups.add(new ArrayList<>());
+                }
+                groups.get(index).add(draw);
+            }
         }
-        for (List<Draw> group : opaque.values()) {
+        for (int i = 0; i < groupIndices.size(); i++) {
+            List<Draw> group = groups.get(i);
             // Within a key, sequential-quad draws and index-list draws form at most two runs.
-            for (Draw draw : group) if (draw.quads()) result.add(draw);
-            for (Draw draw : group) if (!draw.quads()) result.add(draw);
+            for (Draw draw : group) if (draw.quads()) orderedDraws.add(draw);
+            for (Draw draw : group) if (!draw.quads()) orderedDraws.add(draw);
         }
-        result.addAll(blended);
-        reordered += pending.size() - blended.size();
-        return result;
+        orderedDraws.addAll(blendedDraws);
+        reordered += pending.size() - blendedDraws.size();
+        orderCpu.sample(System.nanoTime() - start);
+        return orderedDraws;
     }
     private long reordered;
     /** Flush breakdown in ns: {state snapshot, draws, state restore, ring fences}. */
@@ -367,6 +399,9 @@ final class Gl46Entities implements AutoCloseable {
     @Override public void close() {
         if (current == this) current = null;
         open = false; pending.clear();
+        groupIndices.clear(); groups.clear(); orderedDraws.clear(); blendedDraws.clear(); lastRecord = -1;
+        Gl46Context.report("ENTITY_UPLOADS records=" + recordUploads + " reusedRecords=" + reusedRecords + " vertexBytes=" + vertexBytesUploaded
+                + " indexBytes=" + indexBytesUploaded + " orderCpu{" + orderCpu + "}");
         if (vertices != null) Gl46Context.report("ENTITY_CLOSE captured=" + captured + " flushes=" + flushes + " multiDraws=" + multiDraws + " reordered=" + reordered
                 + " splits=" + splits + " rejected=" + rejected + " captureNanos=" + captureNanos + " flushNanos=" + flushNanos + " fallbacks=" + fallbacks
                 + " rings{fences,waits,waitNanos,oversized} vertices=" + Arrays.toString(vertices.stats()) + " indices=" + Arrays.toString(indices.stats())

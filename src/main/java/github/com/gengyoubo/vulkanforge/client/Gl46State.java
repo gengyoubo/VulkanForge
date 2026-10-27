@@ -15,7 +15,7 @@ import static org.lwjgl.opengl.GL46C.*;
 final class Gl46State implements AutoCloseable {
     private static final boolean DIFF = Boolean.getBoolean("vulkanforge.gl46.diffState");
     private static Gl46State active;
-    private static long fullScopes, diffScopes, restoreCalls, avoidedCalls;
+    private static long fullScopes, diffScopes, restoreCalls, avoidedCalls, stateCalls, avoidedStateCalls;
     private final Gl46State previous = active;
     private final GlStateCache.Snapshot saved;
     private final int[] textures = new int[3], samplers = new int[3], savedSamplers = new int[3];
@@ -24,19 +24,22 @@ final class Gl46State implements AutoCloseable {
 
     Gl46State() {
         saved = DIFF ? previous == null ? GlStateCache.boundarySnapshot() : GlStateCache.actualSnapshot() : GlStateCache.snapshot();
+        program = saved.program(); vao = -1;
+        textures[0] = saved.texture0(); textures[1] = saved.texture1(); textures[2] = saved.texture2();
+        java.util.Arrays.fill(samplers, -1);
+        depth=saved.depthTest();cull=saved.cull();blend=saved.blend();depthMask=saved.depthMask();depthFunc=saved.depthFunc();
+        srcRGB=saved.srcRGB();dstRGB=saved.dstRGB();srcAlpha=saved.srcAlpha();dstAlpha=saved.dstAlpha();
         if (DIFF) {
-            program = saved.program(); vao = glGetInteger(GL_VERTEX_ARRAY_BINDING);
-            textures[0] = saved.texture0(); textures[1] = saved.texture1(); textures[2] = saved.texture2();
+            vao = glGetInteger(GL_VERTEX_ARRAY_BINDING);
             for (int unit=0;unit<3;unit++) samplers[unit] = savedSamplers[unit] = glGetIntegeri(GL_SAMPLER_BINDING, unit);
-            depth=saved.depthTest();cull=saved.cull();blend=saved.blend();depthMask=saved.depthMask();depthFunc=saved.depthFunc();
-            srcRGB=saved.srcRGB();dstRGB=saved.dstRGB();srcAlpha=saved.srcAlpha();dstAlpha=saved.dstAlpha();
             // All mutations inside these owned passes use the wrappers below. No shadow state survives the boundary.
-            if (previous != null) previous.unknown = true;
-            active = this; diffScopes++;
+            diffScopes++;
         } else fullScopes++;
+        if (previous != null) previous.unknown = true;
+        active = this;
     }
     static boolean differential() { return DIFF; }
-    static long[] stats() { return new long[]{fullScopes,diffScopes,restoreCalls,avoidedCalls}; }
+    static long[] stats() { return new long[]{fullScopes,diffScopes,restoreCalls,avoidedCalls,stateCalls,avoidedStateCalls}; }
     /** Future callers that invoke foreign/raw callbacks inside a scope must request conservative full restoration. */
     static void invalidateCurrent() { if(active!=null) active.unknown=true; }
     private boolean needs(boolean different) { if(!DIFF||unknown||different) {restoreCalls++;return true;} avoidedCalls++;return false; }
@@ -63,19 +66,33 @@ final class Gl46State implements AutoCloseable {
 
     static void toggle(int capability, boolean enabled) { if (enabled) glEnable(capability); else glDisable(capability); }
     private static void rawToggle(int capability, boolean enabled) {if(enabled)org.lwjgl.opengl.GL11C.glEnable(capability);else org.lwjgl.opengl.GL11C.glDisable(capability);}
-    static void glUseProgram(int value) {org.lwjgl.opengl.GL20C.glUseProgram(value);if(active!=null)active.program=value;}
-    static void glBindVertexArray(int value) {org.lwjgl.opengl.GL30C.glBindVertexArray(value);if(active!=null)active.vao=value;}
-    static void glBindSampler(int unit,int value) {org.lwjgl.opengl.GL33C.glBindSampler(unit,value);if(active!=null&&unit<3)active.samplers[unit]=value;}
-    static void textureBound(int unit,int value) {if(active!=null&&unit>=0&&unit<3)active.textures[unit]=value;}
-    static void glEnable(int capability) {org.lwjgl.opengl.GL11C.glEnable(capability);enabled(capability,true);}
-    static void glDisable(int capability) {org.lwjgl.opengl.GL11C.glDisable(capability);enabled(capability,false);}
+    private static boolean change(boolean different) {
+        if (active == null) return true;
+        if (active.unknown || different) { stateCalls++; return true; }
+        avoidedStateCalls++; return false;
+    }
+    static void glUseProgram(int value) {if(!change(active==null||active.program!=value))return;org.lwjgl.opengl.GL20C.glUseProgram(value);if(active!=null)active.program=value;}
+    static void glBindVertexArray(int value) {if(!change(active==null||active.vao!=value))return;org.lwjgl.opengl.GL30C.glBindVertexArray(value);if(active!=null)active.vao=value;}
+    static void glBindSampler(int unit,int value) {if(!change(active==null||unit<0||unit>=3||active.samplers[unit]!=value))return;org.lwjgl.opengl.GL33C.glBindSampler(unit,value);if(active!=null&&unit>=0&&unit<3)active.samplers[unit]=value;}
+    static boolean textureBindingNeeded(int unit,int value) {
+        if(!change(active==null||unit<0||unit>=3||active.textures[unit]!=value))return false;
+        if(active!=null&&unit>=0&&unit<3)active.textures[unit]=value;
+        return true;
+    }
+    static void glEnable(int capability) {if(!enableNeeded(capability,true))return;org.lwjgl.opengl.GL11C.glEnable(capability);enabled(capability,true);}
+    static void glDisable(int capability) {if(!enableNeeded(capability,false))return;org.lwjgl.opengl.GL11C.glDisable(capability);enabled(capability,false);}
+    private static boolean enableNeeded(int capability,boolean value) {
+        if(active==null)return true;
+        return change(switch(capability){case GL_DEPTH_TEST->active.depth!=value;case GL_CULL_FACE->active.cull!=value;case GL_BLEND->active.blend!=value;default->true;});
+    }
     private static void enabled(int capability,boolean value) {
         if(active==null)return;
         switch(capability) {case GL_DEPTH_TEST->active.depth=value;case GL_CULL_FACE->active.cull=value;case GL_BLEND->active.blend=value;default->{}}
     }
-    static void glDepthMask(boolean value) {org.lwjgl.opengl.GL11C.glDepthMask(value);if(active!=null)active.depthMask=value;}
-    static void glDepthFunc(int value) {org.lwjgl.opengl.GL11C.glDepthFunc(value);if(active!=null)active.depthFunc=value;}
+    static void glDepthMask(boolean value) {if(!change(active==null||active.depthMask!=value))return;org.lwjgl.opengl.GL11C.glDepthMask(value);if(active!=null)active.depthMask=value;}
+    static void glDepthFunc(int value) {if(!change(active==null||active.depthFunc!=value))return;org.lwjgl.opengl.GL11C.glDepthFunc(value);if(active!=null)active.depthFunc=value;}
     static void glBlendFuncSeparate(int srcRGB,int dstRGB,int srcAlpha,int dstAlpha) {
+        if(!change(active==null||active.srcRGB!=srcRGB||active.dstRGB!=dstRGB||active.srcAlpha!=srcAlpha||active.dstAlpha!=dstAlpha))return;
         org.lwjgl.opengl.GL14C.glBlendFuncSeparate(srcRGB,dstRGB,srcAlpha,dstAlpha);
         if(active!=null) {active.srcRGB=srcRGB;active.dstRGB=dstRGB;active.srcAlpha=srcAlpha;active.dstAlpha=dstAlpha;}
     }

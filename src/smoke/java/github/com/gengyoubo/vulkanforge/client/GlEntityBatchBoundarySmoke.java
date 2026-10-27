@@ -43,10 +43,15 @@ public final class GlEntityBatchBoundarySmoke {
                 glClearBufferfv(GL_COLOR,0,new float[]{0,0,1,1}); // Foreign vanilla work after the fallback boundary.
                 pass.end();pixel(0,0,255);
                 if(pass.stats()[1]!=1)throw new AssertionError("End must not replay a consumed instance");
+                glClearBufferfv(GL_COLOR,0,new float[]{0,0,0,1});
+                // More deferred instances than the original ring's ENTIRE capacity. Only the first part covers the pixel.
+                for(int i=0;i<20;i++)seedCachedInstance(pass,red,white,1024,i==0?0:10+i);
+                pass.end();pixel(255,0,0);
+                if(pass.blockEntityStats()[2]!=20481)throw new AssertionError("Instance pressure dropped draws");
             }
             if(glGetError()!=GL_NO_ERROR)throw new AssertionError("GL error");
             glDeleteFramebuffers(target);glDeleteTextures(color);glDeleteTextures(red);glDeleteTextures(white);
-            String result="PASS cached-only queue flushed before unsupported vanilla draw\nPASS red cached instance rendered before blue fallback; no stale instance at end\nPASS GL_ERRORS=0 VISIBLE=false SWAP_CALLS=0\nSTATUS=OK\n";
+            String result="PASS cached-only queue flushed before unsupported vanilla draw\nPASS red cached instance rendered before blue fallback; no stale instance at end\nPASS 20480 deferred instances exceed the old ring capacity without corruption\nPASS GL_ERRORS=0 VISIBLE=false SWAP_CALLS=0\nSTATUS=OK\n";
             Files.writeString(output.resolve("report.txt"),result);System.out.print(result);
         } finally {glfwDestroyWindow(window);glfwTerminate();}
     }
@@ -54,6 +59,10 @@ public final class GlEntityBatchBoundarySmoke {
     /** Seed the private cache with one real resident mesh, avoiding a full Minecraft world/renderer bootstrap. */
     @SuppressWarnings("unchecked")
     private static void seedCachedInstance(Gl46Entities owner,int red,int white) throws Exception {
+        seedCachedInstance(owner,red,white,1,0);
+    }
+    @SuppressWarnings("unchecked")
+    private static void seedCachedInstance(Gl46Entities owner,int red,int white,int count,float x) throws Exception {
         Gl46BlockEntities cache=(Gl46BlockEntities)field(owner,"blockEntities").get(owner);
         Gl46Buffers.Arena arena=(Gl46Buffers.Arena)field(cache,"arena").get(cache);
         Gl46Buffers.Uploader uploads=(Gl46Buffers.Uploader)field(cache,"uploads").get(cache);
@@ -72,11 +81,13 @@ public final class GlEntityBatchBoundarySmoke {
         Class<?> partType=Class.forName(Gl46BlockEntities.class.getName()+"$Part");
         var constructor=partType.getDeclaredConstructors()[0];constructor.setAccessible(true);
         Object part=constructor.newInstance(key,null,0,first,1);
-        field(part,"record").setInt(part,record);field(part,"count").setInt(part,1);
-        float[] data=(float[])field(part,"data").get(part);
-        for(int i=0;i<4;i++)data[i*5]=1;
-        for(int i=0;i<3;i++)data[16+i*5]=1;
-        data[30]=Float.intBitsToFloat(record/256);
+        field(part,"record").setInt(part,record);field(part,"count").setInt(part,count);
+        float[] data=new float[count*32];field(part,"data").set(part,data);
+        for(int at=0;at<data.length;at+=32) {
+            for(int i=0;i<4;i++)data[at+i*5]=1;
+            for(int i=0;i<3;i++)data[at+16+i*5]=1;
+            data[at+12]=x;data[at+30]=Float.intBitsToFloat(record/256);
+        }
         ((List<Object>)field(cache,"active").get(cache)).add(part);
     }
     private static java.lang.reflect.Field field(Object target,String name) throws Exception {

@@ -26,8 +26,8 @@ final class Gl46Buffers {
     }
 
     /**
-     * Persistent, coherent write-only mapping split into segments that are reused round-robin. A segment's data can only be
-     * overwritten after the cursor has wrapped all the way around, so it needs one fence, placed by the first {@link #submit()}
+     * Persistent, coherent write-only mapping split into segments, preferring completed segments before waiting. A segment's
+     * data is protected by one fence, placed by the first {@link #submit()}
      * after the cursor left it (by then every GL command reading it has been issued; readers may be deferred, e.g. a whole
      * entity window). glFenceSync costs tens of microseconds on some drivers, and with multi-MB segments this is one fence
      * per few hundred frames instead of one per draw pass.
@@ -40,8 +40,11 @@ final class Gl46Buffers {
         /** Left by the cursor but not yet fenced. */
         private final boolean[] closed;
         private int segment, cursor;
-        private long waits, waitNanos, fenceCount, oversized;
+        private long waits, waitNanos, fenceCount, oversized, maxWaitNanos, polls, busySegments, deferred, wraps, allocatedBytes;
+        private final Gl46Timer blocked = new Gl46Timer();
         Ring(int segmentSize, int segments) {
+            if (segmentSize <= 0 || segments < 2 || (long) segmentSize * segments > Integer.MAX_VALUE)
+                throw new IllegalArgumentException("Invalid ring dimensions");
             this.segmentSize = segmentSize; fences = new long[segments]; closed = new boolean[segments];
             int flags = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
             buffer = immutable((long) segmentSize * segments, flags);
@@ -55,23 +58,43 @@ final class Gl46Buffers {
          * issues its pending readers, submits and retries).
          */
         int allocate(int bytes, int alignment) {
+            if (bytes < 0 || alignment <= 0) throw new IllegalArgumentException("Invalid ring allocation");
             if (bytes > segmentSize) { oversized++; return -1; }
             int offset = (cursor + alignment - 1) / alignment * alignment;
             if (offset + bytes > (segment + 1) * segmentSize) {
-                int next = (segment + 1) % fences.length;
-                if (closed[next]) return -1;
+                int next = -1, busy = -1;
+                // Prefer a completed segment before blocking; never touch deferred readers, including the current segment.
+                for (int step = 1; step < fences.length; step++) {
+                    int candidate = (segment + step) % fences.length;
+                    if (closed[candidate]) continue;
+                    long fence = fences[candidate];
+                    if (fence == 0) { next = candidate; break; }
+                    polls++;
+                    int status = glClientWaitSync(fence, 0, 0);
+                    if (status == GL_WAIT_FAILED) throw new IllegalStateException("Ring fence poll failed");
+                    if (status == GL_ALREADY_SIGNALED || status == GL_CONDITION_SATISFIED) { next = candidate; break; }
+                    busySegments++; if (busy < 0) busy = candidate;
+                }
+                boolean ready = next >= 0;
+                if (next < 0) next = busy;
+                if (next < 0) { deferred++; return -1; }
                 closed[segment] = true;
-                segment = next;
+                segment = next; wraps++;
                 if (fences[segment] != 0) {
                     long start = System.nanoTime(), fence = fences[segment];
+                    if (!ready && await(fence)) {
+                        long spent = System.nanoTime() - start;
+                        waits++; waitNanos += spent; maxWaitNanos = Math.max(maxWaitNanos, spent);
+                        blocked.sample(spent);
+                    }
                     fences[segment] = 0;
-                    if (await(fence)) { waits++; waitNanos += System.nanoTime() - start; }
                     release(fence);
                 }
                 offset = segment * segmentSize;
             }
             cursor = offset + bytes;
             GlCompat.written(buffer, offset, bytes);
+            allocatedBytes += bytes;
             return offset;
         }
         /** After the GL commands reading this ring's allocations so far have been issued; a no-op unless a segment was left. */
@@ -83,8 +106,12 @@ final class Gl46Buffers {
             fenceCount++;
             for (int i = 0; i < closed.length; i++) if (closed[i]) { long old = fences[i]; fences[i] = fence; closed[i] = false; release(old); }
         }
-        /** {fences, CPU waits, waitNanos, oversized requests}. */
-        long[] stats() { return new long[]{fenceCount, waits, waitNanos, oversized}; }
+        /** First four entries remain compatible. Wait percentiles include blocking events only, never zero-wait allocations. */
+        long[] stats() {
+            double[] p = blocked.percentiles();
+            return new long[]{fenceCount, waits, waitNanos, oversized, maxWaitNanos, polls, busySegments, deferred, wraps, allocatedBytes,
+                    (long)(p[0]*1000), (long)(p[1]*1000), (long)(p[2]*1000)};
+        }
         long waits() { return waits; }
         @Override public void close() {
             for (int i = 0; i < fences.length; i++) { long fence = fences[i]; fences[i] = 0; release(fence); }
@@ -99,6 +126,7 @@ final class Gl46Buffers {
         /** True when the CPU actually had to block. */
         private static boolean await(long fence) {
             int status = glClientWaitSync(fence, 0, 0);
+            if (status == GL_WAIT_FAILED) throw new IllegalStateException("glClientWaitSync failed");
             if (status == GL_ALREADY_SIGNALED || status == GL_CONDITION_SATISFIED) return false;
             do {
                 status = glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1_000_000_000L);

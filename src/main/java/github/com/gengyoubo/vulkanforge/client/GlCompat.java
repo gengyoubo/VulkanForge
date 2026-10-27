@@ -163,7 +163,7 @@ final class GlCompat {
         try { glTexStorage2D(GL_TEXTURE_2D, levels, format, width, height); } finally { glBindTexture(GL_TEXTURE_2D, old); }
     }
     static void glBindTextureUnit(int unit, int texture) {
-        Gl46State.textureBound(unit, texture);
+        if (!Gl46State.textureBindingNeeded(unit, texture)) return;
         if (dsa()) { org.lwjgl.opengl.GL45C.glBindTextureUnit(unit, texture); return; }
         int active = glGetInteger(GL_ACTIVE_TEXTURE); glActiveTexture(GL_TEXTURE0 + unit);
         glBindTexture(GL_TEXTURE_2D, texture); glActiveTexture(active);

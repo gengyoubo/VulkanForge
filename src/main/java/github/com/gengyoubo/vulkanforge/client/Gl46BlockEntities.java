@@ -73,6 +73,8 @@ final class Gl46BlockEntities implements AutoCloseable {
     private Gl46Buffers.Arena arena;
     private Gl46Buffers.Uploader uploads;
     private Gl46Buffers.Ring instances;
+    private java.nio.FloatBuffer instanceFloats;
+    private long uploadedBytes, ringGrows;
     private int vao, vaoBuffer;
     private long instancesDrawn, instancedDraws, animated, uncacheable, recordings, cachedNanos, cachedCalls;
 
@@ -83,6 +85,7 @@ final class Gl46BlockEntities implements AutoCloseable {
             arena = new Gl46Buffers.Arena("block entity mesh", STRIDE, 1 << 14, 32L << 20);
             uploads = new Gl46Buffers.Uploader(1 << 20, 2);
             instances = new Gl46Buffers.Ring(INSTANCE << 12, 4);
+            instanceFloats = instances.mapped.asFloatBuffer();
             vao = glCreateVertexArrays();
             glVertexArrayAttribFormat(vao, 0, 3, GL_FLOAT, false, 0);
             glVertexArrayAttribFormat(vao, 1, 4, GL_UNSIGNED_BYTE, true, 12);
@@ -195,18 +198,28 @@ final class Gl46BlockEntities implements AutoCloseable {
     void draw(Gl46Buffers.Ring commands, int offset) {
         if (active.isEmpty()) return;
         active.sort(Comparator.comparingInt(part -> part.key.hashCode()));
+        int totalBytes = 0;
+        for (Part part : active) totalBytes = Math.addExact(totalBytes, Math.multiplyExact(part.count, INSTANCE));
+        // Reserve the WHOLE batch before writing any deferred draw. Per-part wrapping could overwrite instances not drawn yet.
+        if (totalBytes > instances.segmentSize()) {
+            int size = instances.segmentSize();
+            while (size < totalBytes && size < (64 << 20)) size *= 2;
+            if (size < totalBytes) throw new IllegalStateException("Block entity instance batch exceeds ring budget");
+            Gl46Buffers.Ring replacement = new Gl46Buffers.Ring(size, 4);
+            instances.close(); instances = replacement; instanceFloats = instances.mapped.asFloatBuffer(); ringGrows++;
+        }
+        int base = instances.allocate(totalBytes, INSTANCE);
+        if (base < 0) { instances.submit(); base = instances.allocate(totalBytes, INSTANCE); }
+        if (base < 0) throw new IllegalStateException("Block entity instance batch cannot be reserved");
         ByteBuffer out = commands.mapped;
         for (int i = 0; i < active.size(); i++) {
             Part part = active.get(i);
             int bytes = part.count * INSTANCE;
-            int base = instances.allocate(bytes, INSTANCE);
-            if (base < 0) { instances.submit(); base = instances.allocate(bytes, INSTANCE); }
-            if (base < 0) throw new IllegalStateException("Block entity instance ring too small for " + part.count + " instances");
-            long address = MemoryUtil.memAddress(instances.mapped) + base;
-            for (int f = 0; f < part.count * INSTANCE / 4; f++) MemoryUtil.memPutFloat(address + f * 4L, part.data[f]);
+            instanceFloats.put(base / 4, part.data, 0, bytes / 4);
             int at = offset + i * COMMAND;
             out.putInt(at, part.quads * 6).putInt(at + 4, part.count).putInt(at + 8, 0).putInt(at + 12, part.firstVertex).putInt(at + 16, base / INSTANCE);
             instancesDrawn += part.count;
+            base += bytes; uploadedBytes += bytes;
         }
         if (vaoBuffer != arena.buffer()) { vaoBuffer = arena.buffer(); glVertexArrayVertexBuffer(vao, 0, vaoBuffer, 0, STRIDE); }
         glUseProgram(program.id());
@@ -241,6 +254,7 @@ final class Gl46BlockEntities implements AutoCloseable {
 
     @Override public void close() {
         if (arena != null) Gl46Context.report("BLOCK_ENTITY_CLOSE {meshes,recordings,instances,instancedDraws,animated,uncacheable,nsPerCall}=" + Arrays.toString(stats()));
+        if (instances != null) Gl46Context.report("BLOCK_ENTITY_UPLOADS bytes=" + uploadedBytes + " ringGrows=" + ringGrows + " ring=" + Arrays.toString(instances.stats()));
         active.clear(); meshes.clear();
         if (program != null) glDeleteProgram(program.id());
         program = null;

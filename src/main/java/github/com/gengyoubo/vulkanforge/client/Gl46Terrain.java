@@ -121,10 +121,15 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
     /** Previous frame's depth pyramid (R32F, max of 2x2) and the camera it was built with. */
     private static final boolean HIZ = !Boolean.getBoolean("vulkanforge.gl46.noHiZ");
     private static final float MAX_TURN_DEGREES = 10, MAX_MOVE_BLOCKS = 2, MAX_PROJECTION_CHANGE = .02f;
-    private int pyramid, pyramidWidth, pyramidHeight, pyramidLevels, readback, readbackFrame;
+    private int pyramid, pyramidWidth, pyramidHeight, pyramidLevels, pyramidParameters, readback, readbackFrame;
+    private int depthWidth, depthHeight;
+    private long hizDispatches, hizBarriers;
     private ByteBuffer readbackMapped;
     private final int counterInterval = Math.max(0, Integer.getInteger("vulkanforge.gl46.counterInterval", 60));
     private final long[] counterFences = new long[READBACK_SLOTS];
+    private int counterSlot = -1;
+    private final Gl46Timer counterCpu = new Gl46Timer(), hizCpu = new Gl46Timer();
+    private final Gl46GpuTimer cullGpu = new Gl46GpuTimer(), drawsGpu = new Gl46GpuTimer(), hizGpu = new Gl46GpuTimer();
     private long counterFrames, counterCopies, counterBusyDrops, opaqueLayerCalls, emptyLayerSkips;
     private final boolean skipEmptyLayers = Boolean.parseBoolean(System.getProperty("vulkanforge.gl46.skipEmptyLayers", "true"));
     /** CPU residency only; never the GPU-visible count. Updated on slot replace/remove/reset. */
@@ -349,6 +354,8 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
         Gl46State saved = new Gl46State();
         long t1 = System.nanoTime(), t2 = t1, t3 = t1;
         try (MemoryStack stack = MemoryStack.stackPush()) {
+            prepareCounts();
+            cullGpu.begin();
             bindFrame(atlas, light, CUTOFF[0], mipSampler);
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, drawBuffer);
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, countBuffer);
@@ -361,8 +368,10 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
             }
             // Indirect commands and counts, plus the statistics copy in collectCounts().
             glMemoryBarrier(GL_COMMAND_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+            cullGpu.end();
             glBindTextureUnit(2, light); glBindSampler(2, lightSampler); // the pyramid sat on unit 2 for the cull
             t2 = System.nanoTime();
+            drawsGpu.begin();
             glUseProgram(opaque.id());
             bindVertexArray(opaqueVao);
             glBindBuffer(GL_DRAW_INDIRECT_BUFFER, drawBuffer);
@@ -377,9 +386,11 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
                 opaqueLayerCalls++;
             }
             t3 = System.nanoTime();
+            drawsGpu.end();
             collectCounts();
             frames.submit();
         } finally {
+            cullGpu.end(); drawsGpu.end();
             long t4 = System.nanoTime();
             saved.close();
             long t5 = System.nanoTime();
@@ -508,15 +519,28 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
         return true;
     }
     /** Sampled telemetry only. Never waits and never controls any draw's visible count. 0 disables sampling. */
-    private void collectCounts() {
+    private void prepareCounts() {
+        long start = System.nanoTime();
         pollCounts();
         long frame = counterFrames++;
-        if (counterInterval == 0 || frame % counterInterval != 0) return;
-        int slot = readbackFrame;
-        if (counterFences[slot] != 0) { counterBusyDrops++; return; }
-        GlCompat.copyCounterReadback(countBuffer, readback, slot * 32L, COUNT_BYTES);
-        counterFences[slot] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-        readbackFrame = (readbackFrame + 1) % READBACK_SLOTS; counterCopies++;
+        counterSlot = -1;
+        if (counterInterval != 0 && frame % counterInterval == 0) {
+            for (int n = 0; n < READBACK_SLOTS; n++) {
+                int slot = (readbackFrame + n) % READBACK_SLOTS;
+                if (counterFences[slot] == 0) { counterSlot = slot; break; }
+            }
+            if (counterSlot < 0) counterBusyDrops++;
+        }
+        counterCpu.add(System.nanoTime() - start);
+    }
+    private void collectCounts() {
+        long start = System.nanoTime();
+        if (counterSlot >= 0) {
+            GlCompat.copyCounterReadback(countBuffer, readback, counterSlot * 32L, COUNT_BYTES);
+            counterFences[counterSlot] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+            readbackFrame = (counterSlot + 1) % READBACK_SLOTS; counterCopies++;
+        }
+        counterCpu.add(System.nanoTime() - start); counterCpu.frame();
     }
     private void pollCounts() {
         for (int slot = 0; slot < READBACK_SLOTS; slot++) {
@@ -536,7 +560,7 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
     }
     private void discardCounts() {
         for (int slot = 0; slot < READBACK_SLOTS; slot++) if (counterFences[slot] != 0) { glDeleteSync(counterFences[slot]); counterFences[slot] = 0; }
-        readbackFrame = 0; counterFrames = 0;
+        counterSlot = -1; readbackFrame = 0; counterFrames = 0;
     }
     /** {render attempts, copies, collected samples, busy drops, indirect calls, empty-layer skips}. */
     long[] submissionStats() { return new long[]{frameCount, counterCopies, culling[0], counterBusyDrops, opaqueLayerCalls, emptyLayerSkips}; }
@@ -549,35 +573,47 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
         if (hiz == null || !ready() || width <= 0 || height <= 0) return;
         long start = System.nanoTime();
         int levelWidth = (width + 1) / 2, levelHeight = (height + 1) / 2;
-        if (pyramid == 0 || pyramidWidth != levelWidth || pyramidHeight != levelHeight) {
+        if (pyramid == 0 || depthWidth != width || depthHeight != height) {
+            depthWidth = width; depthHeight = height;
             if (pyramid != 0) glDeleteTextures(pyramid);
             pyramidWidth = levelWidth; pyramidHeight = levelHeight;
             pyramidLevels = 32 - Integer.numberOfLeadingZeros(Math.max(levelWidth, levelHeight));
             pyramid = glCreateTextures(GL_TEXTURE_2D);
             glTextureStorage2D(pyramid, pyramidLevels, GL_R32F, levelWidth, levelHeight);
+            if (pyramidParameters != 0) glDeleteBuffers(pyramidParameters);
+            // These parameters depend only on the framebuffer extent, not on the camera or frame.
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                ByteBuffer levels = stack.calloc(pyramidLevels * uboAlignment);
+                int sourceWidth = width, sourceHeight = height;
+                for (int level = 0; level < pyramidLevels; level++) {
+                    int at = level * uboAlignment;
+                    levels.putInt(at, level == 0 ? 0 : level - 1).putInt(at + 4, sourceWidth).putInt(at + 8, sourceHeight);
+                    sourceWidth = Math.max(1, pyramidWidth >> level); sourceHeight = Math.max(1, pyramidHeight >> level);
+                }
+                pyramidParameters = glCreateBuffers(); glNamedBufferStorage(pyramidParameters, levels, 0);
+            }
             previousCamera = null; // a pyramid of another size never describes the next frame
         }
         try (Gl46State ignored = new Gl46State()) {
+            hizGpu.begin();
             glUseProgram(hiz.id());
             glBindSampler(0, 0);
-            int sourceWidth = width, sourceHeight = height;
+            glBindTextureUnit(0, depthTexture);
+            // Finish earlier shader reads before overwriting this pyramid. Each following dependency is imageStore -> texture fetch.
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT); hizBarriers++;
             for (int level = 0; level < pyramidLevels; level++) {
-                int offset = frames.allocate(16, uboAlignment);
-                if (offset < 0) { frames.submit(); offset = frames.allocate(16, uboAlignment); }
-                frames.mapped.putInt(offset, level == 0 ? 0 : level - 1).putInt(offset + 4, sourceWidth).putInt(offset + 8, sourceHeight);
-                glBindBufferRange(GL_UNIFORM_BUFFER, 1, frames.buffer, offset, 16);
-                glBindTextureUnit(0, level == 0 ? depthTexture : pyramid);
+                glBindBufferRange(GL_UNIFORM_BUFFER, 1, pyramidParameters, (long) level * uboAlignment, 16);
+                if (level == 1) glBindTextureUnit(0, pyramid);
                 glBindImageTexture(0, pyramid, level, false, 0, GL_WRITE_ONLY, GL_R32F);
                 int w = Math.max(1, pyramidWidth >> level), h = Math.max(1, pyramidHeight >> level);
                 glDispatchCompute((w + 7) / 8, (h + 7) / 8, 1);
-                glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
-                sourceWidth = w; sourceHeight = h;
+                glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
+                hizDispatches++; hizBarriers++;
             }
-            frames.submit();
-        }
+        } finally { hizGpu.end(); }
         previousCamera = camera; previousEpoch = epoch; previousYaw = yaw; previousPitch = pitch;
         System.arraycopy(projection, 0, previousProjection, 0, 16);
-        hizBuilds++; hizNanos += System.nanoTime() - start;
+        hizBuilds++; long spent = System.nanoTime() - start; hizNanos += spent; hizCpu.sample(spent);
         checkErrors("hiz");
     }
     /** {cull frames, tested (vanilla-visible), frustumVisible, occluded, layerDraws, vanillaMarked, hizBuilds, hizFrames, hizSkipped}. */
@@ -721,7 +757,7 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
         for (int i = 0; i < 4; i++) frame.putFloat(offset + 96 + i * 4, fogColor[i]);
         frame.putFloat(offset + 112, RenderSystem.getShaderFogStart()).putFloat(offset + 116, RenderSystem.getShaderFogEnd())
                 .putFloat(offset + 120, RenderSystem.getShaderFogShape().getIndex()).putFloat(offset + 124, cutoff);
-        frame.putInt(offset + 128, slotCount).putInt(offset + 132, MAX_SECTIONS);
+        frame.putInt(offset + 128, slotCount).putInt(offset + 132, MAX_SECTIONS).putInt(offset + 136, counterSlot >= 0 ? 1 : 0);
         glBindBufferRange(GL_UNIFORM_BUFFER, 0, frames.buffer, offset, FRAME_BYTES);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sectionBuffer);
         glBindTextureUnit(0, atlas); glBindSampler(0, atlasSampler);
@@ -768,6 +804,11 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
         if (readbackMapped != null) pollCounts();
         discardCounts();
         Gl46Context.report("TERRAIN_SUBMISSIONS=" + Arrays.toString(submissionStats()));
+        Gl46Context.report("TERRAIN_COST hizDispatches=" + hizDispatches + " hizBarriers=" + hizBarriers + " counterCpu{" + counterCpu + "} hizCpu{" + hizCpu + "} cullGpu{" + cullGpu
+                + "} indirectGpu{" + drawsGpu + "} hizGpu{" + hizGpu + "}");
+        Gl46Context.report("GL_STATE_COST scopes{full,diff,restores,avoidedRestores,sets,avoidedSets}=" + Arrays.toString(Gl46State.stats())
+                + " cache{reads,queries,verified,invalidated}=" + Arrays.toString(GlStateCache.stats()));
+        cullGpu.close(); drawsGpu.close(); hizGpu.close();
         if (cpuCommands != null) { MemoryUtil.memFree(cpuCommands); cpuCommands = null; }
         cpuSections.clear();
         if (vertices != null) Gl46Context.report("TERRAIN_CLOSE frames=" + frameCount + " translucentFrames=" + translucentFrames
@@ -786,8 +827,9 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
         for (Gl46Programs.Program program : new Gl46Programs.Program[]{cull, opaque, translucent, hiz}) if (program != null) glDeleteProgram(program.id());
         cull = opaque = translucent = hiz = null;
         if (pyramid != 0) glDeleteTextures(pyramid);
+        if (pyramidParameters != 0) glDeleteBuffers(pyramidParameters);
         if (readback != 0) { glUnmapNamedBuffer(readback); glDeleteBuffers(readback); }
-        pyramid = readback = 0; readbackMapped = null;
+        pyramid = pyramidParameters = readback = 0; readbackMapped = null;
         for (AutoCloseable resource : new AutoCloseable[]{vertices, indices, uploads, frames, commands}) {
             try { if (resource != null) resource.close(); } catch (Exception ignored) { }
         }

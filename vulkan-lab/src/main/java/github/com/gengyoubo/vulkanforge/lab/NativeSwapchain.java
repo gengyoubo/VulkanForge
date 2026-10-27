@@ -117,7 +117,7 @@ final class NativeSwapchain implements AutoCloseable {
             var modes = stack.mallocInt(n.get(0));
             check(vkGetPhysicalDeviceSurfacePresentModesKHR(context.physical, context.surface, n, modes), "native present modes");
             int mode = VK_PRESENT_MODE_FIFO_KHR;
-            if (!vsync) for (int candidate : new int[]{VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR}) {
+            if (!vsync) for (int candidate : new int[]{VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR}) {
                 boolean found = false;
                 for (int i = 0; i < modes.remaining(); i++) if (modes.get(i) == candidate) found = true;
                 if (found) { mode = candidate; break; }

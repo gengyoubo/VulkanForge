@@ -17,11 +17,19 @@ import static org.lwjgl.opengl.GL46C.*;
  */
 final class Gl46Programs {
     private static final String ROOT = "/assets/vulkanforge/shaders/gl46/";
+    private static final java.util.Map<String, byte[]> RESOURCES = new java.util.HashMap<>();
+    private static long resourceReads, resourceHits;
     private Gl46Programs() { }
 
     record Program(int id, boolean spirv) { }
 
     static Program load(String... stages) {
+        long start = System.nanoTime();
+        try { return compile(stages); }
+        finally { Gl46Context.report("PROGRAM_LOAD " + String.join("+", stages) + " cpuUs=" + (System.nanoTime()-start)/1e3
+                + " resourceReads=" + resourceReads + " resourceHits=" + resourceHits); }
+    }
+    private static Program compile(String[] stages) {
         if (GlCompat.core46() && !Boolean.getBoolean("vulkanforge.gl46.glsl")) {
             try { return new Program(link(stages, true), true); }
             catch (RuntimeException error) { Gl46Context.report("SPIRV_REJECTED " + String.join("+", stages) + ": " + error.getMessage()); }
@@ -91,9 +99,11 @@ final class Gl46Programs {
     }
 
     private static byte[] resource(String name) {
+        byte[] cached = RESOURCES.get(name);
+        if (cached != null) { resourceHits++; return cached; }
         try (InputStream in = Gl46Programs.class.getResourceAsStream(ROOT + name)) {
             if (in == null) throw new IOException("Missing GL 4.6 shader resource " + ROOT + name);
-            return in.readAllBytes();
+            byte[] bytes = in.readAllBytes(); RESOURCES.put(name, bytes); resourceReads++; return bytes;
         } catch (IOException error) { throw new IllegalStateException(error); }
     }
 }
