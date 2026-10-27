@@ -19,17 +19,20 @@ public final class NativePipelineBenchmark {
                 public void terrain(PipelineBenchmark.Target target,int slot){
                     glDepthMask(true);glColorMask(true,true,true,true);glDisable(GL_SCISSOR_TEST);glBindFramebuffer(GL_FRAMEBUFFER,target.framebuffer());glClearColor(.5f,.7f,1,0);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
                     if(backend.renderWorldWithSky(width,height,new Object[0],true)==0)throw new AssertionError("Native world unavailable");
+                    if(Boolean.getBoolean("bench.nativeInterval"))backend.beginNativeInterval();
                     if(!backend.nativeComposite(target.framebuffer(),width,height,0,new Object[0])||!backend.nativeComposite(target.framebuffer(),width,height,1,new Object[0]))throw new AssertionError("Native composite unavailable");
                 }
                 public void beginPost(){backend.beginNativePostChain();}
                 public boolean post(Object[] packet){if(!backend.nativePost(packet))throw new AssertionError("Native post unexpectedly fell back");return true;}
                 public void endPost(){backend.endNativePostChain();}
-                public void endFrame(){backend.finishWorldFrame();}
+                public void endFrame(){if(Boolean.getBoolean("bench.nativeInterval"))backend.endNativeInterval();backend.finishWorldFrame();}
+                public void beforeRead(){backend.flushNativePosts();}
                 public void audit(Path path) throws Exception {BenchmarkDrawAudit.write(backend,path.resolve("workload.txt"),true);}
-                public long[] counters(){return backend.interopStats();}
+                public long[] counters(){long[] a=backend.interopStats(),b=GlInterop.groupedCpuStats(),all=java.util.Arrays.copyOf(a,a.length+b.length);System.arraycopy(b,0,all,a.length,b.length);return all;}
+                public double[] profile(){return backend.phaseProfile();}
             },dimensions->backend.createRenderTarget(dimensions[0],dimensions[1],dimensions[2]),backend::destroyRenderTarget)){
                 glDisable(GL_DITHER);glDisable(GL_FRAMEBUFFER_SRGB);
-                pipeline.run(out,Boolean.getBoolean("vulkanforge.noInteropOptimizations")?"VK14_BEFORE":"VK14_AFTER",Integer.getInteger("bench.warmup",2000),Double.parseDouble(System.getProperty("bench.seconds","6")));
+                pipeline.run(out,System.getProperty("bench.label",Boolean.getBoolean("vulkanforge.noInteropOptimizations")?"VK14_BEFORE":"VK14_AFTER"),Integer.getInteger("bench.warmup",2000),Double.parseDouble(System.getProperty("bench.seconds","6")));
             }
             if(glGetError()!=GL_NO_ERROR)throw new AssertionError("Native pipeline GL error");
         }finally{glfwDestroyWindow(hidden);glfwTerminate();}

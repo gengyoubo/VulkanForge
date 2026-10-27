@@ -18,6 +18,8 @@ final class GpuTimers implements AutoCloseable {
     private final boolean[][] recorded;
     private final long[] samples;
     private final double[] total, maximum;
+    private final long[][] starts,ends;
+    private final boolean[][] available;
     private final int validBits, queriesPerSlot;
     private final double period;
     private long pool;
@@ -25,6 +27,7 @@ final class GpuTimers implements AutoCloseable {
     GpuTimers(VulkanContext context, int slots, Consumer<String> log, String... labels) {
         this.context = context; this.labels = labels.clone();
         pending = new boolean[slots]; recorded = new boolean[slots][labels.length];
+        starts=new long[slots][labels.length];ends=new long[slots][labels.length];available=new boolean[slots][labels.length];
         samples = new long[labels.length]; total = new double[labels.length]; maximum = new double[labels.length];
         queriesPerSlot = labels.length * 2;
         try (MemoryStack stack = MemoryStack.stackPush()) {
@@ -48,10 +51,14 @@ final class GpuTimers implements AutoCloseable {
 
     boolean enabled() { return pool != 0; }
     long samples(int metric) { return samples[metric]; }
+    double[] metric(int metric) { return new double[]{samples[metric],total[metric]}; }
+    long[] range(int slot,int metric){return recorded[slot][metric]&&available[slot][metric]?new long[]{starts[slot][metric],ends[slot][metric]}:null;}
+    double elapsedMs(long start,long end){return elapsedTicks(start,end,validBits)*period/1e6;}
     void begin(VkCommandBuffer command, int slot) {
         if (!enabled()) return;
         if (pending[slot]) throw new IllegalStateException("Timestamp slot reused before collection");
         java.util.Arrays.fill(recorded[slot], false);
+        java.util.Arrays.fill(available[slot], false);
         vkCmdResetQueryPool(command, pool, slot * queriesPerSlot, queriesPerSlot);
     }
     void start(VkCommandBuffer command, int slot, int metric, long stage) {
@@ -75,6 +82,7 @@ final class GpuTimers implements AutoCloseable {
                 if (result == VK_NOT_READY) continue;
                 check(result, "read GPU timestamps");
                 if (values.get(1) == 0 || values.get(3) == 0) continue;
+                starts[slot][metric]=values.get(0);ends[slot][metric]=values.get(2);available[slot][metric]=true;
                 double millis = elapsedTicks(values.get(0), values.get(2), validBits) * period / 1_000_000.0;
                 samples[metric]++; total[metric] += millis; maximum[metric] = Math.max(maximum[metric], millis);
             }

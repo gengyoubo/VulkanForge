@@ -79,7 +79,7 @@ public final class GlOffscreenBenchmark {
                         public void terrain(dev.vulkanforge.bench.PipelineBenchmark.Target target,int slot){frame(terrain,atlasTexture,lightTexture);}
                         public void audit(Path out) throws Exception {dev.vulkanforge.bench.Workload.audit(out.resolve("workload.txt"),terrain.auditOpaqueDraws(),terrain.auditTranslucentDraws());}
                     },null,null)) {
-                        glDisable(GL_DITHER);glDisable(GL_FRAMEBUFFER_SRGB);pipeline.run(directory,"CUSTOM_GL46",warmup,minimumSeconds);
+                        glDisable(GL_DITHER);glDisable(GL_FRAMEBUFFER_SRGB);pipeline.run(directory,System.getProperty("bench.label","CUSTOM_GL46"),warmup,minimumSeconds);
                     }
                     report.add("PIPELINE_STATUS=OK");return;
                 }

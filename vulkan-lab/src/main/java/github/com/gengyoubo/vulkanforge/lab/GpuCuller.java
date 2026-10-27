@@ -105,6 +105,12 @@ final class GpuCuller implements AutoCloseable {
         tested += lives[slot]; counts[slot] = lives[slot] = 0;
     }
     long[] stats() { return new long[]{tested, visible, tested - visible}; }
+    /** Diagnostic only, after the owning frame fence completed. Rows are {record ID, submitted vertices}. */
+    java.util.List<int[]> actualDraws(int slot,int records) {
+        int count=compact?drawCounts[slot].mapped.getInt(0):records;var result=new java.util.ArrayList<int[]>();
+        for(int i=0;i<count;i++){int at=i*16,vertices=outputs[slot].mapped.getInt(at);if(vertices!=0)result.add(new int[]{compact?outputs[slot].mapped.getInt(at+12):i,vertices});}
+        return result;
+    }
     void report(Consumer<String> log) { log.accept("GPU_CULLING tested=" + tested + " visible=" + visible + " culled=" + (tested - visible)); }
     @Override public void close() {
         if (pipeline != 0) { vkDestroyPipeline(context.device, pipeline, null); pipeline = 0; }

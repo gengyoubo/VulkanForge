@@ -96,6 +96,16 @@ final class WorldScene implements AutoCloseable {
     private long[] sortKeys = new long[0], orderKeys = new long[0];
     private final List<Section> translucentOrder = new ArrayList<>();
     private final List<Section> cullSections = new ArrayList<>();
+    private boolean auditDrawIds;
+    private final java.util.List<Map<Long,Long>> actualTranslucent = java.util.List.of(new TreeMap<>(),new TreeMap<>());
+    void auditDrawIds(boolean enabled){auditDrawIds=enabled;}
+    Map<Long,Long> actualOpaque(GpuCuller culler,int slot) {
+        if(culler==null||meshPipeline!=0)throw new UnsupportedOperationException("Draw-ID audit currently requires the standard compute/indirect path");
+        var identities=new IdentityHashMap<Section,Long>();sections.forEach((key,section)->identities.put(section,key));Map<Long,Long> result=new TreeMap<>();
+        for(int[] draw:culler.actualDraws(slot,cullSections.size())){Section section=cullSections.get(draw[0]);if(section==null||draw[1]!=section.vertices()||result.put(identities.get(section),draw[1]/6L)!=null)throw new AssertionError("GPU opaque draw ID duplicated or mismatched");}
+        return result;
+    }
+    Map<Long,Long> actualTranslucent(int slot){return new TreeMap<>(actualTranslucent.get(slot));}
     private final BitSet freeCull = new BitSet();
     /** Per culler slot: records changed since that slot's input buffer was last written. */
     private BitSet[] cullDirty;
@@ -431,6 +441,8 @@ final class WorldScene implements AutoCloseable {
     /** Back-to-front sections, each with back-to-front quads; drawn after opaque terrain into the translucent target. */
     void drawTranslucent(VkCommandBuffer command, MemoryStack stack, int slot) {
         if (slot < 0 || slot >= TRANSLUCENT_SLOTS) throw new IllegalArgumentException("Translucent slot out of range: " + slot);
+        Map<Long,Long> audited=auditDrawIds?actualTranslucent.get(slot):null;IdentityHashMap<Section,Long> identities=null;
+        if(audited!=null){audited.clear();identities=new IdentityHashMap<>();for(var entry:sections.entrySet())identities.put(entry.getValue(),entry.getKey());}
         List<Section> ordered = translucentOrder; ordered.clear();
         for (Section section : sections.values()) if (section.translucent() != null) ordered.add(section);
         int count = ordered.size();
@@ -461,6 +473,7 @@ final class WorldScene implements AutoCloseable {
             vkCmdBindVertexBuffers(command, 0, buffers, offsets);
             vkCmdBindIndexBuffer(command, translucent.indices[slot].buffer, 0, VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(command, translucent.quads * 6, 1, 0, 0, 0);
+            if(audited!=null&&audited.put(identities.get(section),(long)translucent.quads)!=null)throw new AssertionError("Duplicate transparent draw ID");
             translucentDraws++;
         }
     }

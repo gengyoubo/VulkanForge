@@ -60,3 +60,19 @@ TERRAIN_POST3 的优化前后，逐例断言实际复制为 2→1、VK 提交为
 可通过 `.\gradlew.bat smokePostChainTransform :vulkan-lab:smokeNativePostBatch` 重跑新增回归检查。开发运行可用 `-Dvulkanforge.noInteropOptimizations=true` 配合 `runClient` 恢复旧行为；常规启动器则把该参数作为 JVM 参数传入。
 
 验证层可用性以原始日志为准；常规计时关闭验证层。通过像素与计数检查不等于通过了 Vulkan 验证层。
+
+
+## 五轮结果（2026-10-27）
+
+| 路径 | 纯地形 FPS | 地形加三后处理 FPS | 后处理组整卡 GPU |
+|---|---:|---:|---:|
+| 原版 GL | 2902 | 1743 | 88.0% |
+| GL 4.6 | 3073 | 1844 | 97.2% |
+| VK 1.4 优化前 | 1039 | 746 | 88.3% |
+| VK 1.4 优化后 | 1113 | 875 | 88.4% |
+
+同轮配对 FPS 提升中位数为纯地形 +7.2%、三后处理 +16.4%。仍保留透明/实体所需的 GL 边界，GL 路径在此负载中更快。GPU 顶点/索引存储保留各自实际实现，这是渲染器架构对照，不是同字节流的纯 API 效率测试。
+
+正式数据包含一次 205.6 ms、一次 941.1 ms 的长帧，未剔除；三组追加 12 秒对照未复现近一秒停顿，优化后为 888～894 FPS。不能据此宣称长尾停顿已解决。原始范围、追加数据和完整误差见 build/reports/interop-optimized/summary.md。
+
+后续跨越地形合成与后处理的显式资源租用区间实验见 [native-lease-interval.md](native-lease-interval.md)。该实验保留 GL 访问边界，游戏未默认开启跨阶段区间；新结果与本节历史样本分开报告。

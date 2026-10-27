@@ -70,6 +70,7 @@ final class VulkanContext implements AutoCloseable {
     }
 
     void initializeInterop(byte[] uuid, boolean requireValidation) {
+        if(instance!=null)throw new IllegalStateException("Vulkan context already initialized; its interop policy cannot change");
         interop = true; deviceUUID = uuid;
         initialize(0, VK.getInstanceVersionSupported(), requireValidation);
     }
@@ -89,6 +90,7 @@ final class VulkanContext implements AutoCloseable {
     }
 
     void initialize(long window, int loaderVersion, boolean requireValidation) {
+        if(instance!=null)throw new IllegalStateException("Vulkan context already initialized");
         if (loaderVersion < apiVersion)
             throw new IllegalStateException("Vulkan " + version(apiVersion) + " loader required; found " + version(loaderVersion));
         boolean offscreen = window == NULL;

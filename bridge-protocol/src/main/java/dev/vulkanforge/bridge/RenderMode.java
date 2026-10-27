@@ -1,6 +1,6 @@
 package dev.vulkanforge.bridge;
 
-/** Running modes share two APIs; only GL_VK permits interop and OpenGL fallback. */
+/** Running modes share two APIs; only GL_VK permits cross-API interop/fallback. */
 public enum RenderMode {
     GL(false,true,false), GL_VK(true,true,true), VK(true,false,false);
     private final boolean vulkan,openGL,interop;
@@ -8,7 +8,8 @@ public enum RenderMode {
     public boolean usesVulkan(){return vulkan;}
     public boolean allowsOpenGL(){return openGL;}
     public boolean allowsInterop(){return interop;}
-    public boolean allowsGlFallback(){return this==GL_VK;}
+    public boolean allowsGlFallback(){return openGL;}
+    public boolean allowsCrossApiFallback(){return interop;}
     public static RenderMode parse(Object value,RenderMode fallback){
         if(value==null)return fallback;
         return switch(value.toString().trim().toUpperCase(java.util.Locale.ROOT).replace('-','_')){

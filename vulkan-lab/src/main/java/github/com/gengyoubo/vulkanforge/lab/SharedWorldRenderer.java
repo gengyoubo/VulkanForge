@@ -14,7 +14,7 @@ import static org.lwjgl.vulkan.VK10.*;
 import static org.lwjgl.vulkan.VK11.VK_QUEUE_FAMILY_EXTERNAL;
 import static org.lwjgl.vulkan.VK13.*;
 
-/** Same-device terrain -> exported color attachments -> host GL sampling. No staging/readback or frame protocol. */
+/** GL_VK boundary adapter. Its legacy nativeMode flag selects Vulkan composites, not GL-free VK mode. */
 final class SharedWorldRenderer implements AutoCloseable {
     private static final int SLOT_COUNT = 2;
     private static final class Slot {
@@ -48,6 +48,8 @@ final class SharedWorldRenderer implements AutoCloseable {
     private final VulkanSceneCore core;
     private GpuTimers timers;
     private GpuTimers entityTimers;
+    private GpuTimers nativeTimers;
+    private double queueGapMs,envelopeMs;
     private GpuCuller culler;
     private record Retired(long serial, Runnable close) { }
     private final java.util.ArrayDeque<Retired> retired = new java.util.ArrayDeque<>();
@@ -66,13 +68,21 @@ final class SharedWorldRenderer implements AutoCloseable {
     private long nativeComposites, nativeEntityPasses;
     private long overlayPasses, skyDraws, handoffGroups, handoffImages;
     private final boolean optimizeInterop = !Boolean.getBoolean("vulkanforge.noInteropOptimizations");
-    private int postChainDepth;
+    private int postChainDepth, nativeIntervalDepth;
+    private sealed interface PendingNative permits PendingPost, PendingComposite {
+        SharedRenderTargets.Target target();
+        java.util.List<SharedRenderTargets.Target> owners();
+        int pass();
+    }
     private record PendingPost(Object[] packet, SharedRenderTargets.Target target, SharedPresentImage[] inputs,
-                               java.util.List<SharedRenderTargets.Target> owners, int pass) { }
-    private final java.util.ArrayList<PendingPost> pendingPosts = new java.util.ArrayList<>();
-    private long depthCopies, avoidedDepthCopies, postBatches, batchedPostPasses;
+                               java.util.List<SharedRenderTargets.Target> owners, int pass) implements PendingNative { }
+    private record PendingComposite(SharedRenderTargets.Target target, int kind, int pass) implements PendingNative {
+        public java.util.List<SharedRenderTargets.Target> owners() { return java.util.List.of(); }
+    }
+    private final java.util.ArrayList<PendingNative> pendingPosts = new java.util.ArrayList<>();
+    private long depthCopies, avoidedDepthCopies, postBatches, batchedPostPasses, mixedBatches, batchedComposites;
     /** Sync-chain cost per frame: queue submits, CPU blocked in fence waits, GL semaphore calls (see SharedPresentImage.groupNanos). */
-    private long submits, fenceWaitNanos, maxFenceWaitNanos, reportedFrames, reportedSubmits, reportedFenceNanos, reportedGlCalls, reportedGlNanos;
+    private long submits, queueSubmitNanos, recordNanos, prepareNanos, uploadFlushNanos, fenceWaitNanos, maxFenceWaitNanos, reportedFrames, reportedSubmits, reportedFenceNanos, reportedGlCalls, reportedGlNanos;
     private int depthTexture, translucentTexture, translucentDepthTexture;
     private long translucentSectionDraws;
     private static final long DEPTH_STAGES = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
@@ -91,7 +101,8 @@ final class SharedWorldRenderer implements AutoCloseable {
             entities = new EntityPass(context, SLOT_COUNT * (MAX_OVERLAYS + 1), retire);
             composite = new DepthComposite(context);
             post = new NativePost(context, SLOT_COUNT * MAX_OVERLAYS);
-            timers = new GpuTimers(context, SLOT_COUNT, log, "TERRAIN", "TERRAIN_RELEASE", "TRIANGLE", "CULLING", "TRANSLUCENT");
+            timers = new GpuTimers(context, SLOT_COUNT, log, "TERRAIN", "TERRAIN_RELEASE", "TRIANGLE", "CULLING", "TRANSLUCENT", "DEPTH_COPY", "TERRAIN_SUBMIT_BODY");
+            if(Boolean.getBoolean("vulkanforge.interopProfile"))nativeTimers=new GpuTimers(context,SLOT_COUNT*MAX_OVERLAYS,log,"COMPOSITE","POST","NATIVE_SUBMIT_BODY");
             if(Boolean.getBoolean("vulkanforge.entityProfile"))entityTimers=new GpuTimers(context,SLOT_COUNT*(MAX_OVERLAYS+1),log,"ENTITY_OVERLAY");
             var handle = stack.mallocLong(1);
             check(vkCreateCommandPool(context.device, VkCommandPoolCreateInfo.calloc(stack).sType$Default().queueFamilyIndex(context.queueFamily)
@@ -142,10 +153,12 @@ final class SharedWorldRenderer implements AutoCloseable {
         Slot slot = slots[index]; waitSlot(index);
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkCommandBuffer command = slot.command;
+            long recordStart=System.nanoTime();
             check(vkResetCommandBuffer(command, 0), "reset shared world command");
             check(vkBeginCommandBuffer(command, VkCommandBufferBeginInfo.calloc(stack).sType$Default()
                     .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)), "begin shared world command");
             timers.begin(command, index);
+            if(nativeTimers!=null)timers.start(command,index,6,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             // Opaque color/depth feed the AFTER_CUTOUT composite; translucent color plus its own depth (a copy of opaque depth,
             // then nearest translucent surface) feed the AFTER_TRANSLUCENT composite. All four are leased to GL every frame.
             var acquire = VkImageMemoryBarrier2.calloc(4, stack);
@@ -196,7 +209,7 @@ final class SharedWorldRenderer implements AutoCloseable {
             }
             vkCmdEndRendering(command);
             timers.end(command, index, metric, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
-            timers.start(command, index, 4, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+            timers.start(command, index, 5, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             var toCopy = VkImageMemoryBarrier2.calloc(1, stack);
             layoutBarrier(toCopy.get(0), slot.depth, DEPTH_STAGES, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, true);
@@ -221,6 +234,8 @@ final class SharedWorldRenderer implements AutoCloseable {
             layoutBarrier(toTest.get(0), slot.translucentDepth, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, DEPTH_STAGES, DEPTH_ACCESS,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, true);
             vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(toTest));
+            timers.end(command,index,5,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+            timers.start(command,index,4,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             var translucentColor = VkRenderingAttachmentInfo.calloc(1, stack).sType$Default().imageView(slot.translucentColor.view())
                     .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL).loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
             translucentColor.clearValue().color().float32(0, 0).float32(1, 0).float32(2, 0).float32(3, 0);
@@ -253,7 +268,9 @@ final class SharedWorldRenderer implements AutoCloseable {
                 vkCmdPipelineBarrier2(command,VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(target));
             }
             timers.end(command, index, 1, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+            if(nativeTimers!=null)timers.end(command,index,6,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             check(vkEndCommandBuffer(command), "end shared world command");
+            recordNanos+=System.nanoTime()-recordStart;
             SharedPresentImage[] images = slot.images();
             var signals = VkSemaphoreSubmitInfo.calloc(nativeMode ? prepareNativeTarget ? 1 : 0 : 1, stack);
             if (signals.hasRemaining()) signals.get(0).sType$Default().semaphore(nativeMode ? slot.overlayColor.ready : slot.color.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
@@ -267,7 +284,7 @@ final class SharedWorldRenderer implements AutoCloseable {
                 submit.pWaitSemaphoreInfos(waits);
             }
             check(vkResetFences(context.device, slot.fence), "reset shared world fence");
-            context.uploads.flush(); check(vkQueueSubmit2(context.queue, submit, slot.fence), "submit shared world"); submits++;
+            flushUploads(); submit(submit, slot.fence, "submit shared world"); submits++;
             slot.used = slot.pending = true; slot.nativeOwned = nativeMode; timers.submitted(index); frames++;
             if (prepareNativeTarget) {
                 slot.overlayUsed = true;
@@ -364,7 +381,7 @@ final class SharedWorldRenderer implements AutoCloseable {
                 submit.pWaitSemaphoreInfos(waits);
             }
             check(vkResetFences(context.device, slot.overlayFences[pass]), "reset overlay fence");
-            context.uploads.flush(); check(vkQueueSubmit2(context.queue, submit, slot.overlayFences[pass]), "submit overlay"); submits++;
+            flushUploads(); submit(submit, slot.overlayFences[pass], "submit overlay"); submits++;
             if(entityTimers!=null)entityTimers.submitted(entitySlot);
             slot.overlayUsed = slot.overlayPending[pass] = true; overlayPasses++;
             overlayReading = index;
@@ -382,12 +399,20 @@ final class SharedWorldRenderer implements AutoCloseable {
 
     boolean nativeReady() { return nativeReading >= 0; }
     boolean composeNative(int framebuffer, int targetWidth, int targetHeight, int kind, java.util.List<Object[]> packets) {
-        flushPosts();
+        long prepareStart=System.nanoTime();
         if (nativeReading < 0) return false;
         var target = renderTargets.get(framebuffer, targetWidth, targetHeight);
         if ((target == null || kind < 2) && (targetWidth != width || targetHeight != height)) return false;
         int index=nativeReading; Slot slot=slots[index];
         if(slot.overlays>=MAX_OVERLAYS) throw new IllegalStateException("Native render pass budget exceeded");
+        if (optimizeInterop && nativeIntervalDepth > 0 && target != null && kind >= 0 && kind < 2) {
+            pendingPosts.add(new PendingComposite(target, kind, slot.overlays++));
+            prepareNanos+=System.nanoTime()-prepareStart;
+            return true;
+        }
+        prepareNanos+=System.nanoTime()-prepareStart;
+        // Copy-backed/unregistered targets and entity passes remain explicit boundaries.
+        flushPosts();
         int pass=slot.overlays++;
         SharedPresentImage targetColor = target == null ? slot.overlayColor : target.color;
         SharedPresentImage targetDepth = target == null ? slot.overlayDepth : target.depth;
@@ -399,9 +424,12 @@ final class SharedWorldRenderer implements AutoCloseable {
             SharedPresentImage.endGroupGL(targetColor,targetDepth);slot.nativeTargetLeased=false;
         }
         try(var stack=MemoryStack.stackPush()) {
+            long recordStart=System.nanoTime();
             var command=slot.overlayCommands[pass];
             check(vkResetCommandBuffer(command,0),"reset native composite");
             check(vkBeginCommandBuffer(command,VkCommandBufferBeginInfo.calloc(stack).sType$Default().flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)),"begin native composite");
+            int nativeTimerSlot=index*MAX_OVERLAYS+pass;
+            if(kind<2&&nativeTimers!=null){nativeTimers.begin(command,nativeTimerSlot);nativeTimers.start(command,nativeTimerSlot,2,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);}
             var barriers=VkImageMemoryBarrier2.calloc(2,stack);
             acquireBarrier(barriers.get(0),true,targetColor,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,false);
             acquireBarrier(barriers.get(1),true,targetDepth,DEPTH_STAGES,DEPTH_ACCESS,VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,true);
@@ -410,6 +438,7 @@ final class SharedWorldRenderer implements AutoCloseable {
             var depth=VkRenderingAttachmentInfo.calloc(stack).sType$Default().imageView(targetDepth.view()).imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL).loadOp(hasDepth?VK_ATTACHMENT_LOAD_OP_LOAD:VK_ATTACHMENT_LOAD_OP_CLEAR).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
             depth.clearValue().depthStencil().depth(1);
             int entitySlot=index*(MAX_OVERLAYS+1)+pass;
+            if(kind<2&&nativeTimers!=null)nativeTimers.start(command,nativeTimerSlot,0,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             if(kind>=2&&entityTimers!=null)entityTimers.begin(command,entitySlot);
             vkCmdBeginRendering(command,VkRenderingInfo.calloc(stack).sType$Default().layerCount(1).pColorAttachments(color).pDepthAttachment(depth).renderArea(r->r.extent(e->e.set(targetWidth,targetHeight))));
             vkCmdSetViewport(command,0,VkViewport.calloc(1,stack).width(targetWidth).height(targetHeight).minDepth(0).maxDepth(1));
@@ -422,16 +451,20 @@ final class SharedWorldRenderer implements AutoCloseable {
                 nativeEntityPasses++;overlayPasses++;
             }
             vkCmdEndRendering(command);
+            if(kind<2&&nativeTimers!=null)nativeTimers.end(command,nativeTimerSlot,0,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             releaseBarrier(barriers.get(0),targetColor,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,false);
             releaseBarrier(barriers.get(1),targetDepth,DEPTH_STAGES,DEPTH_ACCESS,VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,true);
             vkCmdPipelineBarrier2(command,VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barriers));
+            if(kind<2&&nativeTimers!=null)nativeTimers.end(command,nativeTimerSlot,2,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             check(vkEndCommandBuffer(command),"end native composite");
+            recordNanos+=System.nanoTime()-recordStart;
             var wait=VkSemaphoreSubmitInfo.calloc(1,stack).sType$Default().semaphore(targetColor.complete).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             var signal=VkSemaphoreSubmitInfo.calloc(1,stack).sType$Default().semaphore(targetColor.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             check(vkResetFences(context.device,slot.overlayFences[pass]),"reset native composite fence");
-            context.uploads.flush(); check(vkQueueSubmit2(context.queue,VkSubmitInfo2.calloc(1,stack).sType$Default().pWaitSemaphoreInfos(wait).pSignalSemaphoreInfos(signal)
-                    .pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1,stack).sType$Default().commandBuffer(command)),slot.overlayFences[pass]),"submit native composite");
+            flushUploads(); submit(VkSubmitInfo2.calloc(1,stack).sType$Default().pWaitSemaphoreInfos(wait).pSignalSemaphoreInfos(signal)
+                    .pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1,stack).sType$Default().commandBuffer(command)),slot.overlayFences[pass],"submit native composite");
             if(kind>=2&&entityTimers!=null)entityTimers.submitted(index*(MAX_OVERLAYS+1)+pass);
+            if(kind<2&&nativeTimers!=null)nativeTimers.submitted(nativeTimerSlot);
             slot.overlayPending[pass]=true; submits++;
         }
         if (target != null) target.acquireGL();
@@ -446,6 +479,7 @@ final class SharedWorldRenderer implements AutoCloseable {
 
     /** Post inputs remain GPU images; all preflight checks run before changing ownership or recording output. */
     boolean postNative(Object[] packet) {
+        long prepareStart=System.nanoTime();
         if (nativeReading < 0) return false;
         if(packet.length<6||!(packet[3] instanceof int[] meta)||meta.length==0||meta.length%5!=0||!(packet[4] instanceof float[] values)||values.length>256
                 ||!(packet[5] instanceof int[] dimensions)||dimensions.length!=3||(packet.length>7&&(!(packet[7] instanceof float[] clear)||clear.length!=4)))return false;
@@ -473,17 +507,21 @@ final class SharedWorldRenderer implements AutoCloseable {
             log.accept("POST_GL_FALLBACK=" + packet[0] + " reason=" + error.getMessage());
             return false;
         }
+        prepareNanos+=System.nanoTime()-prepareStart;
         int pass = slot.overlays++;
-        if (optimizeInterop && postChainDepth > 0) {
+        if (optimizeInterop && (postChainDepth > 0 || nativeIntervalDepth > 0)) {
             pendingPosts.add(new PendingPost(packet, target, inputs, java.util.List.copyOf(owners), pass));
             return true;
         }
         var all = new java.util.ArrayList<>(owners); all.add(target);
         for (var owner : all) owner.releaseGL();
         try (var stack = MemoryStack.stackPush()) {
+            long recordStart=System.nanoTime();
             var command = slot.overlayCommands[pass];
             check(vkResetCommandBuffer(command, 0), "reset native post");
             check(vkBeginCommandBuffer(command, VkCommandBufferBeginInfo.calloc(stack).sType$Default().flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)), "begin native post");
+            int timerSlot=nativeReading*MAX_OVERLAYS+pass;
+            if(nativeTimers!=null){nativeTimers.begin(command,timerSlot);nativeTimers.start(command,timerSlot,2,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);}
             var barriers = VkImageMemoryBarrier2.calloc(all.size()*2, stack);
             for (int i = 0; i < all.size(); i++) {
                 var owner = all.get(i); boolean out = owner == target;
@@ -506,8 +544,10 @@ final class SharedWorldRenderer implements AutoCloseable {
                     .renderArea(r -> r.extent(e -> e.set(target.width, target.height))));
             vkCmdSetViewport(command, 0, VkViewport.calloc(1, stack).width(target.width).height(target.height).minDepth(0).maxDepth(1));
             vkCmdSetScissor(command, 0, VkRect2D.calloc(1, stack).extent(e -> e.set(target.width, target.height)));
+            if(nativeTimers!=null)nativeTimers.start(command,timerSlot,1,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             post.record(command, stack, nativeReading * MAX_OVERLAYS + pass, packet, inputs);
             vkCmdEndRendering(command);
+            if(nativeTimers!=null)nativeTimers.end(command,timerSlot,1,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             for (int i = 0; i < all.size(); i++) {
                 var owner = all.get(i); boolean out = owner == target;
                 SharedRenderTargets.release(barriers.get(i*2), owner.color, false, out ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -518,7 +558,9 @@ final class SharedWorldRenderer implements AutoCloseable {
                         out ? DEPTH_ACCESS : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
             }
             vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barriers));
+            if(nativeTimers!=null)nativeTimers.end(command,timerSlot,2,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             check(vkEndCommandBuffer(command), "end native post");
+            recordNanos+=System.nanoTime()-recordStart;
             var waits = VkSemaphoreSubmitInfo.calloc(all.size(), stack);
             var signals = VkSemaphoreSubmitInfo.calloc(all.size(), stack);
             for (int i = 0; i < all.size(); i++) {
@@ -526,9 +568,10 @@ final class SharedWorldRenderer implements AutoCloseable {
                 signals.get(i).sType$Default().semaphore(all.get(i).color.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             }
             check(vkResetFences(context.device, slot.overlayFences[pass]), "reset native post fence");
-            context.uploads.flush(); check(vkQueueSubmit2(context.queue, VkSubmitInfo2.calloc(1, stack).sType$Default().pWaitSemaphoreInfos(waits).pSignalSemaphoreInfos(signals)
-                    .pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1, stack).sType$Default().commandBuffer(command)), slot.overlayFences[pass]), "submit native post");
+            flushUploads(); submit(VkSubmitInfo2.calloc(1, stack).sType$Default().pWaitSemaphoreInfos(waits).pSignalSemaphoreInfos(signals)
+                    .pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1, stack).sType$Default().commandBuffer(command)), slot.overlayFences[pass], "submit native post");
             slot.overlayPending[pass] = true; submits++;
+            if(nativeTimers!=null)nativeTimers.submitted(timerSlot);
         }
         for (var owner : all) owner.acquireGL();
         renderTargets.post();
@@ -538,9 +581,18 @@ final class SharedWorldRenderer implements AutoCloseable {
     void beginPostChain() { postChainDepth++; }
     void endPostChain() {
         if (postChainDepth <= 0) throw new IllegalStateException("Unbalanced native post chain");
-        if (--postChainDepth == 0) flushPosts();
+        if (--postChainDepth == 0 && nativeIntervalDepth == 0) flushPosts();
     }
-    /** Only the explicit PostChain scope may defer work; any GL fallback first drains it. */
+    /** Opt-in contract: no GL image access inside this interval without flushPosts() first. */
+    void beginNativeInterval() {
+        if (!optimizeInterop || nativeReading < 0) throw new IllegalStateException("Native interval requires an active optimized GL-VK terrain frame");
+        nativeIntervalDepth++;
+    }
+    void endNativeInterval() {
+        if (nativeIntervalDepth <= 0) throw new IllegalStateException("Unbalanced native interval");
+        if (--nativeIntervalDepth == 0 && postChainDepth == 0) flushPosts();
+    }
+    /** Explicit native scopes may defer work; any GL access/fallback first drains them. */
     void flushPosts() {
         if (pendingPosts.isEmpty()) return;
         if (nativeReading < 0) throw new IllegalStateException("Post batch outlived its terrain frame");
@@ -550,8 +602,10 @@ final class SharedWorldRenderer implements AutoCloseable {
         var command = slot.overlayCommands[first];
         // Build the whole command buffer while images remain GL-owned. A recording failure leaves every GL lease usable.
         try (var stack = MemoryStack.stackPush()) {
+            long recordStart=System.nanoTime();
             check(vkResetCommandBuffer(command,0),"reset post batch");
             check(vkBeginCommandBuffer(command,VkCommandBufferBeginInfo.calloc(stack).sType$Default().flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)),"begin post batch");
+            if(nativeTimers!=null){for(var item:pendingPosts)nativeTimers.begin(command,nativeReading*MAX_OVERLAYS+item.pass());nativeTimers.start(command,nativeReading*MAX_OVERLAYS+first,2,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);}
             var layouts = new java.util.LinkedHashMap<SharedRenderTargets.Target,Boolean>();
             for (var item : pendingPosts) {
                 try (var passStack = MemoryStack.stackPush()) {
@@ -564,7 +618,8 @@ final class SharedWorldRenderer implements AutoCloseable {
                         boolean depth=d==1; var image=depth?owner.depth:owner.color;
                         int layout=output?(depth?VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL):VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
                         long stage=output?(depth?DEPTH_STAGES:VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT):VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT|VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-                        long access=output?(depth?DEPTH_ACCESS:VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT):VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+                        // Composite LOAD and blending read the destination as well as writing it.
+                        long access=output?(depth?DEPTH_ACCESS:VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT):VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
                         if(previous==null)SharedRenderTargets.acquire(barriers.get(i*2+d),image,depth,layout,stage,access);
                         else layoutBarrier(barriers.get(i*2+d),image,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT,stage,access,
                                 previous?(depth?VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL):VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,layout,depth);
@@ -573,12 +628,22 @@ final class SharedWorldRenderer implements AutoCloseable {
                 }
                 vkCmdPipelineBarrier2(command,VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barriers));
                 var target=item.target();
-                var color=VkRenderingAttachmentInfo.calloc(1,stack).sType$Default().imageView(target.color.view()).imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL).loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
-                float[] clear=item.packet().length>7?(float[])item.packet()[7]:new float[]{1,1,1,0};for(int i=0;i<4;i++)color.clearValue().color().float32(i,clear[i]);
-                var depth=VkRenderingAttachmentInfo.calloc(stack).sType$Default().imageView(target.depth.view()).imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL).loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR).storeOp(VK_ATTACHMENT_STORE_OP_STORE);depth.clearValue().depthStencil().depth(1);
+                boolean isPost = item instanceof PendingPost;
+                int timerSlot=nativeReading*MAX_OVERLAYS+item.pass();
+                if(nativeTimers!=null)nativeTimers.start(command,timerSlot,isPost?1:0,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+                int load = isPost ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+                var color=VkRenderingAttachmentInfo.calloc(1,stack).sType$Default().imageView(target.color.view()).imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL).loadOp(load).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+                if (item instanceof PendingPost p) {
+                    float[] clear=p.packet().length>7?(float[])p.packet()[7]:new float[]{1,1,1,0};
+                    for(int i=0;i<4;i++)color.clearValue().color().float32(i,clear[i]);
+                }
+                var depth=VkRenderingAttachmentInfo.calloc(stack).sType$Default().imageView(target.depth.view()).imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL).loadOp(load).storeOp(VK_ATTACHMENT_STORE_OP_STORE);depth.clearValue().depthStencil().depth(1);
                 vkCmdBeginRendering(command,VkRenderingInfo.calloc(stack).sType$Default().layerCount(1).pColorAttachments(color).pDepthAttachment(depth).renderArea(r->r.extent(e->e.set(target.width,target.height))));
                 vkCmdSetViewport(command,0,VkViewport.calloc(1,stack).width(target.width).height(target.height).maxDepth(1));vkCmdSetScissor(command,0,VkRect2D.calloc(1,stack).extent(e->e.set(target.width,target.height)));
-                post.record(command,stack,nativeReading*MAX_OVERLAYS+item.pass(),item.packet(),item.inputs());vkCmdEndRendering(command);
+                if (item instanceof PendingPost p) post.record(command,stack,nativeReading*MAX_OVERLAYS+p.pass(),p.packet(),p.inputs());
+                else if (item instanceof PendingComposite c) composite.record(command,stack,nativeReading,c.kind()==1);
+                vkCmdEndRendering(command);
+                if(nativeTimers!=null)nativeTimers.end(command,timerSlot,isPost?1:0,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
                 }
             }
             var release=VkImageMemoryBarrier2.calloc(all.size()*2,stack);int i=0;
@@ -587,19 +652,41 @@ final class SharedWorldRenderer implements AutoCloseable {
                 SharedRenderTargets.release(release.get(i*2),owner.color,false,output?VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT);
                 SharedRenderTargets.release(release.get(i*2+1),owner.depth,true,output?VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT);i++;
             }
-            vkCmdPipelineBarrier2(command,VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(release));check(vkEndCommandBuffer(command),"end post batch");
+            vkCmdPipelineBarrier2(command,VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(release));if(nativeTimers!=null)nativeTimers.end(command,nativeReading*MAX_OVERLAYS+first,2,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);check(vkEndCommandBuffer(command),"end post batch");
+            recordNanos+=System.nanoTime()-recordStart;
             var waits=VkSemaphoreSubmitInfo.calloc(all.size(),stack);var signals=VkSemaphoreSubmitInfo.calloc(all.size(),stack);i=0;
             for(var owner:all){waits.get(i).sType$Default().semaphore(owner.color.complete).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);signals.get(i).sType$Default().semaphore(owner.color.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);i++;}
             // No allocation/compilation/recording can fail after the ownership changes.
-            check(vkResetFences(context.device,slot.overlayFences[first]),"reset post batch fence");context.uploads.flush();
+            check(vkResetFences(context.device,slot.overlayFences[first]),"reset post batch fence");flushUploads();
             for(var owner:all)owner.releaseGL();
-            check(vkQueueSubmit2(context.queue,VkSubmitInfo2.calloc(1,stack).sType$Default().pWaitSemaphoreInfos(waits).pSignalSemaphoreInfos(signals).pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1,stack).sType$Default().commandBuffer(command)),slot.overlayFences[first]),"submit post batch");
-            slot.overlayPending[first]=true;submits++;postBatches++;batchedPostPasses+=pendingPosts.size();
-            for(var item:pendingPosts)renderTargets.post();
+            submit(VkSubmitInfo2.calloc(1,stack).sType$Default().pWaitSemaphoreInfos(waits).pSignalSemaphoreInfos(signals).pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1,stack).sType$Default().commandBuffer(command)),slot.overlayFences[first],"submit post batch");
+            slot.overlayPending[first]=true;submits++;
+            int posts=0, composites=0;
+            for(var item:pendingPosts) {
+                if(nativeTimers!=null)nativeTimers.submitted(nativeReading*MAX_OVERLAYS+item.pass());
+                if(item instanceof PendingPost){renderTargets.post();posts++;}
+                else {renderTargets.composed(true);nativeComposites++;composites++;}
+            }
+            if(posts>0){postBatches++;batchedPostPasses+=posts;}
+            if(composites>0){mixedBatches++;batchedComposites+=composites;}
             for(var owner:all)owner.acquireGL();
         } finally { pendingPosts.clear(); }
     }
-    long[] interopStats(){return new long[]{depthCopies,avoidedDepthCopies,postBatches,batchedPostPasses,submits,SharedPresentImage.groupCalls};}
+    long[] interopStats(){return new long[]{depthCopies,avoidedDepthCopies,postBatches,batchedPostPasses,submits,SharedPresentImage.groupCalls,mixedBatches,batchedComposites,SharedPresentImage.groupImageReferences,queueSubmitNanos,fenceWaitNanos,SharedPresentImage.groupNanos};}
+    private void submit(VkSubmitInfo2.Buffer info, long fence, String stage) {
+        long start=System.nanoTime();
+        int result=vkQueueSubmit2(context.queue,info,fence);
+        queueSubmitNanos+=System.nanoTime()-start;
+        check(result,stage);
+    }
+    private void flushUploads(){long start=System.nanoTime();context.uploads.flush();uploadFlushNanos+=System.nanoTime()-start;}
+    double[] phaseProfile(){
+        waitAll();double[] a=new double[22];int p=0;
+        for(int metric:new int[]{0,4,3,5}){double[] m=timers.metric(metric);a[p++]=m[0];a[p++]=m[1];}
+        for(int metric=0;metric<2;metric++){double[] m=nativeTimers==null?new double[2]:nativeTimers.metric(metric);a[p++]=m[0];a[p++]=m[1];}
+        a[p++]=recordNanos/1e6;a[p++]=uploadFlushNanos/1e6;a[p++]=queueSubmitNanos/1e6;a[p++]=prepareNanos/1e6;
+        for(double v:timers.metric(6))a[p++]=v;for(double v:nativeTimers==null?new double[2]:nativeTimers.metric(2))a[p++]=v;a[p++]=queueGapMs;a[p]=envelopeMs;return a;
+    }
     /** Per-frame averages since the previous report. */
     private void reportSync() {
         long frameCount = frames - reportedFrames;
@@ -638,7 +725,7 @@ final class SharedWorldRenderer implements AutoCloseable {
     }
 
     void endRead() {
-        flushPosts();postChainDepth=0;
+        flushPosts();postChainDepth=0;nativeIntervalDepth=0;
         nativeReading = -1;
         if (reading >= 0) { int index = reading; reading = -1; slots[index].sceneFresh = false; SharedPresentImage.endGroupGL(slots[index].images()); }
         finishOverlay();
@@ -658,8 +745,10 @@ final class SharedWorldRenderer implements AutoCloseable {
             }
         }
         if(entityTimers!=null)for(int k=0;k<MAX_OVERLAYS;k++)entityTimers.collect(index*(MAX_OVERLAYS+1)+k);
+        if(nativeTimers!=null)for(int k=0;k<MAX_OVERLAYS;k++)nativeTimers.collect(index*MAX_OVERLAYS+k);
         if (!slot.pending) return;
         slot.pending = false; timers.collect(index);
+        if(nativeTimers!=null){long[] terrain=timers.range(index,6);if(terrain!=null){long last=terrain[1];for(int pass=0;pass<slot.overlays;pass++){long[] range=nativeTimers.range(index*MAX_OVERLAYS+pass,2);if(range!=null){queueGapMs+=timers.elapsedMs(last,range[0]);last=range[1];}}envelopeMs+=timers.elapsedMs(terrain[0],last);}}
         if (culler != null) culler.collect(index);
         completedFrames = Math.max(completedFrames, slot.serial);
         while (!retired.isEmpty() && retired.peekFirst().serial() <= completedFrames) retired.removeFirst().close().run();
@@ -720,6 +809,7 @@ final class SharedWorldRenderer implements AutoCloseable {
         }
         if (timers != null) { timers.report(log); timers.close(); timers = null; }
         if(entityTimers!=null){entityTimers.report(log);entityTimers.close();entityTimers=null;}
+        if(nativeTimers!=null){nativeTimers.report(log);nativeTimers.close();nativeTimers=null;}
         if (culler != null) { culler.report(log); culler = null; }
         core.close(); destroyTargets();
         if(composite!=null){composite.close();composite=null;}

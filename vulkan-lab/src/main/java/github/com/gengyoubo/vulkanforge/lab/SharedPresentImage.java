@@ -10,7 +10,7 @@ import static org.lwjgl.vulkan.KHRExternalMemoryWin32.*;
 import static org.lwjgl.vulkan.KHRExternalSemaphoreWin32.*;
 
 /** Exported Vulkan allocation; imported GL objects belong to the host's existing LWJGL. */
-final class SharedPresentImage implements AutoCloseable, VulkanImageBinding {
+final class SharedPresentImage implements VulkanRenderImage {
     final VulkanContext context;
     long image, memory, ready, complete, view;
     private long memoryHandle, readyHandle, completeHandle;
@@ -59,6 +59,7 @@ final class SharedPresentImage implements AutoCloseable, VulkanImageBinding {
                 .semaphore(semaphore).handleType(VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT), handle), "export GL semaphore"); return handle.get(0);
     }
     void copyFromGL(int source, int width, int height) { glImage.accept(new int[]{source, width, height}); }
+    @Override public long image() { return image; }
     @Override public long view() {
         if (view == 0) try (MemoryStack stack = MemoryStack.stackPush()) {
             var handle = stack.mallocLong(1);
@@ -86,11 +87,11 @@ final class SharedPresentImage implements AutoCloseable, VulkanImageBinding {
         int[] command = new int[images.length + 2], textures = new int[images.length]; command[0] = begin ? 3 : 4; command[1] = images.length;
         for (int i = 0; i < images.length; i++) command[i + 2] = textures[i] = images[i].textureGL();
         images[0].glImage.accept(command);
-        groupCalls++; groupNanos += System.nanoTime() - start;
+        groupCalls++; groupImageReferences += images.length; groupNanos += System.nanoTime() - start;
         return textures;
     }
     /** GL side of every grouped handoff (glWaitSemaphoreEXT, or glSignalSemaphoreEXT + glFlush); render thread only. */
-    static long groupCalls, groupNanos;
+    static long groupCalls, groupNanos, groupImageReferences;
     private static void closeHandle(long handle) {
         long function = org.lwjgl.system.windows.Kernel32.getLibrary().getFunctionAddress("CloseHandle");
         if (org.lwjgl.system.JNI.callPI(handle, function) == 0) throw new IllegalStateException("CloseHandle failed");

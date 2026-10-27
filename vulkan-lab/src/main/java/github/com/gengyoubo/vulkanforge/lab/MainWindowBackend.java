@@ -196,6 +196,7 @@ public final class MainWindowBackend implements AutoCloseable {
     public int renderWorldWithSky(int width, int height, Object[] sky) {
         return renderWorldWithSky(width,height,sky,false);
     }
+    /** nativeMode is the historical in-Vulkan composite path inside GL_VK; NativeWorldRenderer executes pure VK. */
     public int renderWorldWithSky(int width, int height, Object[] sky, boolean nativeMode) {
         var list = new java.util.ArrayList<Object[]>(sky.length);
         for (Object packet : sky) list.add((Object[]) packet);
@@ -204,7 +205,9 @@ public final class MainWindowBackend implements AutoCloseable {
     public boolean nativeComposite(int framebuffer,int width,int height,int kind,Object[] packets){
         if(world==null)return false;
         var list=new java.util.ArrayList<Object[]>();for(Object packet:packets)list.add((Object[])packet);
-        return world.composeNative(framebuffer,width,height,kind,list);
+        boolean supported=world.composeNative(framebuffer,width,height,kind,list);
+        if(!supported)flushNativePosts();
+        return supported;
     }
     private SharedRenderTargets targets() {
         if (renderTargets == null) renderTargets = new SharedRenderTargets(context, terrainImporter, finishGL, this::log);
@@ -217,7 +220,11 @@ public final class MainWindowBackend implements AutoCloseable {
     public void beginNativePostChain(){if(world!=null)world.beginPostChain();}
     public void endNativePostChain(){if(world!=null)world.endPostChain();}
     public void flushNativePosts(){if(world!=null)world.flushPosts();}
-    public long[] interopStats(){return world==null?new long[6]:world.interopStats();}
+    /** Experimental verified native-only interval. Call flushNativePosts BEFORE any GL image access. */
+    public void beginNativeInterval(){world().beginNativeInterval();}
+    public void endNativeInterval(){if(world==null)throw new IllegalStateException("No native interval");world.endNativeInterval();}
+    public long[] interopStats(){return world==null?new long[12]:world.interopStats();}
+    public double[] phaseProfile(){return world==null?new double[22]:world.phaseProfile();}
     /** Captured GUI packets, consumed exactly once by the next present (including skipped/minimized frames). */
     public void gui(Object[] packets) {
         var list = new java.util.ArrayList<Object[]>(packets.length);

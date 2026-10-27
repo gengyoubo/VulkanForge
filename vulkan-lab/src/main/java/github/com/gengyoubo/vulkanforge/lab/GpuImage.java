@@ -5,7 +5,7 @@ import org.lwjgl.vulkan.*;
 import static org.lwjgl.vulkan.VK10.*;
 import static github.com.gengyoubo.vulkanforge.lab.VulkanContext.check;
 
-final class GpuImage implements AutoCloseable, VulkanImageBinding {
+final class GpuImage implements VulkanRenderImage {
     private final VulkanContext context;
     final int width, height;
     long image, memory, view;
@@ -39,6 +39,7 @@ final class GpuImage implements AutoCloseable, VulkanImageBinding {
     }
 
     @Override public long view(){return view;}
+    @Override public long image(){return image;}
     @Override public void close() {
         if (view != 0) { vkDestroyImageView(context.device, view, null); view = 0; }
         if (image != 0) { vkDestroyImage(context.device, image, null); image = 0; }

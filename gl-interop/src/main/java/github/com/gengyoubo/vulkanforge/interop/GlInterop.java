@@ -13,6 +13,10 @@ import static org.lwjgl.opengl.EXTSemaphoreWin32.glImportSemaphoreWin32HandleEXT
 /** Compiled against each host's LWJGL. Only JDK interfaces and primitive arrays cross the loader boundary. */
 public final class GlInterop {
     private GlInterop() { }
+    private static final boolean PROFILE = Boolean.getBoolean("vulkanforge.interopProfile");
+    private static long waitCalls, signalCalls, flushCalls, waitNanos, signalNanos, flushNanos;
+    /** CPU call duration only; this does not measure the GPU's semaphore wait span. Host GL loader owns these counters. */
+    public static long[] groupedCpuStats() { return new long[]{waitCalls,signalCalls,flushCalls,waitNanos,signalNanos,flushNanos}; }
     public static byte[] deviceUUID() {
         var caps = GL.getCapabilities();
         if (!(caps.GL_EXT_memory_object_win32 && caps.GL_EXT_semaphore_win32)) throw new IllegalStateException("GL Win32 external memory/semaphore extensions are required");
@@ -118,8 +122,17 @@ public final class GlInterop {
                         var groupTextures = stack.mallocInt(source[1]); var groupLayouts = stack.mallocInt(source[1]);
                         for (int i = 0; i < source[1]; i++) { groupTextures.put(source[i + 2]); groupLayouts.put(GL_LAYOUT_GENERAL_EXT); }
                         groupTextures.flip(); groupLayouts.flip();
-                        if (source[0] == 3) glWaitSemaphoreEXT(ready, empty, groupTextures, groupLayouts);
-                        else { glSignalSemaphoreEXT(complete, empty, groupTextures, groupLayouts); glFlush(); }
+                        if (source[0] == 3) {
+                            long start=PROFILE?System.nanoTime():0;
+                            glWaitSemaphoreEXT(ready, empty, groupTextures, groupLayouts);
+                            if(PROFILE){waitCalls++;waitNanos+=System.nanoTime()-start;}
+                        } else {
+                            long start=PROFILE?System.nanoTime():0;
+                            glSignalSemaphoreEXT(complete, empty, groupTextures, groupLayouts);
+                            if(PROFILE){signalCalls++;signalNanos+=System.nanoTime()-start;start=System.nanoTime();}
+                            glFlush();
+                            if(PROFILE){flushCalls++;flushNanos+=System.nanoTime()-start;}
+                        }
                     }
                     else if (source[0] == 0) { glWaitSemaphoreEXT(ready, empty, textures, layouts); source[1] = texture; }
                     else if (source[0] == 1) { glSignalSemaphoreEXT(complete, empty, textures, layouts); glFlush(); }

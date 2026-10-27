@@ -17,7 +17,7 @@ import net.minecraftforge.fml.loading.FMLPaths;
 /**
  * Client config (config/vulkanforge-client.toml), edited from the Mods list "Config" button.
  * All values are startup choices: {@link #startup()} snapshots them once, before the game window exists.
- * Vulkan 1.2/1.3/1.4 (main-window presentation) and OpenGL 4.3 through 4.6 (GPU-driven terrain).
+ * Three modes: GL, GL_VK and experimental VK. Vulkan 1.2..1.4 and OpenGL 4.3..4.6 are API selections.
  */
 public final class VulkanForgeConfig {
     /** Legacy startup aliases. VULKAN means GL_VK, as it did before the mode split. */
@@ -118,7 +118,8 @@ public final class VulkanForgeConfig {
 
     /**
      * Minecraft creates its Window before Forge loads client configs, so the first call reads the TOML file directly.
-     * Missing files or invalid values fall back to the spec defaults. -Dvulkanforge.startup=OPENGL:GL_4_6 (or VULKAN:V1_4)
+     * Legacy renderer.backend is migrated without changing its meaning. Overrides: GL:GL_4_6, GL_VK:V1_4, VK:V1_4.
+     * OPENGL and VULKAN remain legacy aliases for GL and GL_VK.
      * overrides the file for this launch only, e.g. for smoke runs.
      */
     public static synchronized Startup startup() {

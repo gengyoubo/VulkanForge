@@ -16,8 +16,10 @@ public final class PipelineBenchmark implements AutoCloseable {
         default boolean post(Object[] packet){return false;}
         default void endPost(){ }
         default void endFrame(){ }
+        default void beforeRead(){ }
         default void audit(Path out) throws Exception { }
         default long[] counters(){return new long[6];}
+        default double[] profile(){return new double[0];}
     }
     public static final String VERTEX_GL="#version 430\nout vec2 uv;void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);uv=p;gl_Position=vec4(p*2.0-1.0,0,1);}";
     public static final String FRAGMENT_GL="#version 430\nin vec2 uv;out vec4 color;uniform sampler2D sourceColor;void main(){vec4 c=texture(sourceColor,uv);color=vec4(c.rgb*.875+vec3(.03125),1);}";
@@ -40,7 +42,7 @@ public final class PipelineBenchmark implements AutoCloseable {
     private void frame(int slot,Path capture) throws Exception {
         Target scene=targets[slot][0];glBindFramebuffer(GL_FRAMEBUFFER,scene.framebuffer());glViewport(0,0,width,height);
         renderer.terrain(scene,slot);
-        if(capture!=null)capture(capture,"scene",scene);
+        if(capture!=null){renderer.beforeRead();capture(capture,"scene",scene);}
         actualPosts[slot]=0;
         if(passes!=0){renderer.beginPost();try{
             for(int p=0;p<passes;p++) {
@@ -55,7 +57,7 @@ public final class PipelineBenchmark implements AutoCloseable {
     public void run(Path out,String api,int warmup,double seconds) throws Exception {
         Files.createDirectories(out);for(int i=0;i<warmup;i++){int s=(int)(sequence++%2);waitSlot(s);frame(s,null);fence(s);}drain();
         for(int s=0;s<2;s++){frame(s,s==0?out:null);fence(s);}drain();renderer.audit(out);
-        long[] counters0=renderer.counters();long[] cpu=new long[262144];long frames=0,completed=0;double gpu=0;double[] times=new double[2];boolean[] pending=new boolean[2];
+        double[] profile0=renderer.profile();long[] counters0=renderer.counters();long[] cpu=new long[262144];long frames=0,completed=0;double gpu=0;double[] times=new double[2];boolean[] pending=new boolean[2];
         long beginEpoch=System.currentTimeMillis(),begin=System.nanoTime();
         do {
             long t=System.nanoTime();int s=(int)(sequence++%2);waitSlot(s);
@@ -69,6 +71,12 @@ public final class PipelineBenchmark implements AutoCloseable {
         long[] counters=renderer.counters();StringBuilder audit=new StringBuilder("POST_PASSES_PER_FRAME="+passes+"\nSLOTS=2\nCOLOR=RGBA8\nDEPTH=D32F\nPRESENT_CALLS=0\n");
         for(int i=0;i<counters.length;i++)audit.append("COUNTER_").append(i).append("_PER_FRAME=").append((double)(counters[i]-counters0[i])/frames).append('\n');
         if(actualPosts[0]!=passes||actualPosts[1]!=passes)throw new AssertionError("Post pass workload changed");Files.writeString(out.resolve("pipeline-audit.txt"),audit);
+        double[] profile=renderer.profile();StringBuilder detail=new StringBuilder();String[] metrics={"VK_OPAQUE_MS","VK_TRANSLUCENT_MS","VK_CULL_MS","VK_DEPTH_COPY_MS","VK_COMPOSITE_MS","VK_POST_MS"};
+        for(int i=0;i<Math.min(6,profile.length/2);i++){detail.append(metrics[i]).append('=').append((profile[i*2+1]-profile0[i*2+1])/frames).append('\n');detail.append(metrics[i]).append("_SAMPLES_PER_FRAME=").append((profile[i*2]-profile0[i*2])/frames).append('\n');}
+        if(profile.length>=15){String[] names={"CPU_RECORD_MS","CPU_UPLOAD_FLUSH_MS","CPU_QUEUE_SUBMIT_MS"};for(int i=0;i<3;i++)detail.append(names[i]).append('=').append((profile[12+i]-profile0[12+i])/frames).append('\n');}if(profile.length>=16)detail.append("CPU_PREPARE_MS=").append((profile[15]-profile0[15])/frames).append('\n');
+        if(profile.length>=22){double bodies=(profile[17]-profile0[17]+profile[19]-profile0[19])/frames,gap=(profile[20]-profile0[20])/frames,envelope=(profile[21]-profile0[21])/frames,passes=0;for(int i=0;i<6;i++)passes+=(profile[i*2+1]-profile0[i*2+1])/frames;
+            detail.append("VK_TERRAIN_SUBMIT_BODY_MS=").append((profile[17]-profile0[17])/frames).append('\n').append("VK_NATIVE_SUBMIT_BODY_MS=").append((profile[19]-profile0[19])/frames).append('\n').append("VK_SUBMIT_BODY_SUM_MS=").append(bodies).append('\n').append("VK_QUEUE_GAPS_MS=").append(gap).append('\n').append("VK_QUEUE_ENVELOPE_MS=").append(envelope).append('\n').append("VK_INSIDE_BODIES_UNATTRIBUTED_MS=").append(bodies-passes).append('\n').append("VK_ENVELOPE_ACCOUNTING_ERROR_MS=").append(envelope-bodies-gap).append('\n');}
+        Files.writeString(out.resolve("phase-profile.txt"),detail);
         String result=String.format(Locale.ROOT,"PIPELINE_RESULT API=%s frames=%d seconds=%.6f FPS=%.3f GPU_MS=%.6f CPU_P50_MS=%.6f CPU_P99_MS=%.6f CPU_MAX_MS=%.6f DRAIN_MS=%.6f POST_PASSES=%d START_MS=%d END_MS=%d",api,frames,(end-begin)/1e9,frames/((end-begin)/1e9),gpu/frames,sorted[(sorted.length-1)/2]/1e6,sorted[(sorted.length-1)*99/100]/1e6,sorted[sorted.length-1]/1e6,(end-drainStart)/1e6,passes,beginEpoch,endEpoch);
         Files.writeString(out.resolve("pipeline-result.txt"),result+"\n");System.out.println(result);
         frame(0,null);fence(0);drain();renderer.audit(out);capture(out,"after-final",targets[0][passes%2]);
