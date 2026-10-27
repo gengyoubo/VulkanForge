@@ -64,6 +64,12 @@ final class SharedWorldRenderer implements AutoCloseable {
     private int nativeReading = -1;
     private long nativeComposites, nativeEntityPasses;
     private long overlayPasses, skyDraws, handoffGroups, handoffImages;
+    private final boolean optimizeInterop = !Boolean.getBoolean("vulkanforge.noInteropOptimizations");
+    private int postChainDepth;
+    private record PendingPost(Object[] packet, SharedRenderTargets.Target target, SharedPresentImage[] inputs,
+                               java.util.List<SharedRenderTargets.Target> owners, int pass) { }
+    private final java.util.ArrayList<PendingPost> pendingPosts = new java.util.ArrayList<>();
+    private long depthCopies, avoidedDepthCopies, postBatches, batchedPostPasses;
     /** Sync-chain cost per frame: queue submits, CPU blocked in fence waits, GL semaphore calls (see SharedPresentImage.groupNanos). */
     private long submits, fenceWaitNanos, maxFenceWaitNanos, reportedFrames, reportedSubmits, reportedFenceNanos, reportedGlCalls, reportedGlNanos;
     private int depthTexture, translucentTexture, translucentDepthTexture;
@@ -207,7 +213,7 @@ final class SharedWorldRenderer implements AutoCloseable {
             var copy = VkImageCopy.calloc(1, stack).srcSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).layerCount(1))
                     .dstSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).layerCount(1)).extent(e -> e.set(width, height, 1));
             vkCmdCopyImage(command, slot.depth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.translucentDepth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy);
-            if (terrain) {
+            if (terrain && (!nativeMode || !optimizeInterop)) {
                 // Entities test against Vulkan terrain depth; the copy stays Vulkan-owned in TRANSFER_DST until the entity submit.
                 var scene = VkImageMemoryBarrier2.calloc(1, stack).sType$Default().srcStageMask(VK_PIPELINE_STAGE_2_NONE)
                         .dstStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).dstAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
@@ -217,7 +223,9 @@ final class SharedWorldRenderer implements AutoCloseable {
                 vkCmdPipelineBarrier2(command, VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(scene));
                 vkCmdCopyImage(command, slot.depth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.sceneDepth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy);
             }
-            slot.sceneFresh = terrain; slot.sceneReadable = false; slot.overlays = 0;
+            depthCopies++; // Opaque -> independent translucent depth is needed for the later GL/entity ordering.
+            if (terrain && (!nativeMode || !optimizeInterop)) depthCopies++; else if (terrain) avoidedDepthCopies++;
+            slot.sceneFresh = terrain && (!nativeMode || !optimizeInterop); slot.sceneReadable = false; slot.overlays = 0;
             var toTest = VkImageMemoryBarrier2.calloc(1, stack);
             layoutBarrier(toTest.get(0), slot.translucentDepth, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, DEPTH_STAGES, DEPTH_ACCESS,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, true);
@@ -383,6 +391,7 @@ final class SharedWorldRenderer implements AutoCloseable {
 
     boolean nativeReady() { return nativeReading >= 0; }
     boolean composeNative(int framebuffer, int targetWidth, int targetHeight, int kind, java.util.List<Object[]> packets) {
+        flushPosts();
         if (nativeReading < 0) return false;
         var target = renderTargets.get(framebuffer, targetWidth, targetHeight);
         if ((target == null || kind < 2) && (targetWidth != width || targetHeight != height)) return false;
@@ -447,6 +456,8 @@ final class SharedWorldRenderer implements AutoCloseable {
     /** Post inputs remain GPU images; all preflight checks run before changing ownership or recording output. */
     boolean postNative(Object[] packet) {
         if (nativeReading < 0) return false;
+        if(packet.length<6||!(packet[3] instanceof int[] meta)||meta.length==0||meta.length%5!=0||!(packet[4] instanceof float[] values)||values.length>256
+                ||!(packet[5] instanceof int[] dimensions)||dimensions.length!=3||(packet.length>7&&(!(packet[7] instanceof float[] clear)||clear.length!=4)))return false;
         int[] output = (int[]) packet[5], metadata = (int[]) packet[3];
         var target = renderTargets.get(output[0], output[1], output[2]);
         if (target == null || metadata.length == 0 || metadata.length % 5 != 0) return false;
@@ -472,6 +483,10 @@ final class SharedWorldRenderer implements AutoCloseable {
             return false;
         }
         int pass = slot.overlays++;
+        if (optimizeInterop && postChainDepth > 0) {
+            pendingPosts.add(new PendingPost(packet, target, inputs, java.util.List.copyOf(owners), pass));
+            return true;
+        }
         var all = new java.util.ArrayList<>(owners); all.add(target);
         for (var owner : all) owner.releaseGL();
         try (var stack = MemoryStack.stackPush()) {
@@ -528,6 +543,72 @@ final class SharedWorldRenderer implements AutoCloseable {
         renderTargets.post();
         return true;
     }
+
+    void beginPostChain() { postChainDepth++; }
+    void endPostChain() {
+        if (postChainDepth <= 0) throw new IllegalStateException("Unbalanced native post chain");
+        if (--postChainDepth == 0) flushPosts();
+    }
+    /** Only the explicit PostChain scope may defer work; any GL fallback first drains it. */
+    void flushPosts() {
+        if (pendingPosts.isEmpty()) return;
+        if (nativeReading < 0) throw new IllegalStateException("Post batch outlived its terrain frame");
+        var all = new java.util.LinkedHashSet<SharedRenderTargets.Target>();
+        for (var item : pendingPosts) { all.addAll(item.owners()); all.add(item.target()); }
+        Slot slot = slots[nativeReading]; int first = pendingPosts.get(0).pass();
+        var command = slot.overlayCommands[first];
+        // Build the whole command buffer while images remain GL-owned. A recording failure leaves every GL lease usable.
+        try (var stack = MemoryStack.stackPush()) {
+            check(vkResetCommandBuffer(command,0),"reset post batch");
+            check(vkBeginCommandBuffer(command,VkCommandBufferBeginInfo.calloc(stack).sType$Default().flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)),"begin post batch");
+            var layouts = new java.util.LinkedHashMap<SharedRenderTargets.Target,Boolean>();
+            for (var item : pendingPosts) {
+                try (var passStack = MemoryStack.stackPush()) {
+                // Per-pass native scratch is reclaimed even for long chains.
+                var touched = new java.util.ArrayList<>(item.owners()); touched.add(item.target());
+                var barriers = VkImageMemoryBarrier2.calloc(touched.size()*2,passStack);
+                for(int i=0;i<touched.size();i++) {
+                    var owner=touched.get(i); boolean output=owner==item.target(); Boolean previous=layouts.get(owner);
+                    for(int d=0;d<2;d++) {
+                        boolean depth=d==1; var image=depth?owner.depth:owner.color;
+                        int layout=output?(depth?VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL):VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        long stage=output?(depth?DEPTH_STAGES:VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT):VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT|VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+                        long access=output?(depth?DEPTH_ACCESS:VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT):VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+                        if(previous==null)SharedRenderTargets.acquire(barriers.get(i*2+d),image,depth,layout,stage,access);
+                        else layoutBarrier(barriers.get(i*2+d),image,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT,stage,access,
+                                previous?(depth?VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL):VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,layout,depth);
+                    }
+                    layouts.put(owner,output);
+                }
+                vkCmdPipelineBarrier2(command,VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barriers));
+                var target=item.target();
+                var color=VkRenderingAttachmentInfo.calloc(1,stack).sType$Default().imageView(target.color.view()).imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL).loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+                float[] clear=item.packet().length>7?(float[])item.packet()[7]:new float[]{1,1,1,0};for(int i=0;i<4;i++)color.clearValue().color().float32(i,clear[i]);
+                var depth=VkRenderingAttachmentInfo.calloc(stack).sType$Default().imageView(target.depth.view()).imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL).loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR).storeOp(VK_ATTACHMENT_STORE_OP_STORE);depth.clearValue().depthStencil().depth(1);
+                vkCmdBeginRendering(command,VkRenderingInfo.calloc(stack).sType$Default().layerCount(1).pColorAttachments(color).pDepthAttachment(depth).renderArea(r->r.extent(e->e.set(target.width,target.height))));
+                vkCmdSetViewport(command,0,VkViewport.calloc(1,stack).width(target.width).height(target.height).maxDepth(1));vkCmdSetScissor(command,0,VkRect2D.calloc(1,stack).extent(e->e.set(target.width,target.height)));
+                post.record(command,stack,nativeReading*MAX_OVERLAYS+item.pass(),item.packet(),item.inputs());vkCmdEndRendering(command);
+                }
+            }
+            var release=VkImageMemoryBarrier2.calloc(all.size()*2,stack);int i=0;
+            for(var owner:all) {
+                boolean output=layouts.get(owner);
+                SharedRenderTargets.release(release.get(i*2),owner.color,false,output?VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT);
+                SharedRenderTargets.release(release.get(i*2+1),owner.depth,true,output?VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT);i++;
+            }
+            vkCmdPipelineBarrier2(command,VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(release));check(vkEndCommandBuffer(command),"end post batch");
+            var waits=VkSemaphoreSubmitInfo.calloc(all.size(),stack);var signals=VkSemaphoreSubmitInfo.calloc(all.size(),stack);i=0;
+            for(var owner:all){waits.get(i).sType$Default().semaphore(owner.color.complete).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);signals.get(i).sType$Default().semaphore(owner.color.ready).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);i++;}
+            // No allocation/compilation/recording can fail after the ownership changes.
+            check(vkResetFences(context.device,slot.overlayFences[first]),"reset post batch fence");context.uploads.flush();
+            for(var owner:all)owner.releaseGL();
+            check(vkQueueSubmit2(context.queue,VkSubmitInfo2.calloc(1,stack).sType$Default().pWaitSemaphoreInfos(waits).pSignalSemaphoreInfos(signals).pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1,stack).sType$Default().commandBuffer(command)),slot.overlayFences[first]),"submit post batch");
+            slot.overlayPending[first]=true;submits++;postBatches++;batchedPostPasses+=pendingPosts.size();
+            for(var item:pendingPosts)renderTargets.post();
+            for(var owner:all)owner.acquireGL();
+        } finally { pendingPosts.clear(); }
+    }
+    long[] interopStats(){return new long[]{depthCopies,avoidedDepthCopies,postBatches,batchedPostPasses,submits,SharedPresentImage.groupCalls};}
     /** Per-frame averages since the previous report. */
     private void reportSync() {
         long frameCount = frames - reportedFrames;
@@ -566,6 +647,7 @@ final class SharedWorldRenderer implements AutoCloseable {
     }
 
     void endRead() {
+        flushPosts();postChainDepth=0;
         nativeReading = -1;
         if (reading >= 0) { int index = reading; reading = -1; slots[index].sceneFresh = false; SharedPresentImage.endGroupGL(slots[index].images()); }
         finishOverlay();

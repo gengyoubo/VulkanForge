@@ -312,6 +312,12 @@ Forge 早期窗口按 4.6 → 3.2 依次尝试，已经拿到驱动支持的最�
 
 2026-10-27 的计数低频采样、空层跳过、状态差异恢复 A/B，以及 Bindless / 实例缓存 / Vulkan P99 的验证范围见 [性能调优记录](docs/performance-tuning.md)。默认每 60 帧尝试采集一次地形统计，并跳过完全没有驻留网格的不透明层；状态差异恢复保留为可选项。
 
+跨 API 比较采用 [统一三层 Benchmark](docs/unified-benchmark.md)：先核对实际提交 ID、GPU 顶点计数与完整颜色/深度，再分别比较 Baseline、GPU Driven 和 Full Pipeline。受控合成负载的 FPS 与原有地形/实体分项数据不能直接拼成完整游戏性能结论。
+
+共享图像和 Semaphore 的固定成本、兼容 Draw、深度复制与交接次数使用 [A / B / C / D 对照](docs/interop-ablation.md) 分别测量，保留零绘制控制、单向完成延迟、原始 CPU 帧和最终排空数据。
+
+原生路径避免未使用的 overlay 深度副本，连续后处理在明确的 PostChain 范围内合并；实现边界、原版 GL / GL46 / VK14 五轮复测见 [交接与复制优化](docs/interop-optimization.md)。
+
 Vulkan 地形之后到 `AFTER_BLOCK_ENTITIES` 之间，`NEW_ENTITY` 格式的 `rendertype_entity_*` / `armor_cutout_no_cull` / `entity_shadow` 绘制被复制进持久映射环形缓冲；256 字节逐绘制记录（矩阵、ColorModulator、光照方向、雾）放在 SSBO，每条间接命令的 `baseInstance` 是记录下标，SSBO 每次刷新只绑定一次。不透明绘制按 GL 状态与贴图分组（首次出现顺序），混合绘制保持原顺序并放在之后，每组一次 `glMultiDrawElementsIndirect`；连续 QUADS 使用静态四边形索引，不在 CPU 写索引。其他绘制（发光、文字、输出到其他 framebuffer 等）先刷新已捕获部分再由原版绘制，保持画家顺序。Fabulous 模式不启用实体通道。
 
 GL 状态不再用 `glGet*` 查询：`GlStateCache` 按类型反射读取原版 `GlStateManager` 与 `ShaderInstance` 的缓存（生产环境字段名为 SRG），创建时与真实 GL 状态比对，不一致或布局不符则退回查询；`-Pgl46Verify` 会逐次比对（检查中 79752 次全部一致）。顶点数组不恢复，而是令 `BufferUploader` 失效，原版每次绘制前都会重新绑定。

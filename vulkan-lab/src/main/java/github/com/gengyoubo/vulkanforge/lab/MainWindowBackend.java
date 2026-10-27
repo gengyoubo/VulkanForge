@@ -211,9 +211,13 @@ public final class MainWindowBackend implements AutoCloseable {
         return renderTargets;
     }
     public int[] createRenderTarget(int framebuffer, int width, int height) { return targets().create(framebuffer, width, height); }
-    public void destroyRenderTarget(int framebuffer) { if (renderTargets != null) renderTargets.destroy(framebuffer); }
+    public void destroyRenderTarget(int framebuffer) { flushNativePosts(); if (renderTargets != null) renderTargets.destroy(framebuffer); }
     public long[] renderTargetStats() { return renderTargets == null ? new long[6] : renderTargets.stats(); }
-    public boolean nativePost(Object[] packet) { return world != null && world.postNative(packet); }
+    public boolean nativePost(Object[] packet) { boolean supported=world != null && world.postNative(packet);if(!supported)flushNativePosts();return supported; }
+    public void beginNativePostChain(){if(world!=null)world.beginPostChain();}
+    public void endNativePostChain(){if(world!=null)world.endPostChain();}
+    public void flushNativePosts(){if(world!=null)world.flushPosts();}
+    public long[] interopStats(){return world==null?new long[6]:world.interopStats();}
     /** Captured GUI packets, consumed exactly once by the next present (including skipped/minimized frames). */
     public void gui(Object[] packets) {
         var list = new java.util.ArrayList<Object[]>(packets.length);

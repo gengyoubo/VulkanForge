@@ -78,6 +78,16 @@ public final class VanillaGlOffscreenBenchmark {
             }
             glViewport(0,0,WIDTH,HEIGHT);
             RenderSystem.disableCull();RenderSystem.enableCull();RenderSystem.disableDepthTest();RenderSystem.enableDepthTest();
+            if(Boolean.getBoolean("bench.pipeline")) {
+                try(var pipeline=new dev.vulkanforge.bench.PipelineBenchmark(WIDTH,HEIGHT,new dev.vulkanforge.bench.PipelineBenchmark.Renderer(){
+                    public void terrain(dev.vulkanforge.bench.PipelineBenchmark.Target target,int slot){frame();}
+                    public void audit(Path out) throws Exception {Map<Long,Long> opaque=new TreeMap<>(),glass=new TreeMap<>();for(var s:sections)if(s.opaque()!=null)opaque.put(s.key(),s.opaqueQuads());for(var s:translucent)glass.put(s.key(),s.translucentQuads());Workload.audit(out.resolve("workload.txt"),opaque,glass);}
+                },null,null)) {
+                    glDisable(GL_DITHER);glDisable(GL_FRAMEBUFFER_SRGB);
+                    pipeline.run(output,"VANILLA_GL",Integer.getInteger("bench.warmup",2000),Double.parseDouble(System.getProperty("bench.seconds","6")));
+                }
+                report.add("PIPELINE_STATUS=OK");return;
+            }
             int warmup=Integer.getInteger("bench.warmup",2000);
             for(int i=0;i<warmup;i++) frame();glFinish();
             long beforeOpaque=opaqueDraws,beforeTranslucent=translucentDraws;frame();glFinish();
@@ -134,9 +144,9 @@ public final class VanillaGlOffscreenBenchmark {
     }
     private static void frame() {
         RenderSystem.depthMask(true);glClearColor(.5f,.7f,1,0);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
-        RenderSystem.enableDepthTest();RenderSystem.depthFunc(GL_LEQUAL);RenderSystem.enableCull();RenderSystem.disableBlend();
+        RenderSystem.enableDepthTest();RenderSystem.depthFunc(GL_LEQUAL);if(Boolean.getBoolean("bench.matchVulkanRaster"))RenderSystem.disableCull();else RenderSystem.enableCull();RenderSystem.disableBlend();
         layer(solidShader,sections,false);
-        RenderSystem.enableBlend();RenderSystem.defaultBlendFunc();layer(translucentShader,translucent,true);
+        RenderSystem.enableCull();RenderSystem.enableBlend();RenderSystem.defaultBlendFunc();layer(translucentShader,translucent,true);
     }
     /** Same shader-per-layer, ChunkOffset upload, VBO bind/draw sequence as LevelRenderer.renderChunkLayer. */
     private static void layer(ShaderInstance shader,List<Section> list,boolean transparent) {

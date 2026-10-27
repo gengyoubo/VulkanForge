@@ -14,6 +14,9 @@ final class BenchmarkDrawAudit {
         Method method=object.getClass().getDeclaredMethod(name); method.setAccessible(true); return method.invoke(object);
     }
     static void write(MainWindowBackend backend,Path output) throws Exception {
+        write(backend,output,false);
+    }
+    static void write(MainWindowBackend backend,Path output,boolean nativeMode) throws Exception {
         Object shared=field(backend,"world"), scene=field(shared,"world"), culler=field(shared,"culler");
         @SuppressWarnings("unchecked") Map<Long,?> sections=(Map<Long,?>)field(scene,"sections");
         Map<Integer,Long> keys=new HashMap<>(); Map<Long,Long> translucent=new TreeMap<>();
@@ -24,7 +27,7 @@ final class BenchmarkDrawAudit {
         }
         long before=(Long)field(scene,"translucentDraws");
         long[] size=backend.worldStats();
-        for(int i=0;i<2;i++) { backend.renderWorld((int)size[4],(int)size[5]); backend.finishWorldFrame(); }
+        for(int i=0;i<2;i++) { if(nativeMode)backend.renderWorldWithSky((int)size[4],(int)size[5],new Object[0],true);else backend.renderWorld((int)size[4],(int)size[5]); backend.finishWorldFrame(); }
         new BenchmarkScene.Probe(backend).drain();
         if((Long)field(scene,"translucentDraws")-before!=2L*translucent.size())
             throw new AssertionError("Actual Vulkan translucent submissions differ from the audited list");

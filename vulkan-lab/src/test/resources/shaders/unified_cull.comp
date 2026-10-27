@@ -1,0 +1,13 @@
+#include "unified_common.glsl"
+layout(local_size_x=64) in;
+struct Command { uint count; uint instances; uint firstIndex; int vertexOffset; uint firstInstance; };
+layout(SET0 std430,binding=1) writeonly buffer Commands { Command commands[]; };
+layout(SET0 std430,binding=2) readonly buffer Parameters { uint drawCount; };
+void main(){
+    uint id=gl_GlobalInvocationID.x;if(id>=drawCount)return;
+    Record r=records[id];
+    vec3 lo=vec3(r.rect.xy-r.rect.zw,r.details.x-r.details.y);
+    vec3 hi=vec3(r.rect.xy+r.rect.zw,r.details.x+r.details.y);
+    bool visible=all(lessThanEqual(lo,vec3(1.0)))&&all(greaterThanEqual(hi,vec3(-1.0)));
+    commands[id]=Command(visible?36u:0u,1u,0u,0,id);
+}

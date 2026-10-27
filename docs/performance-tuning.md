@@ -4,6 +4,12 @@ ImmediatelyFast、Embeddium、Flywheel、Nvidium 与 Iris 的固定版本源码�
 
 Vulkan 大量实体的捕获/回放分项、去掉合批中间数组的实测和实际场景诊断参数见 [实体性能记录](entity-performance.md)。
 
+按相同输入、GPU 实际提交与颜色/深度结果核对的三层跨 API 实验见 [统一 Benchmark](unified-benchmark.md)。
+
+进一步拆分外部共享图像交接、兼容 Draw、深度复制和交接次数的实验见 [A / B / C / D 对照](interop-ablation.md)。
+
+原生 Vulkan 的深度复制裁减与后处理提交合并，以及原版 GL / GL46 / VK14 对照方法见 [交接与复制优化](interop-optimization.md)。
+
 ## 已接入的运行时优化
 
 | JVM 属性 | 默认值 | 行为 |

@@ -73,6 +73,16 @@ public final class GlOffscreenBenchmark {
                     if(!GlStateCache.initialise())throw new AssertionError("Benchmark state cache not coherent");
                     report.add("BENCH_STATE_CACHE_TRUSTED=true");
                 }
+                if(Boolean.getBoolean("bench.pipeline")) {
+                    final int atlasTexture=atlas,lightTexture=light;
+                    try(var pipeline=new dev.vulkanforge.bench.PipelineBenchmark(width,height,new dev.vulkanforge.bench.PipelineBenchmark.Renderer(){
+                        public void terrain(dev.vulkanforge.bench.PipelineBenchmark.Target target,int slot){frame(terrain,atlasTexture,lightTexture);}
+                        public void audit(Path out) throws Exception {dev.vulkanforge.bench.Workload.audit(out.resolve("workload.txt"),terrain.auditOpaqueDraws(),terrain.auditTranslucentDraws());}
+                    },null,null)) {
+                        glDisable(GL_DITHER);glDisable(GL_FRAMEBUFFER_SRGB);pipeline.run(directory,"CUSTOM_GL46",warmup,minimumSeconds);
+                    }
+                    report.add("PIPELINE_STATUS=OK");return;
+                }
                 for (int i = 0; i < warmup; i++) frame(terrain, atlas, light);
                 glFinish();
                 if (Boolean.getBoolean("bench.audit")) dev.vulkanforge.bench.Workload.audit(directory.resolve("workload.txt"),terrain.auditOpaqueDraws(),terrain.auditTranslucentDraws());

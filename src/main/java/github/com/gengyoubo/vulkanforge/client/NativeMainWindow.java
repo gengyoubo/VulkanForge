@@ -28,6 +28,7 @@ public final class NativeMainWindow {
     private static Method present, beginFrame, setVsync, frames, generations, capture, close, earlyAcquires, lateAcquires;
     private static Method hand, handPasses;
     private static Method nativeComposite, nativePost, createRenderTarget, destroyRenderTarget, renderTargetStats, presentationStats;
+    private static Method beginNativePostChain,endNativePostChain,flushNativePosts;
     private static Method renderWorld, renderWorldWithSky, worldStats, finishWorldFrame, closeWorld, renderOverlay, finishOverlay, entityTexture, entityTexturePatch, gui, guiPasses, optimizationStats, uploadStats, tryWorldCommand, memoryStats, guiBindingStats;
     private static Consumer<Object[]> worldCommands;
 
@@ -67,6 +68,7 @@ public final class NativeMainWindow {
             nativeComposite=type.getMethod("nativeComposite",int.class,int.class,int.class,int.class,Object[].class);
             // Optional until the backend implements it; PostEffects falls back to vanilla post passes on false.
             try { nativePost = type.getMethod("nativePost", Object[].class); } catch (NoSuchMethodException missing) { nativePost = null; }
+            beginNativePostChain=type.getMethod("beginNativePostChain");endNativePostChain=type.getMethod("endNativePostChain");flushNativePosts=type.getMethod("flushNativePosts");
 
             createRenderTarget=type.getMethod("createRenderTarget",int.class,int.class,int.class);
             destroyRenderTarget=type.getMethod("destroyRenderTarget",int.class);
@@ -202,6 +204,9 @@ public final class NativeMainWindow {
         return (Boolean)call(nativeComposite,framebuffer,viewport[2],viewport[3],kind,(Object)packets);
     }
     static boolean nativePost(Object[] pass) { return active() && nativePost != null && (Boolean) call(nativePost, (Object) pass); }
+    static void beginNativePostChain(){if(active())call(beginNativePostChain);}
+    static void endNativePostChain(){if(active())call(endNativePostChain);}
+    static void flushNativePosts(){if(active())call(flushNativePosts);}
     static int[] createRenderTarget(int framebuffer, int width, int height) { return active() ? (int[]) call(createRenderTarget, framebuffer, width, height) : null; }
     static void destroyRenderTarget(int framebuffer) { if (active()) call(destroyRenderTarget, framebuffer); }
     static long[] renderTargetStats() { return active() ? (long[]) call(renderTargetStats) : new long[6]; }
@@ -239,6 +244,7 @@ public final class NativeMainWindow {
         finally {
             backend = null; present = beginFrame = setVsync = frames = generations = capture = close = earlyAcquires = lateAcquires = null;
             hand = handPasses = nativeComposite = nativePost = createRenderTarget = destroyRenderTarget = renderTargetStats = presentationStats = null;
+            beginNativePostChain=endNativePostChain=flushNativePosts=null;
             renderWorld = renderWorldWithSky = worldStats = finishWorldFrame = closeWorld = renderOverlay = finishOverlay = entityTexture = entityTexturePatch = gui = guiPasses = optimizationStats = uploadStats = tryWorldCommand = memoryStats = guiBindingStats = null; worldCommands = null;
             try { if (loader != null) loader.close(); } catch (Exception error) { LOGGER.warn("Could not close backend loader", error); }
             loader = null;

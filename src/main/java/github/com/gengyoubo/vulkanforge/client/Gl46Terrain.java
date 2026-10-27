@@ -149,7 +149,7 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
     private boolean receivedMesh;
     // Opt-in A/B: CPU generates the same compact commands; MDI, Indirect Count and shader format stay independent.
     private final boolean cpuDriven = Boolean.getBoolean("vulkanforge.gl46.noGpuDriven");
-    private static final boolean MATCH_VULKAN_RASTER = Boolean.getBoolean("bench.matchVulkanTargets");
+    private static final boolean MATCH_VULKAN_RASTER = Boolean.getBoolean("bench.matchVulkanTargets") || Boolean.getBoolean("bench.matchVulkanRaster");
     private record CpuSection(int x, int y, int z, float[] bounds, int first, int[] quads) { }
     private final Map<Integer, CpuSection> cpuSections = new HashMap<>();
     private ByteBuffer cpuCommands;

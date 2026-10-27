@@ -20,18 +20,23 @@ public final class PostEffects {
     private static final Pattern UNIFORM=Pattern.compile("uniform\\s+(\\w+)\\s+(\\w+)\\s*;");
     private static final Pattern IO=Pattern.compile("(?m)^\\s*(in|out)\\s+(\\w+)\\s+(\\w+)\\s*;");
     private static long passes,fallbacks;
+    private static final java.util.ArrayDeque<Boolean> chainScopes=new java.util.ArrayDeque<>();
     private PostEffects(){}
+    public static void beginChain(){boolean enabled=VulkanPreview.nativeTerrain();if(enabled)NativeMainWindow.beginNativePostChain();chainScopes.push(enabled);}
+    public static void endChain(){if(chainScopes.isEmpty())throw new IllegalStateException("Unbalanced post chain");if(chainScopes.pop())NativeMainWindow.endNativePostChain();}
+    public static void endChainOnFailure(Throwable failure){try{endChain();}catch(Throwable endFailure){failure.addSuppressed(endFailure);}}
+    private static boolean fallback(){NativeMainWindow.flushNativePosts();return false;}
     public static boolean process(PostPass pass,float time){
-        if(!VulkanPreview.nativeTerrain())return false;
+        if(!VulkanPreview.nativeTerrain())return fallback();
         EntityDraws.flushCurrent();
-        if (unsupported.contains(pass.getName())) { fallbacks++; return false; }
+        if (unsupported.contains(pass.getName())) { fallbacks++; return fallback(); }
         Program program;
         try {
             program=programs.computeIfAbsent(pass.getName(),name->{try{return load(name);}catch(Exception error){throw new IllegalArgumentException(error);}});
         } catch (IllegalArgumentException error) {
             unsupported.add(pass.getName()); fallbacks++;
             github.com.gengyoubo.vulkanforge.VulkanForge.LOGGER.warn("Post program {} stays on OpenGL: {}", pass.getName(), error.getMessage());
-            return false;
+            return fallback();
         }
         try {
             Map<String,Integer> textures=new HashMap<>();textures.put("DiffuseSampler",pass.inTarget.getColorTextureId());
@@ -39,7 +44,7 @@ public final class PostEffects {
             for(int i=0;i<aux.size();i++)textures.put(names.get(i),aux.get(i).getAsInt());
             int[] inputs=new int[program.samplers.size()*5];int bound=glGetInteger(GL_TEXTURE_BINDING_2D);
             try {for(int i=0;i<program.samplers.size();i++){
-                Integer texture=textures.get(program.samplers.get(i));if(texture==null){fallbacks++;return false;}
+                Integer texture=textures.get(program.samplers.get(i));if(texture==null){fallbacks++;return fallback();}
                 com.mojang.blaze3d.platform.GlStateManager._bindTexture(texture);int at=i*5;
                 inputs[at]=texture;inputs[at+1]=glGetTexLevelParameteri(GL_TEXTURE_2D,0,GL_TEXTURE_WIDTH);inputs[at+2]=glGetTexLevelParameteri(GL_TEXTURE_2D,0,GL_TEXTURE_HEIGHT);
                 int internal=glGetTexLevelParameteri(GL_TEXTURE_2D,0,GL_TEXTURE_INTERNAL_FORMAT);
@@ -64,7 +69,7 @@ public final class PostEffects {
                 }
             }
             if(!NativeMainWindow.nativePost(new Object[]{pass.getName(),program.vertex,program.fragment,inputs,values,
-                    new int[]{pass.outTarget.frameBufferId,pass.outTarget.width,pass.outTarget.height},program.blend,clearColor(pass.outTarget)})){fallbacks++;return false;}
+                    new int[]{pass.outTarget.frameBufferId,pass.outTarget.width,pass.outTarget.height},program.blend,clearColor(pass.outTarget)})){fallbacks++;return fallback();}
             passes++;RenderSystem.viewport(0,0,pass.outTarget.width,pass.outTarget.height);RenderSystem.depthFunc(GL_LEQUAL);
             pass.outTarget.unbindWrite();pass.inTarget.unbindRead();return true;
         }catch(RuntimeException error){throw error;}catch(Exception error){throw new IllegalStateException("Native post pass "+pass.getName(),error);}

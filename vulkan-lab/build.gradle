@@ -134,6 +134,22 @@ tasks.register('benchmarkBindings', JavaExec) {
     systemProperty 'vulkanforge.disableValidation', 'true'
 }
 
+tasks.register('benchmarkUnified', JavaExec) {
+    dependsOn 'testClasses'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.lab.UnifiedRenderingBenchmark'
+    systemProperty 'vulkanforge.disableValidation', 'true'
+    rootProject.properties.findAll { it.key.startsWith('bench.') }.each { systemProperty it.key, it.value }
+}
+
+tasks.register('benchmarkInteropAblation', JavaExec) {
+    dependsOn 'testClasses'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.lab.InteropAblationBenchmark'
+    systemProperty 'vulkanforge.disableValidation', 'true'
+    rootProject.properties.findAll { it.key.startsWith('bench.') }.each { systemProperty it.key, it.value }
+}
+
 tasks.register('benchmarkPresent', JavaExec) {
     dependsOn 'testClasses'
     classpath = sourceSets.test.runtimeClasspath

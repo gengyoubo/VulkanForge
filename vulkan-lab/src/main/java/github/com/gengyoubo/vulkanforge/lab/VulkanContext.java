@@ -34,6 +34,8 @@ final class VulkanContext implements AutoCloseable {
     /** Terrain draws through NV task/mesh shaders instead of compute culling + indirect count. */
     boolean meshShaderNV;
     boolean pushDescriptors, pushDescriptorCore;
+    private boolean requestPipelineStatistics;
+    boolean pipelineStatisticsEnabled;
     int queueFamily = -1;
     long surface;
     private long messenger;
@@ -52,6 +54,10 @@ final class VulkanContext implements AutoCloseable {
         if (apiVersion != VK_API_VERSION_1_2 && apiVersion != VK_API_VERSION_1_3 && apiVersion != VK_API_VERSION_1_4)
             throw new IllegalArgumentException("Unsupported Vulkan API version: " + version(apiVersion));
         this.apiVersion = apiVersion;
+    }
+    /** Test-only opt-in; normal renderer constructors do not enable additional device features. */
+    VulkanContext(int apiVersion, String nvidiaExtensions, boolean pipelineStatistics) {
+        this(apiVersion,nvidiaExtensions);requestPipelineStatistics=pipelineStatistics;
     }
 
     static int requestedApiVersion() {
@@ -159,6 +165,10 @@ final class VulkanContext implements AutoCloseable {
                     .timelineSemaphore(capabilities.timeline()).drawIndirectCount(driven);
             var enabled11 = VkPhysicalDeviceVulkan11Features.calloc(stack).sType$Default().pNext(enabled12.address()).shaderDrawParameters(driven);
             var core = VkPhysicalDeviceFeatures.calloc(stack).multiDrawIndirect(driven).drawIndirectFirstInstance(driven);
+            if(requestPipelineStatistics) {
+                var supported=VkPhysicalDeviceFeatures.calloc(stack);vkGetPhysicalDeviceFeatures(physical,supported);
+                pipelineStatisticsEnabled=supported.pipelineStatisticsQuery();core.pipelineStatisticsQuery(pipelineStatisticsEnabled);
+            }
             nvidia = NvidiaExtensions.select(physical, stack, requestedNvidia, name -> hasDeviceExtension(physical, stack, name));
             VkDeviceCreateInfo deviceInfo = VkDeviceCreateInfo.calloc(stack).sType$Default().pQueueCreateInfos(queueInfo)
                     .pNext(nvidia.chain(stack, enabled11.address())).pEnabledFeatures(core);
