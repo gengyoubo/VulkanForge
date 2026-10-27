@@ -94,7 +94,8 @@ public final class VulkanForgeConfigScreen extends Screen {
         vulkanButton.active = vulkan; openGLButton.active = mode==RenderMode.GL;
         planButton.active = mode == RenderMode.GL_VK;
         for (var button : extensionButtons) button.active = vulkan;
-        if(restartButton!=null){restartButton.active=minecraft.level==null&&mode!=RenderMode.VK;restartButton.setTooltip(Tooltip.create(Component.translatable(mode==RenderMode.VK?"vulkanforge.config.mode.vk.tooltip":minecraft.level!=null?"vulkanforge.config.restart.in_world":"vulkanforge.config.restart.tooltip")));}
+        boolean missingBootstrap=mode==RenderMode.VK&&!Boolean.getBoolean("vulkanforge.nativeBootstrapAvailable");
+        if(restartButton!=null){restartButton.active=minecraft.level==null&&!missingBootstrap;restartButton.setTooltip(Tooltip.create(Component.translatable(missingBootstrap?"vulkanforge.config.mode.vk.tooltip":minecraft.level!=null?"vulkanforge.config.restart.in_world":"vulkanforge.config.restart.tooltip")));}
     }
 
     private void save() {
@@ -107,7 +108,7 @@ public final class VulkanForgeConfigScreen extends Screen {
     }
 
     private void restart() {
-        if (restarting || minecraft.level != null || mode==RenderMode.VK) return;
+        if (restarting || minecraft.level != null || mode==RenderMode.VK&&!Boolean.getBoolean("vulkanforge.nativeBootstrapAvailable")) return;
         try { save(); }
         catch (RuntimeException error) { restartFailed(error, false); return; }
         restarting = true;

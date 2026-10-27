@@ -16,10 +16,14 @@ final class NativeShaderProgram implements AutoCloseable {
     final List<String> samplers = new ArrayList<>();
     private final Map<String,Uniform> uniforms = new LinkedHashMap<>();
     private final VulkanContext context;
+    final boolean terrain, entity;
     long textureLayout,layout,vertex,fragment;
     private final Map<String,Long> pipelines = new HashMap<>();
+    private Map<Integer,Integer> vertexInputs=Map.of();
     NativeShaderProgram(VulkanContext context,String vertexSource,String fragmentSource,Map<String,Integer> attributes) {
         this.context=context;
+        terrain=vertexSource.contains("ChunkOffset");
+        entity=vertexSource.contains("UV1")&&vertexSource.contains("Normal")&&!terrain;
         int next=0; Matcher matcher=UNIFORM.matcher(vertexSource+"\n"+fragmentSource);
         while(matcher.find()) {
             String type=matcher.group(1),name=matcher.group(2);
@@ -33,8 +37,8 @@ final class NativeShaderProgram implements AutoCloseable {
         Map<String,Integer> varying=new LinkedHashMap<>(); matcher=IO.matcher(vertexSource);
         while(matcher.find())if(matcher.group(2).equals("out"))varying.put(matcher.group(4),varying.size());
         try(var stack=MemoryStack.stackPush()) {
-            vertex=ShaderCompiler.moduleSource(context,translate(vertexSource,true,attributes,varying),"minecraft-native.vert",shaderc_glsl_vertex_shader);
-            fragment=ShaderCompiler.moduleSource(context,translate(fragmentSource,false,attributes,varying),"minecraft-native.frag",shaderc_glsl_fragment_shader);
+            vertex=ShaderCompiler.moduleSource(context,translate(vertexSource,true,attributes,varying),"minecraft-native.vert",shaderc_glsl_vertex_shader,true,code->vertexInputs=SpirvVertexInputs.read(code));
+            fragment=ShaderCompiler.moduleSource(context,translate(fragmentSource,false,attributes,varying),"minecraft-native.frag",shaderc_glsl_fragment_shader,true,null);
             var bindings=VkDescriptorSetLayoutBinding.calloc(samplers.size()+1,stack);
             for(int i=0;i<samplers.size();i++)bindings.get(i).binding(i).descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).stageFlags(VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT);
             bindings.get(samplers.size()).binding(samplers.size()).descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC).stageFlags(VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT);
@@ -84,12 +88,16 @@ final class NativeShaderProgram implements AutoCloseable {
         return result;
     }
     long pipeline(int[] state,int[][] attributes,int stride) {
-        String key=Arrays.toString(state)+Arrays.deepToString(attributes)+stride;Long existing=pipelines.get(key);if(existing!=null)return existing;
+        int[][] consumed=Arrays.stream(attributes).filter(attribute->vertexInputs.containsKey(attribute[0])).toArray(int[][]::new);
+        if(consumed.length!=vertexInputs.size())throw new UnsupportedOperationException("Native draw lacks shader vertex inputs: "+vertexInputs.keySet());
+        // Buffer names are resource identities, not pipeline state. Chunk recycling must reuse the same pipeline.
+        int[][] layoutAttributes=Arrays.stream(consumed).map(attribute->Arrays.copyOf(attribute,6)).toArray(int[][]::new);
+        String key=Arrays.toString(state)+Arrays.deepToString(layoutAttributes)+stride;Long existing=pipelines.get(key);if(existing!=null)return existing;
         try(var stack=MemoryStack.stackPush()) {
             var stages=VkPipelineShaderStageCreateInfo.calloc(2,stack);
             stages.get(0).sType$Default().stage(VK_SHADER_STAGE_VERTEX_BIT).module(vertex).pName(stack.UTF8("main"));stages.get(1).sType$Default().stage(VK_SHADER_STAGE_FRAGMENT_BIT).module(fragment).pName(stack.UTF8("main"));
-            var attrs=VkVertexInputAttributeDescription.calloc(attributes.length,stack);
-            for(int i=0;i<attributes.length;i++){int[] a=attributes[i];attrs.get(i).location(a[0]).binding(0).format(format(a[1],a[2],a[3]!=0,a[4]!=0)).offset(a[5]);}
+            var attrs=VkVertexInputAttributeDescription.calloc(consumed.length,stack);
+            for(int i=0;i<consumed.length;i++){int[] a=consumed[i];attrs.get(i).location(a[0]).binding(0).format(format(a[1],a[2],a[3]!=0,vertexInputs.get(a[0])!=SpirvVertexInputs.FLOAT)).offset(a[5]);}
             var input=VkPipelineVertexInputStateCreateInfo.calloc(stack).sType$Default().pVertexBindingDescriptions(VkVertexInputBindingDescription.calloc(1,stack).binding(0).stride(stride).inputRate(VK_VERTEX_INPUT_RATE_VERTEX)).pVertexAttributeDescriptions(attrs);
             var blend=VkPipelineColorBlendAttachmentState.calloc(1,stack).colorWriteMask(state[12]).blendEnable(state[0]!=0)
                     .srcColorBlendFactor(factor(state[1])).dstColorBlendFactor(factor(state[2])).srcAlphaBlendFactor(factor(state[3])).dstAlphaBlendFactor(factor(state[4])).colorBlendOp(operation(state[5])).alphaBlendOp(operation(state[6]));
@@ -110,10 +118,10 @@ final class NativeShaderProgram implements AutoCloseable {
     private static int format(int size,int type,boolean normalized,boolean integer) {
         int[] formats=switch(type){
             case 5126->new int[]{VK_FORMAT_R32_SFLOAT,VK_FORMAT_R32G32_SFLOAT,VK_FORMAT_R32G32B32_SFLOAT,VK_FORMAT_R32G32B32A32_SFLOAT};
-            case 5121->normalized?new int[]{VK_FORMAT_R8_UNORM,VK_FORMAT_R8G8_UNORM,VK_FORMAT_R8G8B8_UNORM,VK_FORMAT_R8G8B8A8_UNORM}:new int[]{VK_FORMAT_R8_UINT,VK_FORMAT_R8G8_UINT,VK_FORMAT_R8G8B8_UINT,VK_FORMAT_R8G8B8A8_UINT};
-            case 5120->new int[]{VK_FORMAT_R8_SNORM,VK_FORMAT_R8G8_SNORM,VK_FORMAT_R8G8B8A8_SNORM,VK_FORMAT_R8G8B8A8_SNORM};
-            case 5122->integer?new int[]{VK_FORMAT_R16_SINT,VK_FORMAT_R16G16_SINT,VK_FORMAT_R16G16B16_SINT,VK_FORMAT_R16G16B16A16_SINT}:new int[]{VK_FORMAT_R16_SSCALED,VK_FORMAT_R16G16_SSCALED,VK_FORMAT_R16G16B16_SSCALED,VK_FORMAT_R16G16B16A16_SSCALED};
-            case 5123->new int[]{VK_FORMAT_R16_UINT,VK_FORMAT_R16G16_UINT,VK_FORMAT_R16G16B16_UINT,VK_FORMAT_R16G16B16A16_UINT};
+            case 5121->integer?new int[]{VK_FORMAT_R8_UINT,VK_FORMAT_R8G8_UINT,VK_FORMAT_R8G8B8A8_UINT,VK_FORMAT_R8G8B8A8_UINT}:normalized?new int[]{VK_FORMAT_R8_UNORM,VK_FORMAT_R8G8_UNORM,VK_FORMAT_R8G8B8A8_UNORM,VK_FORMAT_R8G8B8A8_UNORM}:new int[]{VK_FORMAT_R8_USCALED,VK_FORMAT_R8G8_USCALED,VK_FORMAT_R8G8B8A8_USCALED,VK_FORMAT_R8G8B8A8_USCALED};
+            case 5120->integer?new int[]{VK_FORMAT_R8_SINT,VK_FORMAT_R8G8_SINT,VK_FORMAT_R8G8B8A8_SINT,VK_FORMAT_R8G8B8A8_SINT}:normalized?new int[]{VK_FORMAT_R8_SNORM,VK_FORMAT_R8G8_SNORM,VK_FORMAT_R8G8B8A8_SNORM,VK_FORMAT_R8G8B8A8_SNORM}:new int[]{VK_FORMAT_R8_SSCALED,VK_FORMAT_R8G8_SSCALED,VK_FORMAT_R8G8B8A8_SSCALED,VK_FORMAT_R8G8B8A8_SSCALED};
+            case 5122->integer?new int[]{VK_FORMAT_R16_SINT,VK_FORMAT_R16G16_SINT,VK_FORMAT_R16G16B16_SINT,VK_FORMAT_R16G16B16A16_SINT}:normalized?new int[]{VK_FORMAT_R16_SNORM,VK_FORMAT_R16G16_SNORM,VK_FORMAT_R16G16B16_SNORM,VK_FORMAT_R16G16B16A16_SNORM}:new int[]{VK_FORMAT_R16_SSCALED,VK_FORMAT_R16G16_SSCALED,VK_FORMAT_R16G16B16_SSCALED,VK_FORMAT_R16G16B16A16_SSCALED};
+            case 5123->integer?new int[]{VK_FORMAT_R16_UINT,VK_FORMAT_R16G16_UINT,VK_FORMAT_R16G16B16_UINT,VK_FORMAT_R16G16B16A16_UINT}:normalized?new int[]{VK_FORMAT_R16_UNORM,VK_FORMAT_R16G16_UNORM,VK_FORMAT_R16G16B16_UNORM,VK_FORMAT_R16G16B16A16_UNORM}:new int[]{VK_FORMAT_R16_USCALED,VK_FORMAT_R16G16_USCALED,VK_FORMAT_R16G16B16_USCALED,VK_FORMAT_R16G16B16A16_USCALED};
             default->throw new UnsupportedOperationException("Native vertex type "+type);};
         return formats[size-1];
     }

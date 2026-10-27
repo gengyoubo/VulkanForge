@@ -12,6 +12,10 @@ sourceSets.main.java.srcDir 'bridge-protocol/src/main/java'
 sourceSets.main.java.srcDir 'gl-interop/src/main/java'
 sourceSets {
     nativeBootstrap { }
+    nativeBootstrapTest {
+        compileClasspath += sourceSets.nativeBootstrap.output + sourceSets.nativeBootstrap.runtimeClasspath
+        runtimeClasspath += output + compileClasspath
+    }
     smoke {
         java.srcDir 'benchmark-support/src/main/java'
         compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
@@ -29,15 +33,18 @@ minecraft {
             mods { vulkanforge { source sourceSets.main } }
         }
         client {
+            // The agent reads the saved mode before Forge; it stays inert for GL/GL_VK.
+            jvmArg '-javaagent:' + project.file('build/libs/vulkanforge-native-bootstrap.jar').absolutePath
+            if (!project.hasProperty('nativeGame') && System.getProperty('vulkanforge.startup') != null)
+                property 'vulkanforge.startup', System.getProperty('vulkanforge.startup')
             if (project.hasProperty('nativeGame')) {
                 workingDirectory project.file('run-native')
                 property 'vulkanforge.startup', 'VK:' + (project.findProperty('nativeApi') ?: 'V1_4')
-                jvmArg '-javaagent:' + project.file('build/libs/vulkanforge-native-bootstrap.jar').absolutePath
-                if (project.hasProperty('nativeGameSmoke')) {
-                    property 'vulkanforge.nativeGameSmoke', 'true'
-                    if (project.hasProperty('nativeMenuOnly')) property 'vulkanforge.nativeMenuOnly', 'true'
-                    mods { vulkanforge { source sourceSets.smoke } }
-                }
+            }
+            if (project.hasProperty('nativeGameSmoke')) {
+                property 'vulkanforge.nativeGameSmoke', 'true'
+                if (project.hasProperty('nativeMenuOnly')) property 'vulkanforge.nativeMenuOnly', 'true'
+                mods { vulkanforge { source sourceSets.smoke } }
             }
             ['vulkanforge.entityProfile', 'vulkanforge.entityLegacyBatch', 'vulkanforge.noInteropOptimizations', 'vulkanforge.earlyGlInputFlush', 'vulkanforge.glTailCompatibility'].each { key ->
                 if (System.getProperty(key) != null) property key, System.getProperty(key)
@@ -119,19 +126,31 @@ tasks.register('nativeBootstrapJar', Jar) {
     manifest { attributes 'Premain-Class': 'dev.vulkanforge.bootstrap.NativeBootstrap' }
     exclude 'module-info.class', 'META-INF/versions/**/module-info.class'
 }
-if (project.hasProperty('nativeGame')) tasks.matching { it.name == 'runClient' }.configureEach {
+tasks.register('smokeNativeBootstrap', JavaExec) {
+    dependsOn 'nativeBootstrapTestClasses'
+    classpath = sourceSets.nativeBootstrapTest.runtimeClasspath
+    mainClass = 'dev.vulkanforge.bootstrap.NativeBootstrapSmoke'
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+}
+tasks.named('assemble') { dependsOn 'nativeBootstrapJar' }
+tasks.matching { it.name == 'runClient' }.configureEach { dependsOn 'nativeBootstrapJar' }
+if (project.hasProperty('nativeGame') || project.hasProperty('nativeGameSmoke')) tasks.matching { it.name == 'runClient' }.configureEach {
     dependsOn 'nativeBootstrapJar'
     doFirst {
-        def directory=file('run-native'); directory.mkdirs()
+        def directory=file(project.hasProperty('nativeGame') ? 'run-native' : 'run'); directory.mkdirs()
         if (project.hasProperty('nativeGameSmoke')) {
-            file('run-native/options.txt').text='renderDistance:3\nsimulationDistance:5\nguiScale:2\nmaxFps:60\nenableVsync:false\nonboardAccessibility:false\n'
-            def result=file('run-native/logs/vulkanforge/native-game-smoke/result.txt');result.parentFile.mkdirs();result.text='STATUS=RUNNING\n'
+            if (project.hasProperty('nativeGame')) new File(directory,'options.txt').text='renderDistance:3\nsimulationDistance:5\nguiScale:2\nmaxFps:60\nenableVsync:false\nonboardAccessibility:false\n'
+            def result=new File(directory,'logs/vulkanforge/native-game-smoke/result.txt');result.parentFile.mkdirs();result.text='STATUS=RUNNING\n'
         }
     }
     doLast {
         if (project.hasProperty('nativeGameSmoke')) {
-            def result=file('run-native/logs/vulkanforge/native-game-smoke/result.txt')
-            if (!result.exists() || !result.text.contains('STATUS=OK')) throw new GradleException('Native game smoke failed; see run-native logs')
+            def directory=file(project.hasProperty('nativeGame') ? 'run-native' : 'run')
+            def result=new File(directory,'logs/vulkanforge/native-game-smoke/result.txt')
+            if (!result.exists() || !result.text.contains('STATUS=OK')) throw new GradleException('Native game smoke failed; see ' + directory)
+            def backend=new File(directory,'logs/vulkanforge/native-game-report.txt')
+            if(!backend.exists() || !backend.text.contains('CLOSED=true') || !backend.text.contains('VALIDATION_ERRORS=0')) throw new GradleException('Native backend did not finish cleanly; see ' + backend)
+            if(project.hasProperty('validationSmoke') && !backend.text.contains('VALIDATION=ENABLED')) throw new GradleException('Native validation layer was not enabled')
         }
     }
 }

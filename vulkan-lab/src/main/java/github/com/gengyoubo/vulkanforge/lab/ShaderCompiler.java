@@ -42,6 +42,9 @@ final class ShaderCompiler {
         return moduleSource(context,source,resource,kind);
     }
     static long moduleSource(VulkanContext context,String source,String resource,int kind){
+        return moduleSource(context,source,resource,kind,false,null);
+    }
+    static long moduleSource(VulkanContext context,String source,String resource,int kind,boolean optimized,java.util.function.Consumer<ByteBuffer> inspect){
         long compiler = shaderc_compiler_initialize();
         if (compiler == 0) throw new IllegalStateException("shaderc compiler initialization failed");
         long options = 0, result = 0;
@@ -51,6 +54,7 @@ final class ShaderCompiler {
             // Vulkan 1.2 accepts SPIR-V 1.5; the 1.3/1.4 paths can use SPIR-V 1.6.
             shaderc_compile_options_set_target_env(options, shaderc_target_env_vulkan, context.apiVersion < org.lwjgl.vulkan.VK13.VK_API_VERSION_1_3 ? shaderc_env_version_vulkan_1_2 : shaderc_env_version_vulkan_1_3);
             shaderc_compile_options_set_target_spirv(options, context.apiVersion < org.lwjgl.vulkan.VK13.VK_API_VERSION_1_3 ? shaderc_spirv_version_1_5 : shaderc_spirv_version_1_6);
+            if (optimized) shaderc_compile_options_set_optimization_level(options, shaderc_optimization_level_performance);
             result = shaderc_compile_into_spv(compiler, source, kind, resource, "main", options);
             if (result == 0) throw new IllegalStateException("shaderc returned a null compilation result");
             if (shaderc_result_get_compilation_status(result) != shaderc_compilation_status_success) {
@@ -58,6 +62,7 @@ final class ShaderCompiler {
             }
             ByteBuffer bytes = shaderc_result_get_bytes(result);
             if (bytes == null) throw new IllegalStateException("shaderc returned no SPIR-V");
+            if (inspect != null) inspect.accept(bytes.asReadOnlyBuffer());
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 VkShaderModuleCreateInfo info = VkShaderModuleCreateInfo.calloc(stack).sType$Default().pCode(bytes);
                 LongBuffer handle = stack.mallocLong(1);

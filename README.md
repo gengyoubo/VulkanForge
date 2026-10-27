@@ -2,14 +2,15 @@
 
 Minecraft **1.20.1 / Forge 47.4.28 / Java 17** 客户端 Vulkan 渲染实验。
 
-**整个游戏进程无 OpenGL 的 `VK` 模式尚未接入 Minecraft。** 已新增独立的私有 Vulkan 地形 → Vulkan Swapchain 后端及禁止加载 GL/互操作实现的 GPU 检查：`.\gradlew.bat :vulkan-lab:smokeNativeWindow`。它验证后端，不代表可用的纯 Vulkan 游戏；启动、资源和实体/GUI 的剩余迁移见 [原生游戏渲染状态](docs/native-game-rendering.md)。
+**实验性原生 `VK` 模式已接入实际游戏**：地形、实体、粒子、手持物和 GUI 使用 Vulkan 绘制，最终通过 Vulkan Swapchain 呈现。早期 JVM 引导关闭 Forge 的 GL 加载窗口，游戏窗口使用 `GLFW_NO_API`；原生模式禁止真实 OpenGL 调用，不创建隐藏 GL 上下文或共享 GL 图像。真实游戏的主菜单、进出世界、背包、窗口缩放、资源重载及 Fabulous 场景已通过 GPU 检查，启用 Vulkan 同步校验时错误数为零。启动方法、验证范围和限制见 [原生游戏渲染](docs/native-game-rendering.md)。
 
 **GL-VK 默认使用 GL 尾部兼容计划**：Vulkan 批量绘制地形，GL 负责兼容绘制、后处理、GUI/HUD 与最终输出。配置页的“GL-VK 执行计划”对应 `renderer.glVkPlan`，可在 `GL_TAIL` 与原 `INTERLEAVED` 之间切换，重启生效。下述 Vulkan Swapchain、实体/GUI 回放说明针对原交错计划。
 
-当前已经打通四条路径：
+当前已经打通五条路径：
 
+- 原生 VK 游戏（Windows）：CPU 资源与绘制状态 → 原版着色器转 SPIR-V → 私有 Vulkan 附件 → Vulkan Swapchain，全程无 OpenGL；使用独立的 `NativeGameBackend`。
 - 独立 Vulkan 1.2/1.3/1.4 窗口：交换链、动态渲染、缩放重建、三角形绘制。
-- Minecraft 主窗口呈现（Windows）：可见窗口使用 `GLFW_NO_API`，创建 Win32 Vulkan Surface / Swapchain；原版主 framebuffer 经共享 GPU 图像和跨 API 信号量交给 `vkQueuePresentKHR`，Vulkan 在最终图像中追加受支持的手持物和 HUD。正常呈现过程不经过 CPU 像素读回。
+- GL-VK 交错计划的 Minecraft 主窗口呈现（Windows）：可见窗口使用 `GLFW_NO_API`，创建 Win32 Vulkan Surface / Swapchain；原版主 framebuffer 经共享 GPU 图像和跨 API 信号量交给 `vkQueuePresentKHR`，Vulkan 在最终图像中追加受支持的手持物和 HUD。正常呈现过程不经过 CPU 像素读回。
 - 游戏主窗口预览：同进程 Vulkan 绘制旋转三角形 → 导出共享 GPU 图像 → 原有 GL 上下文采样 → 主菜单 / HUD 显示。
 - 世界不透明和镂空方块：采集原版烘焙模型、贴图 UV、染色、环境遮蔽与光照坐标 → 分区顶点缓冲 → Vulkan 图集/光照图采样、相机变换、alpha 丢弃、D32 深度测试 → 在原版 cutout 阶段之后合成。
 
@@ -26,11 +27,27 @@ $env:Path = "$env:JAVA_HOME\bin;$env:Path"
 .\gradlew.bat runClient
 ```
 
-IntelliJ IDEA：导入根目录的 `build.gradle`，将 **Gradle JVM** 和 **Project SDK** 设为 Java 17。
+IntelliJ IDEA：导入根目录的 `build.gradle`，将 **Gradle JVM** 和 **Project SDK** 设为 Java 17。运行 `.\gradlew.bat genIntellijRuns` 更新已有运行配置，确保 `runClient` 包含 JVM 引导参数。
 
-产物：`build/libs/vulkanforge-0.1.0.jar`。放入 Forge 1.20.1 客户端的 `mods` 文件夹即可；Vulkan 测试程序和运行库已打包，无需另放 LWJGL jar。当前随包提供 Windows/Linux x86_64 原生库；Linux 路径尚未实机验证。
+产物：`build/libs/vulkanforge-0.1.0.jar` 和 `build/libs/vulkanforge-native-bootstrap.jar`。模组 jar 放入 Forge 1.20.1 客户端的 `mods` 文件夹；原生 VK 模式还需将独立引导 jar 配置为启动器 JVM 参数 `-javaagent:<引导 jar 的绝对路径>`。Gradle `runClient` 自动添加该参数，引导在 GL/GL-VK 模式下保持停用。Vulkan 测试程序和运行库已打包，无需另放 LWJGL jar。当前随包提供 Windows/Linux x86_64 原生库；原生游戏模式目前仅实现 Windows。
 
-主窗口 Vulkan 呈现目前仅支持 **Windows x86_64**，要求同一 GPU 支持所选的 Vulkan 1.2、1.3 或 1.4、`dynamicRendering`、`synchronization2`（1.2 通过 `VK_KHR_dynamic_rendering` / `VK_KHR_synchronization2`）、`VK_KHR_swapchain`、Win32 external-memory / external-semaphore，以及 GL 对应的两个 Win32 扩展。启动时按设备 UUID 匹配，并实际验证共享内存导入和 framebuffer；失败时使用原来的 OpenGL 窗口。其他平台继续使用原来的 GL 呈现。可在启动器 JVM 参数中加入 `-Dvulkanforge.directPresent=false`，重启后关闭主窗口 Vulkan 路径；开发环境：
+### 原生 VK 游戏
+
+普通 `runClient` 按 `run/config/vulkanforge-client.toml` 中的 `renderer.mode = "VK"` 启用原生模式；配置页修改模式后重启生效。默认模式仍为 `GL_VK`。也可在隔离的 `run-native` 目录直接启动，不修改普通游戏配置：
+
+```powershell
+.\gradlew.bat -PnativeGame runClient
+# 可选 Vulkan 1.2 / 1.3；默认 V1_4
+.\gradlew.bat -PnativeGame -PnativeApi=V1_3 runClient
+```
+
+原生模式不需要 F8。日志为 `logs/vulkanforge/native-game-report.txt`，兼容报告为 `vk-native-compatibility.json`。缺少早期引导或必要 GPU 功能会明确停止启动。当前只验证 Forge、原版游戏与本模组的场景；纹理仅使用基础 mip，尚未承诺性能提升或任意模组兼容。详细要求和实际世界测试命令见 [原生游戏渲染](docs/native-game-rendering.md)。
+
+### GL-VK 混合模式
+
+以下共享图像、GL 尾部计划、F8/F9/F10 和 P1–P11 的说明针对既有 GL-VK 混合路径。
+
+GL-VK 主窗口 Vulkan 呈现目前仅支持 **Windows x86_64**，要求同一 GPU 支持所选的 Vulkan 1.2、1.3 或 1.4、`dynamicRendering`、`synchronization2`（1.2 通过 `VK_KHR_dynamic_rendering` / `VK_KHR_synchronization2`）、`VK_KHR_swapchain`、Win32 external-memory / external-semaphore，以及 GL 对应的两个 Win32 扩展。启动时按设备 UUID 匹配，并实际验证共享内存导入和 framebuffer；失败时使用原来的 OpenGL 窗口。其他平台继续使用原来的 GL 呈现。可在启动器 JVM 参数中加入 `-Dvulkanforge.directPresent=false`，重启后关闭主窗口 Vulkan 路径；开发环境：
 
 ```powershell
 .\gradlew.bat '-Dvulkanforge.directPresent=false' runClient

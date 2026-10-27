@@ -40,8 +40,14 @@ public final class NativeGameWindow {
             Path report=FMLPaths.GAMEDIR.get().resolve("logs/vulkanforge/native-game-report.txt");
             backend=type.getConstructor(String.class,long.class,long.class,int.class,String.class,boolean.class).newInstance(report.toAbsolutePath().toString(),hwnd,instance,startup.vulkanVersion().apiVersion,startup.nvidiaExtensionNames(),Boolean.getBoolean("vulkanforge.requireValidation"));
             for(Method method:type.getMethods())if(method.getDeclaringClass()==type)methods.put(method.getName(),method);
+            NativeModeAvailability.markActive(report.resolveSibling("vk-native-compatibility.json"));
             return window;
-        }catch(Throwable error){throw new IllegalStateException("Native Vulkan game bootstrap failed",cause(error));}
+        }catch(Throwable error){
+            long failedWindow=window;
+            try{close();}catch(Throwable cleanup){error.addSuppressed(cleanup);}
+            finally{if(failedWindow!=0)GLFW.glfwDestroyWindow(failedWindow);}
+            throw new IllegalStateException("Native Vulkan game bootstrap failed",cause(error));
+        }
     }
     public static Object call(String name,Object...arguments) {
         if(backend==null)throw new IllegalStateException("Native device is not initialized: "+name);
@@ -60,7 +66,7 @@ public final class NativeGameWindow {
         call("present",target.frameBufferId,width[0],height[0]);
         if(!System.getProperty("vulkanforge.forbiddenGlCalls","0").equals("0"))throw new IllegalStateException("A forbidden OpenGL call occurred");
     }
-    public static long[] stats(){return backend==null?new long[6]:(long[])call("stats");}
+    public static long[] stats(){return backend==null?new long[8]:(long[])call("stats");}
     public static void captureNext(Path path){call("captureNext",path.toAbsolutePath().toString());}
     static void close() {
         try{if(backend!=null)call("close");}

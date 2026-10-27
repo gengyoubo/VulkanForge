@@ -5,14 +5,21 @@ import java.security.ProtectionDomain;
 import org.objectweb.asm.*;
 import org.objectweb.asm.tree.*;
 import java.util.*;
+import java.nio.file.*;
+import java.util.regex.*;
 
 /** Opt-in JVM bootstrap: disable Forge's GL early window and fail every real GL entry point. */
 public final class NativeBootstrap {
     private static final String STATE = "github/com/gengyoubo/vulkanforge/client/NativeDeviceState";
     private static final String WINDOW = "github/com/gengyoubo/vulkanforge/client/NativeGameWindow";
     public static void premain(String arguments, Instrumentation instrumentation) {
-        String mode = System.getProperty("vulkanforge.startup", "VK:V1_4");
-        if (!mode.startsWith("VK:")) throw new IllegalArgumentException("Native bootstrap requires an explicit VK startup mode");
+        System.setProperty("vulkanforge.nativeBootstrapAvailable", "true");
+        Path directory=arguments==null||arguments.isBlank()?Path.of(""):Path.of(arguments);
+        String config="";
+        try {Path file=directory.resolve("config/vulkanforge-client.toml");if(Files.isRegularFile(file))config=Files.readString(file);}
+        catch(java.io.IOException ignored) { /* Match the client reader's default when the file is unreadable. */ }
+        String mode=nativeStartup(System.getProperty("vulkanforge.startup"),config);
+        if(mode==null)return; // Inert for GL/GL_VK, including an ordinary renderer restart.
         System.setProperty("vulkanforge.startup", mode);
         System.setProperty("vulkanforge.nativeBootstrap", "true");
         System.setProperty("vulkanforge.forbiddenGlCalls", "0");
@@ -27,6 +34,24 @@ public final class NativeBootstrap {
                 }
             }
         });
+    }
+    static String nativeStartup(String override,String config) {
+        String saved=setting(config,"renderer","mode",setting(config,"renderer","backend","GL_VK"));
+        String raw=override==null||override.isBlank()?saved:override.split(":",2)[0];
+        String selected=raw.trim().toUpperCase(Locale.ROOT).replace('-','_');
+        boolean nativeMode=switch(selected){case "VK","VK_NATIVE"->true;case "GL","OPENGL","GL_VK","VULKAN","HYBRID","GLVK_HYBRID"->false;default->saved.equalsIgnoreCase("VK")||saved.equalsIgnoreCase("VK_NATIVE");};
+        if(!nativeMode)return null;
+        String version=setting(config,"vulkan","version","V1_4");
+        if(override!=null&&override.contains(":"))version=override.split(":",2)[1];
+        version=version.trim().toUpperCase(Locale.ROOT);
+        if(!Set.of("V1_2","V1_3","V1_4").contains(version))version="V1_4";
+        return "VK:"+version;
+    }
+    private static String setting(String source,String section,String key,String fallback) {
+        boolean inside=false;
+        Pattern header=Pattern.compile("^\\[([^]]+)]\\s*(?:#.*)?$"),entry=Pattern.compile("^"+Pattern.quote(key)+"\\s*=\\s*(['\"])(.*?)\\1\\s*(?:#.*)?$");
+        for(String line:source.split("\\R")){line=line.strip();Matcher match=header.matcher(line);if(match.matches()){inside=match.group(1).equals(section);continue;}if(inside){match=entry.matcher(line);if(match.matches())return match.group(2);}}
+        return fallback;
     }
     static byte[] rewrite(String name, byte[] bytes) {
         if (name == null) return null;
@@ -45,6 +70,11 @@ public final class NativeBootstrap {
             if (glfw && method.name.equals("glfwMakeContextCurrent")) {
                 trap(method, "glfwMakeContextCurrent"); changed = true; continue;
             }
+            if (glfw && (method.name.equals("glfwCreateWindow")||method.name.equals("nglfwCreateWindow")) && (method.access & Opcodes.ACC_NATIVE)==0) {
+                InsnList noApi=new InsnList();noApi.add(new LdcInsnNode(139265));noApi.add(new InsnNode(Opcodes.ICONST_0));
+                noApi.add(new MethodInsnNode(Opcodes.INVOKESTATIC,"org/lwjgl/glfw/GLFW","glfwWindowHint","(II)V",false));
+                method.instructions.insert(noApi);changed=true;
+            }
             for (AbstractInsnNode instruction : method.instructions.toArray()) {
                 if (!(instruction instanceof MethodInsnNode call) || call.getOpcode() != Opcodes.INVOKESTATIC) continue;
                 if (early && method.name.equals("load") && call.owner.endsWith("/FMLConfig") && call.name.equals("getBoolConfigValue")) {
@@ -56,6 +86,8 @@ public final class NativeBootstrap {
                     call.owner = WINDOW; call.name = "hint"; changed = true;
                 } else if (game && call.owner.equals("org/lwjgl/glfw/GLFW") && call.name.equals("glfwSwapInterval")) {
                     call.owner = WINDOW; call.name = "swapInterval"; changed = true;
+                } else if (game && call.owner.equals("com/mojang/blaze3d/systems/TimerQuery") && call.name.equals("getInstance") && call.desc.equals("()Ljava/util/Optional;")) {
+                    call.owner = "java/util/Optional"; call.name = "empty"; changed = true;
                 } else if (game && call.owner.equals("com/mojang/blaze3d/platform/GlDebug") && call.desc.equals("(IZ)V")) {
                     InsnList skip = new InsnList(); skip.add(new InsnNode(Opcodes.POP)); skip.add(new InsnNode(Opcodes.POP));
                     method.instructions.insertBefore(call, skip); method.instructions.remove(call); changed = true;

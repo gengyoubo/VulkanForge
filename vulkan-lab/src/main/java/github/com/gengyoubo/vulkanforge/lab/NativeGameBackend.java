@@ -32,7 +32,7 @@ public final class NativeGameBackend implements AutoCloseable {
     private final List<Runnable> retired=new ArrayList<>();
     private final List<Object[]> commands=new ArrayList<>();
     private final long[] samplers=new long[4];
-    private long pool,fence,descriptors,frames,draws,uploads;
+    private long pool,fence,descriptors,frames,draws,uploads,terrainDraws,entityDraws;
     private VkCommandBuffer command;
     private GpuBuffer vertices,indices,uniforms;
     private boolean pending,frameOpen,closed;
@@ -129,7 +129,7 @@ public final class NativeGameBackend implements AutoCloseable {
                     writes.get(inputs.length).sType$Default().dstSet(descriptor.get(0)).dstBinding(inputs.length).descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC).pBufferInfo(VkDescriptorBufferInfo.calloc(1,stack).buffer(uniforms.buffer).range(1024));vkUpdateDescriptorSets(context.device,writes,null);
                     vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,program.layout,0,descriptor,stack.ints(drawIndex*1024));
                     vkCmdBindVertexBuffers(command,0,stack.longs(vertices.buffer),stack.longs(vertexOffset));vkCmdBindIndexBuffer(command,indices.buffer,indexOffset,(Integer)p[3]==5123?VK_INDEX_TYPE_UINT16:VK_INDEX_TYPE_UINT32);
-                    vkCmdDrawIndexed(command,(Integer)p[4],1,0,0,0);draws++;drawIndex++;
+                    vkCmdDrawIndexed(command,(Integer)p[4],1,0,0,0);draws++;if(program.terrain)terrainDraws++;if(program.entity)entityDraws++;drawIndex++;
                 } else {
                     if(active!=null){vkCmdEndRendering(command);active=null;}
                     if(kind==1){Target output=(Target)entry[1];begin(output,stack);int mask=(Integer)entry[2];var clears=VkClearAttachment.calloc(((mask&16384)!=0?1:0)+((mask&256)!=0?1:0),stack);int at=0;
@@ -183,6 +183,6 @@ public final class NativeGameBackend implements AutoCloseable {
             check(vkWaitForFences(context.device,fence,true,10_000_000_000L),"native screenshot complete");byte[] pixels=new byte[size];storage.mapped.duplicate().get(pixels);return pixels;
         }
     }
-    public long[] stats(){return new long[]{frames,draws,uploads,programs.size(),targets.size(),context.validationErrors()};}
+    public long[] stats(){return new long[]{frames,draws,uploads,programs.size(),targets.size(),context.validationErrors(),terrainDraws,entityDraws};}
     @Override public void close(){if(closed)return;closed=true;presentation.close();if(context.device!=null)vkDeviceWaitIdle(context.device);context.uploads.drain();for(Runnable action:retired)action.run();retired.clear();Set<Image> images=Collections.newSetFromMap(new IdentityHashMap<>());for(Texture texture:textures.values())images.add(texture.image());for(Target target:targets.values()){images.add(target.color());images.add(target.depth());}for(Image image:images)image.gpu.close();for(NativeShaderProgram program:programs.values())program.close();if(vertices!=null)vertices.close();if(indices!=null)indices.close();if(uniforms!=null)uniforms.close();for(long sampler:samplers)if(sampler!=0)vkDestroySampler(context.device,sampler,null);vkDestroyDescriptorPool(context.device,descriptors,null);vkDestroyFence(context.device,fence,null);vkDestroyCommandPool(context.device,pool,null);report.println("FINAL_PRESENTED_FRAMES="+frames+"\nNATIVE_DRAWS="+draws+"\nCPU_TEXTURE_UPLOADS="+uploads+"\nVALIDATION_ERRORS="+context.validationErrors());context.close();report.println("CLOSED=true");report.close();}
 }

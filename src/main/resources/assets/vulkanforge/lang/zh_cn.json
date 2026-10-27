@@ -60,5 +60,5 @@
   "vulkanforge.config.mode.vk": "VK（实验）",
   "vulkanforge.config.mode.gl.tooltip": "OpenGL 渲染；支持 GL 4.3～4.6，侧重模组兼容和性能。",
   "vulkanforge.config.mode.gl_vk.tooltip": "Vulkan 绘制已支持的内容，OpenGL 回退；允许共享资源和跨 API 同步。",
-  "vulkanforge.config.mode.vk.tooltip": "纯 Vulkan 开发模式，不允许 GL 回退。原生地形与 Swapchain 后端可独立验证；尚未接入 Minecraft 无 GL 启动、资源和实体/GUI，完整游戏启动仍不可用。"
+  "vulkanforge.config.mode.vk.tooltip": "原生 Vulkan 游戏渲染：不创建 OpenGL 上下文，地形、实体和 GUI 经 Vulkan 绘制并由 Swapchain 呈现。需要启动时加载 native-bootstrap JVM 引导；Gradle runClient 自动挂载，外部启动器需添加 -javaagent 参数。实验模式，不允许 GL 回退。"
 }

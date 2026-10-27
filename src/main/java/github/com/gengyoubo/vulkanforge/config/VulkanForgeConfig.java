@@ -73,7 +73,7 @@ public final class VulkanForgeConfig {
     static {
         var builder = new ForgeConfigSpec.Builder();
         builder.comment("Startup settings: changes take effect after restarting the game.").push("renderer");
-        MODE = builder.comment("Running mode: GL (OpenGL), GL_VK (hybrid with GL fallback), VK (native Vulkan; experimental coverage gate, no GL fallback).")
+        MODE = builder.comment("Running mode: GL (OpenGL), GL_VK (hybrid with GL fallback), VK (native Vulkan; requires the early JVM bootstrap agent, no GL fallback).")
                 .defineEnum("mode", RenderMode.GL_VK);
         GL_VK_PLAN = builder.comment("GL_VK execution plan. GL_TAIL batches Vulkan terrain and keeps compatibility draws/final output on GL. INTERLEAVED keeps the original Vulkan presentation path. Restart required.")
                 .defineEnum("glVkPlan", GlVkPlan.GL_TAIL);

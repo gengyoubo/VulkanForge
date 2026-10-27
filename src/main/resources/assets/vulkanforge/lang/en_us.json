@@ -60,5 +60,5 @@
   "vulkanforge.config.mode.vk": "VK (Experimental)",
   "vulkanforge.config.mode.gl.tooltip": "OpenGL rendering, GL 4.3–4.6 compatibility and performance.",
   "vulkanforge.config.mode.gl_vk.tooltip": "Vulkan draws supported content; OpenGL fallback and shared-resource interop remain available.",
-  "vulkanforge.config.mode.vk.tooltip": "Native Vulkan development mode, with no GL fallback. Private terrain/Swapchain backend tests are available; Minecraft startup, resources and entity/GUI migration are not connected, so full game launch remains unavailable."
+  "vulkanforge.config.mode.vk.tooltip": "Native Vulkan game rendering: no OpenGL context, Vulkan terrain/entities/GUI and Swapchain presentation. Requires the native-bootstrap JVM agent before Forge starts. Gradle runClient attaches it automatically; external launchers need -javaagent. Experimental, no GL fallback."
 }

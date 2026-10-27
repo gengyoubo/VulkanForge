@@ -1,59 +1,101 @@
-# 原生 Vulkan 游戏渲染的当前状态
+# 原生 Vulkan 游戏渲染
 
-目标是整个 Minecraft/Forge 游戏进程不创建 OpenGL 上下文、不调用 OpenGL，用 Vulkan 绘制世界并经 Vulkan Swapchain 呈现。
+实验性 `VK` 模式已经接入 Minecraft 1.20.1 / Forge 47.4.28 的实际游戏循环。地形、实体、粒子、天空、手持物和 GUI 使用 Vulkan 绘制，最终由 Vulkan Swapchain 呈现；整个原生路径不创建 OpenGL 上下文，不执行 OpenGL GPU 调用，不使用 GL/Vulkan 共享图像。默认配置仍为 `GL_VK`，需要选择 `VK` 并重启。
 
-**尚未实现完整游戏目标。** 本次完成的是独立的无 GL 地形/窗口后端，Minecraft 的 `VK` 游戏启动仍由覆盖检查拒绝。`GL_VK / INTERLEAVED` 虽然通过 Vulkan 呈现，仍有隐藏 GL 上下文，不能作为此目标的完成结果。没有修改默认模式或解除该检查。
+## 启动
 
-## 已实现的原生窗口后端
+使用 JDK 17、Windows x86_64。Gradle `runClient` 自动在 Forge 启动前加载 `vulkanforge-native-bootstrap.jar`；引导读取工作目录下的 `config/vulkanforge-client.toml`，仅在模式为 `VK` 时启用。普通启动使用 `run` 目录中保存的配置：
 
-`NativeWindowBackend` 提供只包含 JDK 类型的调用边界：构造时传入调用方拥有的 Win32 `HWND/HINSTANCE`、尺寸和 Vulkan 版本；用 `WorldProtocol.pack` 提交 CPU 网格、图集、光照图和相机；用 `beginFrame` 在输入采样前 acquire，再用 `frame` 绘制和呈现。调用者负责窗口、事件循环和输入；后端不使用 GLFW。
-
-路径为：
-
-```text
-CPU 网格/纹理/相机
-  → NativeWorldRenderer / VulkanSceneCore
-  → 私有 Vulkan 颜色和深度图像（不透明、镂空、排序透明、可选后处理）
-  → Vulkan 全屏采样通道
-  → Vulkan Swapchain / vkQueuePresentKHR
+```powershell
+.\gradlew.bat build
+.\gradlew.bat runClient
 ```
 
-设备选择前创建 Win32 Surface，以便选择实际支持该窗口呈现的队列。此路径不调用 GL UUID 探测，不启用 Win32 external-memory/external-semaphore 扩展，不创建共享图像，不导出图像句柄，不复制到 GL framebuffer。普通帧无 CPU 像素读回；只有显式的测试截图使用 staging buffer。
+已有 IntelliJ 运行配置应执行 `.\gradlew.bat genIntellijRuns` 更新。可以在游戏配置页选择 VK 后“保存并重启”；引导参数会随进程重启保留。无需 F8。
 
-呈现有两个帧槽。复用地形颜色图像前等待对应的**最终采样提交 fence**，覆盖最后一次采样读取；仅等待地形 fence 不够。呈现完成 Semaphore 按 Swapchain 图像分配，在重新 acquire 同一图像后复用。地形与呈现使用同一条 Vulkan queue，通过图像 barrier 建立写入到采样的依赖。
+开发时可直接在独立 `run-native` 目录启动原生模式，避免修改普通游戏配置：
 
-另为每张 Swapchain 图像维护 `VK_EXT_swapchain_maintenance1` 的 **WSI presentation fence**，缩放和关闭先等待它们，再销毁呈现 Semaphore 和 Swapchain。GPU 提交 fence、`vkDeviceWaitIdle` 都不能单独证明显示系统已释放这些资源，见 [Khronos 的呈现 Semaphore 生命周期说明](https://docs.vulkan.org/guide/latest/swapchain_semaphore_reuse.html)。此后端因此额外要求 `VK_EXT_surface_maintenance1`、`VK_KHR_get_surface_capabilities2`、`VK_EXT_swapchain_maintenance1` 及 `swapchainMaintenance1` 功能；不支持时明确拒绝，既有混合/离屏设备路径不增加此要求。
+```powershell
+.\gradlew.bat -PnativeGame runClient
+.\gradlew.bat -PnativeGame -PnativeApi=V1_2 runClient
+.\gradlew.bat -PnativeGame -PnativeApi=V1_3 runClient
+```
 
-缩放重建 Swapchain 并只替换私有附件，保留世界网格、图集和相机。零尺寸不提交帧。取消已 acquire 帧、着色器录制失败和持有已 acquire 图像时关闭，都消费 acquire Semaphore 并归还图像。VSync 修改于下一次 acquire 重建 Swapchain。
+默认原生 API 为 `V1_4`。普通游戏也支持 JVM 覆盖 `-Dvulkanforge.startup=VK:V1_3`；Gradle 会将该参数转交客户端。
 
-原生图像均为 Vulkan 顶部原点，最终采样不使用 GL 路径的 Y 翻转。优先选择 UNORM Swapchain；在仅有 sRGB 格式时，最终着色器先解码显示颜色，避免附件再次编码造成颜色变亮。截图支持 RGBA/BGRA 两种 UNORM/sRGB 格式。
+外部启动器需要两个构建产物：将 `build/libs/vulkanforge-0.1.0.jar` 放入 `mods`，将独立的 `build/libs/vulkanforge-native-bootstrap.jar` 放在固定位置，并加入启动器的 **JVM 参数**：
 
-## 仍未迁移的游戏入口
+```text
+-javaagent:C:\absolute\path\vulkanforge-native-bootstrap.jar
+```
 
-| 入口 | 当前依赖与剩余工作 |
-| --- | --- |
-| Forge `ImmediateWindowHandler.load` | 模组窗口钩子运行前即可创建加载用 GL 上下文，需要无 GL 的早期窗口/启动方案。仅在 Minecraft 窗口创建时换成 `GLFW_NO_API` 不足以满足整个进程无 GL。 |
-| Minecraft `Window`、`GLX`、`RenderSystem` 初始化 | 仍创建 GL capabilities、初始化 GL 调试和默认状态，需要原生窗口及设备入口。 |
-| `TextureUtil`、`NativeImage`、`CpuTextures` | 现有 CPU 上传追踪器仍执行 GL 上传和查询。需原生纹理对象、CPU 上传及生命周期管理，不能用 GL 读回启动原生模式。 |
-| `VertexBuffer`、`TerrainMeshes` | 原版网格捕获仍关联 GL VBO 的创建/状态，回退路径仍可上传 GL。需直接发布编译完成的 CPU 网格及原生资源生命周期。 |
-| 实体、天空、粒子、手持物、GUI 与后处理 | 现有回放依赖 GL 状态、纹理镜像或共享 RenderTarget；需原生状态、附件与完整有序绘制。不能用空实现或漏画绕过。 |
-| 游戏主循环与资源重载 | `NativeWindowBackend` 尚未接入 Minecraft。需覆盖主菜单、进出世界、重载、切换维度、窗口事件和正常退出的真实游戏检查。 |
+若路径含空格，应按启动器要求对完整参数加引号。引导默认读取进程工作目录；启动器的工作目录与游戏目录不同时，用 `-javaagent:<引导jar>=<游戏目录>` 指定配置目录。缺少引导时会报告 `REJECTED_MISSING_NATIVE_BOOTSTRAP`，不会尝试隐藏 GL 上下文或回退 GL。旧报错中“backend is not connected”的无条件拒绝已移除。
 
-覆盖报告将后端标记为 `IMPLEMENTED_NOT_CONNECTED`，剩余项包含 `NATIVE_GAME_RENDER_LOOP` 和 `MINECRAFT_RESOURCES_WITHOUT_GL`。该状态不意味着 `VK` 可游玩。
+## 游戏渲染路径
+
+```text
+JVM premain → 按配置启用原生引导 → 禁用 Forge 的早期 GL 加载窗口
+Minecraft Window → GLFW_NO_API → Win32 Surface
+CPU 纹理、顶点/索引、原版着色器源码、uniform 与绘制状态
+  → NativeDeviceState（CPU 资源及状态）
+  → NativeGameBackend / NativeShaderProgram
+  → SPIR-V、Vulkan 纹理、缓冲、管线与私有颜色/深度附件
+  → 按原顺序绘制与后处理
+  → Vulkan Swapchain → vkQueuePresentKHR
+```
+
+原生引导在类加载时将游戏中的 GL 入口调用改写为 CPU 状态/资源操作；这些操作由 Vulkan 后端执行。真实 LWJGL OpenGL 类的初始化和函数入口被改写为立即失败，并记录尝试，防止遗漏调用偷偷进入驱动。GLFW 窗口创建强制 `GLFW_NO_API`，绑定 OpenGL 上下文也会失败。Forge 的早期 GL 加载窗口在创建前禁用。
+
+纹理直接来自 `NativeImage` 等 CPU 数据，顶点/索引来自游戏的 CPU 缓冲，不从 GL 下载资源。着色器使用 Minecraft 展开后的真实 GLSL，通过显式输入/输出位置、uniform 布局和深度范围变换编译为 SPIR-V。按优化后的 SPIR-V 输入接口建立顶点布局，避免未使用的属性类型冲突；管线缓存按实际布局与状态复用，不按区块 VBO 名称创建重复管线。
+
+绘制保留深度、混合、镂空、剔除、视口与裁剪状态，私有 framebuffer 负责 GUI、世界和 Fabulous 后处理。内部附件保留游戏纹理坐标约定，最终采样通道统一调整显示方向。普通帧不做 CPU 像素读回；显式截图和世界缩略图通过 Vulkan staging buffer 读取。
+
+`NativeGameBackend` 与游戏通过 JDK 类型/数组跨隔离加载器通信，使用自带 LWJGL 3.3.6；游戏仍使用 Forge 的 LWJGL。原生路径不进入 `MainWindowBackend`、`GlInterop` 或共享图像分配器。先前独立的 `NativeWindowBackend / NativeWorldRenderer` 仍用于底层无 GL 地形与 WSI 检查。
+
+## 设备与同步
+
+要求所选 Vulkan 1.2、1.3 或 1.4、`dynamicRendering`、`synchronization2`、Win32 Surface 与 Swapchain。Vulkan 1.2 使用对应 KHR 功能扩展。另外要求 `VK_EXT_surface_maintenance1`、`VK_KHR_get_surface_capabilities2`、`VK_EXT_swapchain_maintenance1` 及 `swapchainMaintenance1` 功能，用于安全回收显示资源。不要求 GL external-memory/external-semaphore；不支持必要功能时直接报错。
+
+设备选择前创建实际窗口 Surface，以确认队列可呈现。交换链 acquire 等待和首次布局转换均在 `COLOR_ATTACHMENT_OUTPUT` 建立依赖；私有图像复用等待其最后采样提交完成。呈现完成 Semaphore 按交换链图像分配，WSI presentation fence 保证缩放/关闭前显示系统已释放资源。零尺寸跳过提交，缩放及 VSync 改变重建交换链，取消帧也消费已 acquire 的信号量。
 
 ## 验证
 
-JDK 17，Windows x86_64：
+无需游戏的引导与真实 GPU 着色器检查：
 
 ```powershell
+.\gradlew.bat smokeNativeBootstrap smokeNativeModeGate smokeRenderModeConfig
+.\gradlew.bat :vulkan-lab:smokeNativeShader
 .\gradlew.bat :vulkan-lab:smokeNativeWindow
-.\gradlew.bat :vulkan-lab:smokeNativeWindow '-PvulkanVersion=1.2' '-Pvulkanforge.smokeReportDir=build/reports/native-window-1.2'
-.\gradlew.bat :vulkan-lab:smokeNativeWindow '-PvulkanVersion=1.3' '-Pvulkanforge.smokeReportDir=build/reports/native-window-1.3'
-.\gradlew.bat smokeNativeModeGate smokeRenderModeConfig
 ```
 
-`smokeNativeWindow` 在禁止加载 `org.lwjgl.opengl.*` 和 `GlInterop` 的隔离 ClassLoader 中运行，只创建 `GLFW_NO_API` 测试窗口，并检查不存在当前 OpenGL 上下文。它逐像素检查实际 Swapchain 截图中的地形、透明混合、镂空、方向、颜色、纹理补丁、后处理奇偶输出、缩放、删除/重置和重新打开；另检查零尺寸、VSync、帧取消、错误恢复、持有 acquire 时关闭。此测试不启动 Minecraft，结果明确写入 `SCOPE=NATIVE_BACKEND_ONLY`。
+`smokeNativeBootstrap` 实际加载并调用改写后的测试类，验证保存配置、模式/API、GL 禁止入口和强制无 API 窗口；`smokeNativeShader` 检查优化后的输入类型、缺失输入拒绝和管线复用。独立窗口检查在禁止 GL/互操作类加载的隔离环境中逐像素验证地形与 Swapchain，范围标记为 `NATIVE_BACKEND_ONLY`。
 
-结果与截图保存在 `build/reports/native-window/` 或指定目录。`VALIDATION=UNAVAILABLE` 时，只能说明 GPU 像素及生命周期检查通过，不能声称通过了 Vulkan 校验层检查。已配置校验层的环境可加 `-PvalidationSmoke` 强制要求实际启用。
+完整实际游戏检查会自动启动 Forge、创建隔离的测试世界，渲染不透明地形、树叶、水、玻璃、牛、箱子、营火粒子、手持物与 HUD；然后打开背包、缩放窗口、重载资源、切换 Fabulous、保存退出世界、回到主菜单并正常关闭：
 
-2026-10-27，本机 RTX 3050 Laptop GPU 上的 Vulkan 1.2、1.3、1.4 原生窗口检查均通过，包含 presentation fence 的关闭/重建路径；测试进程的 GL/互操作类加载尝试为零。`smokePresent` 既有混合呈现回归、`smokeNativeModeGate`、`smokeRenderModeConfig` 以及完整 `build` 通过。该环境未启用 Vulkan 校验层。上述结果均不构成完整 Minecraft 无 GL 游戏验证。
+```powershell
+.\gradlew.bat -PnativeGame -PnativeGameSmoke runClient
+# 按普通 run/config 中保存的 VK 模式检查启动与主菜单
+.\gradlew.bat -PnativeGameSmoke -PnativeMenuOnly runClient
+```
+
+自动游戏检查仅在显式传入 `-PnativeGameSmoke` 时启用，不随模组发布。隔离测试会重置 `run-native/options.txt` 并创建测试存档。
+
+已安装 Khronos 校验层时，可设置 `VK_LAYER_PATH` 指向其目录，设置 `VK_VALIDATION_VALIDATE_SYNC=1` 启用同步校验，再在命令中加 `-PvalidationSmoke` 强制要求层实际启用。`VALIDATION=UNAVAILABLE` 不代表通过校验层检查。
+
+2026-10-27，在本机 RTX 3050 Laptop GPU 上，Vulkan 1.4 的完整游戏检查及普通保存配置启动检查均通过，使用了实际校验层与同步校验：`OPENGL_CONTEXTS=0`、`FORBIDDEN_GL_CALLS=0`、`VALIDATION_ERRORS=0`，并在游戏退出后确认 `CLOSED=true`。完整游戏检查记录了数千次原生地形与实体/物品绘制。独立原生窗口的 Vulkan 1.2、1.3、1.4 检查也已通过；这不等同于所有 API 的完整游戏覆盖。
+
+游戏目录中的报告：
+
+| 路径 | 内容 |
+| --- | --- |
+| `logs/vulkanforge/vk-native-compatibility.json` | 成功初始化时为 `NATIVE_ACTIVE`，更新旧的拒绝报告 |
+| `logs/vulkanforge/native-game-report.txt` | 原生后端、校验层、实际呈现/绘制/上传次数和关闭结果 |
+| `logs/vulkanforge/native-game-smoke/result.txt` | 显式自动检查的范围、GL 禁止入口结果、计数与成功/失败 |
+| `logs/vulkanforge/native-game-smoke/*.png` | 从实际 Swapchain 捕获的菜单、世界、背包、缩放、重载和 Fabulous 图像 |
+
+## 当前限制
+
+- 这是功能实验，未承诺帧率提升；几何数据仍按帧上传，纹理目前仅使用基础 mip，远处纹理过滤尚未达到原版完整效果。
+- 当前验证范围为原版、Forge 与本模组；未验证任意第三方模组、自定义 GLSL、资源包和维度组合。
+- 未支持的 stencil、logic-op、像素缓冲等操作或着色器类型会明确失败。原生路径不会用 OpenGL 绘制这些内容。
+- 原生游戏目前仅支持 Windows x86_64。Vulkan 校验层是开发验证选项，正常启动不要求安装。
