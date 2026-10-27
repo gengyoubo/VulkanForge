@@ -31,6 +31,12 @@ final class TerrainPresenter implements AutoCloseable {
     void drawTranslucent(int texture, int depthTexture) { draw(texture, depthTexture, true, true); }
     private void draw(int texture, int depthTexture, boolean translucent) { draw(texture, depthTexture, translucent, true); }
     private void draw(int texture, int depthTexture, boolean translucent, boolean depthTest) {
+        int stage=translucent?TailFrameProfiler.TRANSLUCENT:TailFrameProfiler.OPAQUE;
+        TailFrameProfiler.begin(stage);
+        try { drawImpl(texture,depthTexture,translucent,depthTest); }
+        finally { TailFrameProfiler.end(stage); }
+    }
+    private void drawImpl(int texture, int depthTexture, boolean translucent, boolean depthTest) {
         if(depthTexture>0 && NativeMainWindow.nativeComposite(translucent?1:0,new Object[0]))return;
         if (quad == null) {
             builder.begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.POSITION_TEX);

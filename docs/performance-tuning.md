@@ -10,6 +10,8 @@ GL 输入生产提前 flush 的 P0 独立时序实验、开关与配对验证见
 
 Vulkan 地形批次、GL 兼容绘制与最终 GL 输出的可选执行计划见 [GL 尾部兼容模式](gl-tail-compatibility.md)。
 
+实际 Forge 的 A/B/C/D 消融、可选后处理控制和 CPU / 异步 GPU 分段计时见 [GL Tail 游戏消融](tail-game-ablation.md)。
+
 进一步拆分外部共享图像交接、兼容 Draw、深度复制和交接次数的实验见 [A / B / C / D 对照](interop-ablation.md)。
 
 原生 Vulkan 的深度复制裁减与后处理提交合并，以及原版 GL / GL46 / VK14 对照方法见 [交接与复制优化](interop-optimization.md)。

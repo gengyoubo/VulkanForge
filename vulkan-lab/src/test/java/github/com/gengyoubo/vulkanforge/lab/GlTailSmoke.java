@@ -17,7 +17,7 @@ public final class GlTailSmoke {
         long window = glfwCreateWindow(32,32,"GL tail functional smoke",0,0);
         if (window == 0) throw new AssertionError("GL context");
         glfwMakeContextCurrent(window); org.lwjgl.opengl.GL.createCapabilities();
-        Path out=Path.of("build/reports/gl-tail-smoke"); Files.createDirectories(out);
+        Path out=Path.of(System.getProperty("vulkanforge.smokeReportDir","build/reports/gl-tail-smoke")); Files.createDirectories(out);
         try (MainWindowBackend backend=new MainWindowBackend(out.resolve("backend.txt").toString(),GlInterop.deviceUUID(),GlInterop::importImage,org.lwjgl.opengl.GL11::glFinish)) {
             var send=backend.worldCommands(GlInterop::importTerrain);
             Consumer<WorldProtocol.Command> command=c->send.accept(WorldProtocol.pack(c));

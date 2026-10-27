@@ -157,6 +157,11 @@ public final class NativeMainWindow {
         return GLX._shouldClose(window);
     }
     public static void swapBuffers(long window) {
+        TailFrameProfiler.begin(TailFrameProfiler.SWAP);
+        try { swapBuffersImpl(window); }
+        finally { TailFrameProfiler.end(TailFrameProfiler.SWAP); TailFrameProfiler.endFrame(); }
+    }
+    private static void swapBuffersImpl(long window) {
         if (!active() || window != mainWindow) { GLFW.glfwSwapBuffers(window); return; }
         if (glTail) {
             // All GL consumers, including the normal final framebuffer blit, have now been queued.
@@ -216,7 +221,9 @@ public final class NativeMainWindow {
         if (!active()) return 0;
         if (glTail) nativeMode = false;
         if (nativeMode) GlInterop.flushInputsBeforeRecord();
-        return ((Number)call(renderWorldWithSky,width,height,(Object)sky,nativeMode)).intValue();
+        TailFrameProfiler.begin(TailFrameProfiler.NATIVE);
+        try { return ((Number)call(renderWorldWithSky,width,height,(Object)sky,nativeMode)).intValue(); }
+        finally { TailFrameProfiler.end(TailFrameProfiler.NATIVE); }
     }
     static boolean nativeComposite(int kind,Object[] packets){
         if(!active() || glTail)return false;
@@ -248,6 +255,16 @@ public final class NativeMainWindow {
         try { return (long[]) backend.getClass().getMethod("interopStats").invoke(backend); }
         catch (ReflectiveOperationException error) { throw new IllegalStateException("Could not read interop counters", error); }
     }
+    static double[] phaseProfileSnapshot() {
+        if (!active()) return new double[22];
+        try { return (double[]) backend.getClass().getMethod("phaseProfileSnapshot").invoke(backend); }
+        catch (ReflectiveOperationException error) { throw new IllegalStateException(error); }
+    }
+    static long[] renderCpuStats() {
+        if (!active()) return new long[3];
+        try { return (long[]) backend.getClass().getMethod("renderCpuStats").invoke(backend); }
+        catch (ReflectiveOperationException error) { throw new IllegalStateException(error); }
+    }
     static boolean worldVisible() { return active() && GLFW.glfwGetWindowAttrib(mainWindow, GLFW.GLFW_ICONIFIED) == 0; }
     static long[] worldStats() { return active() ? (long[])call(worldStats) : new long[25]; }
     /** P7-P9: {color, depth} GL textures of one Vulkan overlay pass, or null; call finishOverlay() right after compositing. */
@@ -277,6 +294,8 @@ public final class NativeMainWindow {
     }
     private static Throwable cause(Throwable error) { return error instanceof InvocationTargetException && error.getCause() != null ? error.getCause() : error; }
     private static void releaseBackend() {
+        try { TailFrameProfiler.close(); }
+        catch (RuntimeException error) { LOGGER.warn("Could not finish GL tail profiling", error); }
         try {
             NativeRenderTargets.shutdown();
             if (backend != null) { if (close != null) close.invoke(backend); else ((AutoCloseable) backend).close(); }

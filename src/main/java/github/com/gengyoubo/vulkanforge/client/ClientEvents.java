@@ -34,6 +34,7 @@ public final class ClientEvents {
             while (PREVIEW.consumeClick()) VulkanPreview.toggle();
             while (TRIANGLE.consumeClick()) launchTriangle();
             while (INSET.consumeClick()) VulkanPreview.toggleInset();
+            if(TailDiagnostics.ENABLED&&TailDiagnostics.selected().equals("D")&&VulkanPreview.directWorld())VulkanPreview.toggle();
         }
     }
 

@@ -69,6 +69,9 @@ final class SharedWorldRenderer implements AutoCloseable {
     private long overlayPasses, skyDraws, handoffGroups, handoffImages;
     private final boolean optimizeInterop = !Boolean.getBoolean("vulkanforge.noInteropOptimizations");
     private final boolean glTail = Boolean.getBoolean("vulkanforge.glTailCompatibility");
+    private final boolean tailProfile = Boolean.getBoolean("vulkanforge.tailProfile");
+    private final boolean tailDiagnostics = Boolean.getBoolean("vulkanforge.glTailDiagnostics");
+    private long renderCpuCalls, renderCpuNanos, omittedTerrainFrames;
     private int postChainDepth, nativeIntervalDepth;
     private sealed interface PendingNative permits PendingPost, PendingComposite {
         SharedRenderTargets.Target target();
@@ -145,7 +148,14 @@ final class SharedWorldRenderer implements AutoCloseable {
         return render(requestedWidth, requestedHeight, sky, false);
     }
     int render(int requestedWidth, int requestedHeight, java.util.List<Object[]> sky, boolean nativeMode) {
+        long start=tailProfile?System.nanoTime():0;
+        try { return renderImpl(requestedWidth,requestedHeight,sky,nativeMode); }
+        finally { if(tailProfile){renderCpuCalls++;renderCpuNanos+=System.nanoTime()-start;} }
+    }
+    long[] renderCpuStats(){return new long[]{renderCpuCalls,renderCpuNanos,omittedTerrainFrames};}
+    private int renderImpl(int requestedWidth, int requestedHeight, java.util.List<Object[]> sky, boolean nativeMode) {
         if (glTail && nativeMode) throw new IllegalStateException("GL tail plan requires GL-owned terrain outputs");
+        boolean omitTerrain=glTail&&tailDiagnostics&&Boolean.getBoolean("vulkanforge.glTailOmitTerrain");
         endRead();
         if (!nativeMode) finishNativeLeases();
         boolean terrain = world.ready();
@@ -201,7 +211,7 @@ final class SharedWorldRenderer implements AutoCloseable {
                     entities.record(command, stack, index * (MAX_OVERLAYS + 1) + MAX_OVERLAYS, sky, world.lightMapView(), world.lightSampler(), world.lightMapIdentity());
                     skyDraws += sky.size();
                 }
-                core.opaque(command, stack, index);
+                if(!omitTerrain)core.opaque(command, stack, index);
             }
             else {
                 vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, trianglePipeline);
@@ -248,7 +258,7 @@ final class SharedWorldRenderer implements AutoCloseable {
                     .renderArea(r -> r.offset(o -> o.set(0, 0)).extent(e -> e.set(width, height))));
             vkCmdSetViewport(command, 0, viewport);
             vkCmdSetScissor(command, 0, scissor);
-            if (terrain) core.translucent(command, stack, index);
+            if (terrain && !omitTerrain) core.translucent(command, stack, index);
             vkCmdEndRendering(command);
             timers.end(command, index, 4, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             timers.start(command, index, 1, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
@@ -296,7 +306,7 @@ final class SharedWorldRenderer implements AutoCloseable {
                 SharedPresentImage.beginGroupGL(slot.overlayColor, slot.overlayDepth); slot.nativeTargetLeased = true;
             }
             slot.serial = frames;
-            if (terrain) { terrainFrames++; sectionDraws += world.drawableSections(); translucentSectionDraws += world.translucentSections(); }
+            if (terrain) { terrainFrames++; if(omitTerrain)omittedTerrainFrames++;else{sectionDraws += world.drawableSections(); translucentSectionDraws += world.translucentSections();} }
             // Keep the GL read lease open through terrain + HUD/inset sampling, and close it before final presentation.
             if(nativeMode) nativeReading=index; else reading=index;
             int[] textures = nativeMode ? new int[]{slot.color.textureGL(),slot.depth.textureGL(),slot.translucentColor.textureGL(),slot.translucentDepth.textureGL()}
@@ -684,7 +694,16 @@ final class SharedWorldRenderer implements AutoCloseable {
     }
     private void flushUploads(){long start=System.nanoTime();context.uploads.flush();uploadFlushNanos+=System.nanoTime()-start;}
     double[] phaseProfile(){
-        waitAll();double[] a=new double[22];int p=0;
+        waitAll();return phaseProfileSnapshot();
+    }
+    /** Queries only fences already signalled; no CPU/GPU drain at diagnostic sampling boundaries. */
+    double[] phaseProfileSnapshot(){
+        for(int index=0;index<SLOT_COUNT;index++){
+            Slot slot=slots[index];
+            if(slot.pending&&vkGetFenceStatus(context.device,slot.fence)==VK_SUCCESS)timers.collect(index);
+            if(nativeTimers!=null)for(int pass=0;pass<slot.overlays;pass++)if(slot.overlayPending[pass]&&vkGetFenceStatus(context.device,slot.overlayFences[pass])==VK_SUCCESS)nativeTimers.collect(index*MAX_OVERLAYS+pass);
+        }
+        double[] a=new double[22];int p=0;
         for(int metric:new int[]{0,4,3,5}){double[] m=timers.metric(metric);a[p++]=m[0];a[p++]=m[1];}
         for(int metric=0;metric<2;metric++){double[] m=nativeTimers==null?new double[2]:nativeTimers.metric(metric);a[p++]=m[0];a[p++]=m[1];}
         a[p++]=recordNanos/1e6;a[p++]=uploadFlushNanos/1e6;a[p++]=queueSubmitNanos/1e6;a[p++]=prepareNanos/1e6;

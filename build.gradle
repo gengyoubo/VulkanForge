@@ -31,6 +31,25 @@ minecraft {
             ['vulkanforge.entityProfile', 'vulkanforge.entityLegacyBatch', 'vulkanforge.noInteropOptimizations', 'vulkanforge.earlyGlInputFlush', 'vulkanforge.glTailCompatibility'].each { key ->
                 if (System.getProperty(key) != null) property key, System.getProperty(key)
             }
+            ['tailProfile','tailProfileCpuOnly','glTailDiagnostics','glTailCase','interopProfile'].each { option ->
+                def key = 'vulkanforge.' + option
+                if (System.getProperty(key) != null) property key, System.getProperty(key)
+            }
+            if (project.hasProperty('tailAblation')) {
+                property 'vulkanforge.tailAblation', 'true'
+                property 'vulkanforge.glTailCompatibility', 'true'
+                property 'vulkanforge.glTailDiagnostics', 'true'
+                property 'vulkanforge.tailProfile', 'true'
+                property 'vulkanforge.interopProfile', 'true'
+                property 'vulkanforge.startup', 'GL_VK:V1_4'
+                ['rounds','seconds','warmup','cases'].each { option ->
+                    def key = 'tailBench.' + option
+                    if (project.hasProperty(key)) property key, project.property(key)
+                }
+                property 'tailBench.output', rootProject.file(project.findProperty('tailBench.output') ?: 'build/reports/tail-game-ablation').absolutePath
+                property 'vulkanforge.tailProfileCpuOnly', project.findProperty('tailBench.cpuOnly') ?: 'false'
+                mods { vulkanforge { source sourceSets.smoke } }
+            }
             if (project.hasProperty('vulkan13Smoke')) property 'vulkanforge.startup', 'VULKAN:V1_3'
             property 'vulkanforge.directPresent', System.getProperty('vulkanforge.directPresent', 'true')
             property 'vulkanforge.legacyPresent', System.getProperty('vulkanforge.legacyPresent', 'false')
@@ -121,6 +140,17 @@ tasks.register('offscreenBenchmarkArgs') {
     }
 }
 tasks.register('smokeGlOffscreen') { dependsOn 'smokeGl43', 'smokeGl44', 'smokeGl45', 'smokeGl46' }
+if (project.hasProperty('tailAblation')) {
+    tasks.matching { it.name == 'runClient' }.configureEach {
+        doLast {
+            def output = rootProject.file(project.findProperty('tailBench.output') ?: 'build/reports/tail-game-ablation')
+            if (!new File(output, 'status.txt').exists() || new File(output, 'status.txt').text.trim() != 'OK'
+                    || new File(output, 'exit-timeout.txt').exists()) throw new GradleException('Tail ablation failed; see ' + output)
+            new File(output, 'backend.txt').bytes = file('run/logs/vulkanforge/main-window-report.txt').bytes
+            new File(output, 'presentation.txt').bytes = file('run/logs/vulkanforge/gl-tail-report.txt').bytes
+        }
+    }
+}
 if (project.hasProperty('glTailSmoke')) {
     tasks.matching { it.name == 'runClient' }.configureEach {
         doFirst {
@@ -148,6 +178,12 @@ tasks.register('smokePostChainTransform', JavaExec) {
     mainClass = 'github.com.gengyoubo.vulkanforge.client.PostChainTransformSmoke'
     javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
     systemProperty 'log4j.configurationFile', file('src/smoke/resources/offscreen-log4j2.xml').toURI().toString()
+}
+tasks.register('smokeTailDiagnosticsTransform', JavaExec) {
+    dependsOn 'compileSmokeJava', 'processResources'
+    classpath = sourceSets.smoke.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.client.TailDiagnosticsTransformSmoke'
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
 }
 // Sampling disabled / every frame / every 60 frames, with actual GPU pixels and foreign-state restoration checks.
 ['60', '1', '0'].each { interval ->

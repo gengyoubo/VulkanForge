@@ -366,6 +366,7 @@ final class VulkanPreview {
     }
 
     static void render(GuiGraphics graphics) {
+        if(Boolean.getBoolean("vulkanforge.tailAblation")&&Minecraft.getInstance().level!=null&&!inset)return;
         if (!enabled || sink == null) return;
         RenderSystem.assertOnRenderThread();
         Minecraft minecraft = Minecraft.getInstance();

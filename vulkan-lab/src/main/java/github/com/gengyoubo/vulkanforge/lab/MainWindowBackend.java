@@ -233,6 +233,8 @@ public final class MainWindowBackend implements AutoCloseable {
     public void endNativeInterval(){if(world==null)throw new IllegalStateException("No native interval");world.endNativeInterval();}
     public long[] interopStats(){return world==null?new long[12]:world.interopStats();}
     public double[] phaseProfile(){return world==null?new double[22]:world.phaseProfile();}
+    public double[] phaseProfileSnapshot(){return world==null?new double[22]:world.phaseProfileSnapshot();}
+    public long[] renderCpuStats(){return world==null?new long[3]:world.renderCpuStats();}
     /** Captured GUI packets, consumed exactly once by the next present (including skipped/minimized frames). */
     public void gui(Object[] packets) {
         var list = new java.util.ArrayList<Object[]>(packets.length);

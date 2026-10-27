@@ -139,6 +139,7 @@ tasks.register('smokeGlTail', JavaExec) {
     mainClass = 'github.com.gengyoubo.vulkanforge.lab.GlTailSmoke'
     systemProperty 'vulkanforge.glTailCompatibility', 'true'
     systemProperty 'vulkanforge.disableValidation', 'true'
+    systemProperty 'vulkanforge.smokeReportDir', rootProject.file(rootProject.findProperty('vulkanforge.smokeReportDir') ?: 'build/reports/gl-tail-smoke').absolutePath
 }
 
 tasks.register('benchmarkBindings', JavaExec) {
