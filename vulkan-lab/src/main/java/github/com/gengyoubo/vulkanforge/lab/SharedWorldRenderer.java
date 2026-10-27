@@ -45,6 +45,7 @@ final class SharedWorldRenderer implements AutoCloseable {
     private final Consumer<String> log;
     private final Slot[] slots = {new Slot(), new Slot()};
     private final WorldScene world;
+    private final VulkanSceneCore core;
     private GpuTimers timers;
     private GpuTimers entityTimers;
     private GpuCuller culler;
@@ -80,9 +81,8 @@ final class SharedWorldRenderer implements AutoCloseable {
     SharedWorldRenderer(VulkanContext context, Function<long[], Consumer<int[]>> importer, Runnable finishGL, Consumer<String> log, SharedRenderTargets renderTargets) {
         this.context = context; this.importer = importer; this.finishGL = finishGL; this.log = log;
         this.renderTargets = renderTargets;
-        world = new WorldScene(context, log);
+        core = new VulkanSceneCore(context,SLOT_COUNT,log);world=core.world;culler=core.culler;
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            world.initialize();
             Consumer<Runnable> retire = resource -> {
                 if (completedFrames >= frames) resource.run(); else retired.addLast(new Retired(frames, resource));
             };
@@ -93,15 +93,6 @@ final class SharedWorldRenderer implements AutoCloseable {
             post = new NativePost(context, SLOT_COUNT * MAX_OVERLAYS);
             timers = new GpuTimers(context, SLOT_COUNT, log, "TERRAIN", "TERRAIN_RELEASE", "TRIANGLE", "CULLING", "TRANSLUCENT");
             if(Boolean.getBoolean("vulkanforge.entityProfile"))entityTimers=new GpuTimers(context,SLOT_COUNT*(MAX_OVERLAYS+1),log,"ENTITY_OVERLAY");
-            var familyCount = stack.ints(0);
-            vkGetPhysicalDeviceQueueFamilyProperties(context.physical, familyCount, null);
-            var families = VkQueueFamilyProperties.calloc(familyCount.get(0), stack);
-            vkGetPhysicalDeviceQueueFamilyProperties(context.physical, familyCount, families);
-            if ((families.get(context.queueFamily).queueFlags() & VK_QUEUE_COMPUTE_BIT) != 0 && !Boolean.getBoolean("vulkanforge.disableGpuCulling"))
-                culler = new GpuCuller(context, SLOT_COUNT);
-            if (culler != null) world.enableGpuDriven(culler);
-            log.accept("GPU_DRIVEN=" + (world.meshShaderActive() ? "NV_TASK_MESH" : culler != null && culler.compact() ? "COMPACT_INDIRECT_COUNT" : "FALLBACK"));
-            log.accept("GPU_CULLING=" + (culler == null ? "DISABLED" : world.meshShaderActive() ? "TASK_SHADER" : "COMPUTE_INDIRECT"));
             var handle = stack.mallocLong(1);
             check(vkCreateCommandPool(context.device, VkCommandPoolCreateInfo.calloc(stack).sType$Default().queueFamilyIndex(context.queueFamily)
                     .flags(VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT), null, handle), "shared world pool"); pool = handle.get(0);
@@ -181,7 +172,7 @@ final class SharedWorldRenderer implements AutoCloseable {
             int metric = terrain ? 0 : 2;
             if (terrain && culler != null) {
                 timers.start(command, index, 3, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-                world.prepareCulling(command, stack, culler, index);
+                core.prepare(command, stack, index);
                 timers.end(command, index, 3, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
             }
             timers.start(command, index, metric, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
@@ -195,7 +186,7 @@ final class SharedWorldRenderer implements AutoCloseable {
                     entities.record(command, stack, index * (MAX_OVERLAYS + 1) + MAX_OVERLAYS, sky, world.lightMapView(), world.lightSampler(), world.lightMapIdentity());
                     skyDraws += sky.size();
                 }
-                world.draw(command, stack, culler, index);
+                core.opaque(command, stack, index);
             }
             else {
                 vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, trianglePipeline);
@@ -239,7 +230,7 @@ final class SharedWorldRenderer implements AutoCloseable {
                     .renderArea(r -> r.offset(o -> o.set(0, 0)).extent(e -> e.set(width, height))));
             vkCmdSetViewport(command, 0, viewport);
             vkCmdSetScissor(command, 0, scissor);
-            if (terrain) world.drawTranslucent(command, stack, index);
+            if (terrain) core.translucent(command, stack, index);
             vkCmdEndRendering(command);
             timers.end(command, index, 4, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             timers.start(command, index, 1, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
@@ -729,8 +720,8 @@ final class SharedWorldRenderer implements AutoCloseable {
         }
         if (timers != null) { timers.report(log); timers.close(); timers = null; }
         if(entityTimers!=null){entityTimers.report(log);entityTimers.close();entityTimers=null;}
-        if (culler != null) { culler.report(log); culler.close(); culler = null; }
-        world.close(); destroyTargets();
+        if (culler != null) { culler.report(log); culler = null; }
+        core.close(); destroyTargets();
         if(composite!=null){composite.close();composite=null;}
         if(post!=null){post.close();post=null;}
         if (trianglePipeline != 0) { vkDestroyPipeline(context.device, trianglePipeline, null); trianglePipeline = 0; }

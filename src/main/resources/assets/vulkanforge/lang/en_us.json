@@ -48,5 +48,12 @@
   "vulkanforge.gl46.waiting": "OpenGL %s terrain | waiting for section meshes",
   "vulkanforge.gl46.controls": "F8 toggle | GPU culling + indirect draws",
   "vulkanforge.gl46.unavailable": "OpenGL %s terrain unavailable: %s",
-  "vulkanforge.gl46.failed": "OpenGL %s terrain failed and fell back to vanilla; see the log"
+  "vulkanforge.gl46.failed": "OpenGL %s terrain failed and fell back to vanilla; see the log",
+  "vulkanforge.config.mode": "Running mode",
+  "vulkanforge.config.mode.gl": "GL",
+  "vulkanforge.config.mode.gl_vk": "GL-VK (Hybrid)",
+  "vulkanforge.config.mode.vk": "VK (Experimental)",
+  "vulkanforge.config.mode.gl.tooltip": "OpenGL rendering, GL 4.3–4.6 compatibility and performance.",
+  "vulkanforge.config.mode.gl_vk.tooltip": "Vulkan draws supported content; OpenGL fallback and shared-resource interop remain available.",
+  "vulkanforge.config.mode.vk.tooltip": "Native Vulkan development mode, with no GL fallback. Native offscreen tests come first; full game startup is not available yet."
 }

@@ -2,6 +2,7 @@ package github.com.gengyoubo.vulkanforge.client;
 
 import github.com.gengyoubo.vulkanforge.config.VulkanForgeConfig;
 import github.com.gengyoubo.vulkanforge.config.VulkanForgeConfig.*;
+import dev.vulkanforge.bridge.RenderMode;
 import java.util.*;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
@@ -17,7 +18,7 @@ import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
 /** Mods list "Config" screen. Edits a copy of the values; Done writes them to vulkanforge-client.toml. */
 public final class VulkanForgeConfigScreen extends Screen {
     private final Screen parent;
-    private Backend backend = VulkanForgeConfig.BACKEND.get();
+    private RenderMode mode = VulkanForgeConfig.MODE.get();
     private VulkanVersion vulkanVersion = VulkanForgeConfig.VULKAN_VERSION.get();
     private OpenGLVersion openGLVersion = VulkanForgeConfig.OPENGL_VERSION.get();
     private final Map<NvidiaExtension, Boolean> extensions = new EnumMap<>(NvidiaExtension.class);
@@ -26,6 +27,7 @@ public final class VulkanForgeConfigScreen extends Screen {
     private final List<CycleButton<Boolean>> extensionButtons = new ArrayList<>();
     private int extensionLabelY;
     private boolean restarting;
+    private Button restartButton;
 
     public VulkanForgeConfigScreen(Screen parent) {
         super(Component.translatable("vulkanforge.config.title"));
@@ -41,9 +43,10 @@ public final class VulkanForgeConfigScreen extends Screen {
 
     @Override protected void init() {
         int column = 150, gap = 10, left = width / 2 - column - gap / 2, right = width / 2 + gap / 2, y = 38;
-        addRenderableWidget(CycleButton.<Backend>builder(value -> Component.translatable("vulkanforge.config.backend." + value.name().toLowerCase(Locale.ROOT)))
-                .withValues(Backend.values()).withInitialValue(backend)
-                .create(left, y, column * 2 + gap, 20, Component.translatable("vulkanforge.config.backend"), (button, value) -> { backend = value; refreshActive(); }));
+        addRenderableWidget(CycleButton.<RenderMode>builder(value -> Component.translatable("vulkanforge.config.mode." + value.name().toLowerCase(Locale.ROOT)))
+                .withValues(RenderMode.values()).withInitialValue(mode)
+                .withTooltip(value->Tooltip.create(Component.translatable("vulkanforge.config.mode."+value.name().toLowerCase(Locale.ROOT)+".tooltip")))
+                .create(left, y, column * 2 + gap, 20, Component.translatable("vulkanforge.config.mode"), (button, value) -> { mode = value; refreshActive(); }));
         y += 24;
         vulkanButton = addRenderableWidget(CycleButton.<VulkanVersion>builder(value -> versionLabel(Component.literal(value.label), value.implemented))
                 .withValues(VulkanVersion.values()).withInitialValue(vulkanVersion)
@@ -63,7 +66,7 @@ public final class VulkanForgeConfigScreen extends Screen {
                     .withTooltip(value -> Tooltip.create(Component.literal(extension.extensionName + "\n").append(Component.translatable(key + ".tooltip"))))
                     .create(i % 2 == 0 ? left : right, y + i / 2 * 24, column, 20, Component.translatable(key), (button, value) -> extensions.put(extension, value))));
         }
-        var restart = addRenderableWidget(Button.builder(Component.translatable("vulkanforge.config.restart"), button -> restart())
+        var restart = restartButton = addRenderableWidget(Button.builder(Component.translatable("vulkanforge.config.restart"), button -> restart())
                 .bounds(left, height - 26, 100, 20).build());
         restart.active = minecraft.level == null;
         restart.setTooltip(Tooltip.create(Component.translatable(restart.active
@@ -80,13 +83,14 @@ public final class VulkanForgeConfigScreen extends Screen {
     }
 
     private void refreshActive() {
-        boolean vulkan = backend == Backend.VULKAN;
-        vulkanButton.active = vulkan; openGLButton.active = !vulkan;
+        boolean vulkan = mode.usesVulkan();
+        vulkanButton.active = vulkan; openGLButton.active = mode==RenderMode.GL;
         for (var button : extensionButtons) button.active = vulkan;
+        if(restartButton!=null){restartButton.active=minecraft.level==null&&mode!=RenderMode.VK;restartButton.setTooltip(Tooltip.create(Component.translatable(mode==RenderMode.VK?"vulkanforge.config.mode.vk.tooltip":minecraft.level!=null?"vulkanforge.config.restart.in_world":"vulkanforge.config.restart.tooltip")));}
     }
 
     private void save() {
-        VulkanForgeConfig.BACKEND.set(backend);
+        VulkanForgeConfig.MODE.set(mode);
         VulkanForgeConfig.VULKAN_VERSION.set(vulkanVersion);
         VulkanForgeConfig.OPENGL_VERSION.set(openGLVersion);
         extensions.forEach((extension, value) -> VulkanForgeConfig.NVIDIA_EXTENSIONS.get(extension).set(value));
@@ -94,7 +98,7 @@ public final class VulkanForgeConfigScreen extends Screen {
     }
 
     private void restart() {
-        if (restarting || minecraft.level != null) return;
+        if (restarting || minecraft.level != null || mode==RenderMode.VK) return;
         try { save(); }
         catch (RuntimeException error) { restartFailed(error, false); return; }
         restarting = true;
@@ -122,7 +126,7 @@ public final class VulkanForgeConfigScreen extends Screen {
         renderBackground(graphics);
         graphics.drawCenteredString(font, title, width / 2, 12, 0xffffff);
         graphics.drawCenteredString(font, Component.translatable("vulkanforge.config.pending", VulkanForgeConfig.startup().toString()), width / 2, 24, 0xffaa55);
-        graphics.drawCenteredString(font, Component.translatable("vulkanforge.config.nvidia"), width / 2, extensionLabelY, backend == Backend.VULKAN ? 0xa0c8ff : 0x707070);
+        graphics.drawCenteredString(font, Component.translatable("vulkanforge.config.nvidia"), width / 2, extensionLabelY, mode.usesVulkan() ? 0xa0c8ff : 0x707070);
         super.render(graphics, mouseX, mouseY, partialTick);
     }
 

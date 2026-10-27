@@ -57,4 +57,6 @@ TERRAIN_POST3 的优化前后，逐例断言实际复制为 2→1、VK 提交为
 
 `PostChainTransformSmoke` 对实际 Minecraft `PostPass` / `PostChain` 应用发布的 coremod，验证字节码，并通过 JVM 执行正常及异常退出路径。`NativePostBatchSmoke` 检查交替读写依赖、单次提交、双帧槽、嵌套范围、GL 回退排空、Shader 拒绝、尺寸变化和销毁。`SharedOffscreenSmoke` 检查旧版共享图像与实体 overlay 的像素、深度和生命周期。
 
+可通过 `.\gradlew.bat smokePostChainTransform :vulkan-lab:smokeNativePostBatch` 重跑新增回归检查。开发运行可用 `-Dvulkanforge.noInteropOptimizations=true` 配合 `runClient` 恢复旧行为；常规启动器则把该参数作为 JVM 参数传入。
+
 验证层可用性以原始日志为准；常规计时关闭验证层。通过像素与计数检查不等于通过了 Vulkan 验证层。

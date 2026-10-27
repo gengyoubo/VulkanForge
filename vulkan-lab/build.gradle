@@ -126,6 +126,12 @@ tasks.register('smokeResources', JavaExec) {
     tasks.register('smokeVk' + api.replace('.', '')) { dependsOn checks }
 }
 tasks.register('smokeVulkanOffscreen') { dependsOn 'smokeVk12', 'smokeVk13', 'smokeVk14' }
+tasks.register('smokeNativePostBatch', JavaExec) {
+    dependsOn 'testClasses'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.lab.NativePostBatchSmoke'
+    systemProperty 'vulkanforge.disableValidation', 'true'
+}
 
 tasks.register('benchmarkBindings', JavaExec) {
     dependsOn 'testClasses'

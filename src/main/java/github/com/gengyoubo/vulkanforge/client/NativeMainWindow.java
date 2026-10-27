@@ -35,10 +35,11 @@ public final class NativeMainWindow {
     private NativeMainWindow() { }
 
     public static long createWindow(IntSupplier width, IntSupplier height, Supplier<String> title, LongSupplier monitor) {
-        long legacy = ImmediateWindowHandler.setupMinecraftWindow(width, height, title, monitor);
         var startup = VulkanForgeConfig.startup();
+        if(startup.mode()==dev.vulkanforge.bridge.RenderMode.VK)NativeModeAvailability.rejectIncompleteGameLaunch(FMLPaths.GAMEDIR.get().resolve("logs/vulkanforge/vk-native-compatibility.json"));
+        long legacy = ImmediateWindowHandler.setupMinecraftWindow(width, height, title, monitor);
         LOGGER.info("VulkanForge startup renderer: {}", startup);
-        if (startup.backend() == VulkanForgeConfig.Backend.OPENGL)
+        if (startup.mode() == dev.vulkanforge.bridge.RenderMode.GL)
             return Gl46Context.window(legacy, startup.openGLVersion(), width, height, title, monitor);
         if (!startup.vulkanMainWindow()) {
             LOGGER.warn("Vulkan {} is not implemented yet; keeping the original OpenGL window", startup.vulkanVersion().label);

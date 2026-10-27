@@ -10,7 +10,7 @@ import static org.lwjgl.vulkan.KHRExternalMemoryWin32.*;
 import static org.lwjgl.vulkan.KHRExternalSemaphoreWin32.*;
 
 /** Exported Vulkan allocation; imported GL objects belong to the host's existing LWJGL. */
-final class SharedPresentImage implements AutoCloseable {
+final class SharedPresentImage implements AutoCloseable, VulkanImageBinding {
     final VulkanContext context;
     long image, memory, ready, complete, view;
     private long memoryHandle, readyHandle, completeHandle;
@@ -20,6 +20,7 @@ final class SharedPresentImage implements AutoCloseable {
         this(context, width, height, importer, false);
     }
     SharedPresentImage(VulkanContext context, int width, int height, Function<long[], Consumer<int[]>> importer, boolean depth) {
+        if(!context.interopEnabled())throw new IllegalStateException("Shared images are forbidden in a native Vulkan context");
         this.context = context;
         format = depth ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
         aspect = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
@@ -58,7 +59,7 @@ final class SharedPresentImage implements AutoCloseable {
                 .semaphore(semaphore).handleType(VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT), handle), "export GL semaphore"); return handle.get(0);
     }
     void copyFromGL(int source, int width, int height) { glImage.accept(new int[]{source, width, height}); }
-    long view() {
+    @Override public long view() {
         if (view == 0) try (MemoryStack stack = MemoryStack.stackPush()) {
             var handle = stack.mallocLong(1);
             check(vkCreateImageView(context.device, VkImageViewCreateInfo.calloc(stack).sType$Default().image(image)

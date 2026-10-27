@@ -37,7 +37,7 @@ final class NativePost implements AutoCloseable {
             return new Program(pipeline(vertex,fragment,layout,blend,stack),layout,setLayout,pool,sets,new GpuBuffer[slots],count);
         }catch(Throwable error){if(pool!=0)vkDestroyDescriptorPool(context.device,pool,null);if(layout!=0)vkDestroyPipelineLayout(context.device,layout,null);if(setLayout!=0)vkDestroyDescriptorSetLayout(context.device,setLayout,null);throw error;}});
     }
-    void record(VkCommandBuffer command,MemoryStack stack,int slot,Object[] packet,SharedPresentImage[] inputs){
+    void record(VkCommandBuffer command,MemoryStack stack,int slot,Object[] packet,VulkanImageBinding[] inputs){
         Program program=program(packet);if(program.uniforms[slot]==null)program.uniforms[slot]=new GpuBuffer(context,1024,VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
         program.uniforms[slot].mapped.duplicate().order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer().put((float[])packet[4]);
         var writes=VkWriteDescriptorSet.calloc(inputs.length+1,stack);int[] metadata=(int[])packet[3];

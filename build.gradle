@@ -28,7 +28,7 @@ minecraft {
             mods { vulkanforge { source sourceSets.main } }
         }
         client {
-            ['vulkanforge.entityProfile', 'vulkanforge.entityLegacyBatch'].each { key ->
+            ['vulkanforge.entityProfile', 'vulkanforge.entityLegacyBatch', 'vulkanforge.noInteropOptimizations'].each { key ->
                 if (System.getProperty(key) != null) property key, System.getProperty(key)
             }
             if (project.hasProperty('vulkan13Smoke')) property 'vulkanforge.startup', 'VULKAN:V1_3'
@@ -115,6 +115,13 @@ tasks.register('offscreenBenchmarkArgs') {
     }
 }
 tasks.register('smokeGlOffscreen') { dependsOn 'smokeGl43', 'smokeGl44', 'smokeGl45', 'smokeGl46' }
+tasks.register('smokePostChainTransform', JavaExec) {
+    dependsOn 'compileSmokeJava', 'processResources'
+    classpath = sourceSets.smoke.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.client.PostChainTransformSmoke'
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+    systemProperty 'log4j.configurationFile', file('src/smoke/resources/offscreen-log4j2.xml').toURI().toString()
+}
 // Sampling disabled / every frame / every 60 frames, with actual GPU pixels and foreign-state restoration checks.
 ['60', '1', '0'].each { interval ->
     tasks.register('smokeTerrainTuning' + interval, JavaExec) {

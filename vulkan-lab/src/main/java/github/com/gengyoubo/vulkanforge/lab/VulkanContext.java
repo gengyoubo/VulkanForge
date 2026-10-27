@@ -73,6 +73,7 @@ final class VulkanContext implements AutoCloseable {
         interop = true; deviceUUID = uuid;
         initialize(0, VK.getInstanceVersionSupported(), requireValidation);
     }
+    boolean interopEnabled(){return interop;}
 
     void attachWin32(long hwnd, long hinstance) {
         try (MemoryStack stack = MemoryStack.stackPush()) {

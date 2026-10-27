@@ -1,6 +1,7 @@
 package github.com.gengyoubo.vulkanforge.client;
 
 import github.com.gengyoubo.vulkanforge.VulkanForge;
+import dev.vulkanforge.bridge.RenderMode;
 import github.com.gengyoubo.vulkanforge.config.VulkanForgeConfig;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.components.AbstractWidget;
@@ -19,7 +20,7 @@ import java.nio.file.*;
 @Mod.EventBusSubscriber(modid = VulkanForge.MOD_ID, value = Dist.CLIENT)
 public final class ConfigScreenSmoke {
     private static int stage, ticks;
-    private static VulkanForgeConfig.Backend original;
+    private static RenderMode original;
 
     @SubscribeEvent public static void tick(TickEvent.ClientTickEvent event) {
         if (!Boolean.getBoolean("vulkanforge.configSmoke") || event.phase != TickEvent.Phase.END || stage == 99) return;
@@ -30,15 +31,15 @@ public final class ConfigScreenSmoke {
             if (stage == 0 && mc.getOverlay() == null && mc.screen instanceof TitleScreen title) {
                 if (Boolean.getBoolean("vulkanforge.restartClientSmoke") && Files.exists(restartMarker)) {
                     String[] state = Files.readString(restartMarker).split("\\n");
-                    var expected = VulkanForgeConfig.Backend.valueOf(state[1]);
-                    if (VulkanForgeConfig.startup().backend() != expected) throw new AssertionError("Restart did not apply " + expected);
-                    VulkanForgeConfig.BACKEND.set(VulkanForgeConfig.Backend.valueOf(state[0]));
+                    var expected = RenderMode.valueOf(state[1]);
+                    if (VulkanForgeConfig.startup().mode() != expected) throw new AssertionError("Restart did not apply " + expected);
+                    VulkanForgeConfig.MODE.set(RenderMode.valueOf(state[0]));
                     VulkanForgeConfig.SPEC.save();
                     Files.delete(restartMarker);
                     Files.writeString(report, "PASS config factory, widgets, Done saved TOML, Save and restart relaunched Minecraft with " + expected + "\nSTATUS=OK\n");
                     stage = 99; mc.stop(); return;
                 }
-                original = VulkanForgeConfig.BACKEND.get();
+                original = VulkanForgeConfig.MODE.get();
                 var info = ModList.get().getModContainerById(VulkanForge.MOD_ID).orElseThrow().getModInfo();
                 // Same lookup the Mods list uses to enable its "Config" button.
                 var screen = ConfigScreenHandler.getScreenFactoryFor(info).orElseThrow(() -> new AssertionError("No config screen registered")).apply(mc, title);
@@ -52,16 +53,17 @@ public final class ConfigScreenSmoke {
                 // Cycle the backend through the screen itself, then press Done.
                 CycleButton<?> backend = (CycleButton<?>) widgets.get(0);
                 backend.onPress();
+                if(Boolean.getBoolean("vulkanforge.restartClientSmoke") && backend.getValue()==RenderMode.VK)backend.onPress();
                 widgets.get(widgets.size() - 2).onClick(0, 0);
                 stage = 2; ticks = 0;
             } else if (stage == 2 && ++ticks > 5) {
-                if (VulkanForgeConfig.BACKEND.get() == original) throw new AssertionError("Done did not store the new backend");
+                if (VulkanForgeConfig.MODE.get() == original) throw new AssertionError("Done did not store the new backend");
                 String toml = Files.readString(FMLPaths.CONFIGDIR.get().resolve("vulkanforge-client.toml"));
-                if (!toml.contains("backend = \"" + VulkanForgeConfig.BACKEND.get().name() + "\"")) throw new AssertionError("TOML not saved:\n" + toml);
+                if (!toml.contains("mode = \"" + VulkanForgeConfig.MODE.get().name() + "\"")) throw new AssertionError("TOML not saved:\n" + toml);
                 if (!(mc.screen instanceof TitleScreen)) throw new AssertionError("Done did not return to the parent screen");
                 if (Boolean.getBoolean("vulkanforge.restartClientSmoke")) {
                     Files.createDirectories(report.getParent());
-                    Files.writeString(restartMarker, original.name() + "\n" + VulkanForgeConfig.BACKEND.get().name());
+                    Files.writeString(restartMarker, original.name() + "\n" + VulkanForgeConfig.MODE.get().name());
                     mc.setScreen(new VulkanForgeConfigScreen(mc.screen));
                     var restart = mc.screen.children().stream().filter(AbstractWidget.class::isInstance)
                             .map(AbstractWidget.class::cast).toList().get(expected() - 3);
@@ -69,7 +71,7 @@ public final class ConfigScreenSmoke {
                     restart.onClick(0, 0);
                     stage = 3; ticks = 0; return;
                 }
-                VulkanForgeConfig.BACKEND.set(original); VulkanForgeConfig.SPEC.save();
+                VulkanForgeConfig.MODE.set(original); VulkanForgeConfig.SPEC.save();
                 Files.createDirectories(report.getParent());
                 Files.writeString(report, "PASS config factory, " + expected() + " widgets, Done saved backend to TOML and returned to parent\nSTATUS=OK\n");
                 stage = 99; mc.stop();

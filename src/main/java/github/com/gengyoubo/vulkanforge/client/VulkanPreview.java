@@ -43,7 +43,7 @@ final class VulkanPreview {
     static void toggle() {
         RenderSystem.assertOnRenderThread();
         if (enabled) close();
-        else if (VulkanForgeConfig.startup().backend() == VulkanForgeConfig.Backend.OPENGL) enableGl();
+        else if (VulkanForgeConfig.startup().mode() == dev.vulkanforge.bridge.RenderMode.GL) enableGl();
         else {
             enabled = true;
             uploaded = lastLogged = 0;
