@@ -28,7 +28,7 @@ minecraft {
             mods { vulkanforge { source sourceSets.main } }
         }
         client {
-            ['vulkanforge.entityProfile', 'vulkanforge.entityLegacyBatch', 'vulkanforge.noInteropOptimizations'].each { key ->
+            ['vulkanforge.entityProfile', 'vulkanforge.entityLegacyBatch', 'vulkanforge.noInteropOptimizations', 'vulkanforge.earlyGlInputFlush', 'vulkanforge.glTailCompatibility'].each { key ->
                 if (System.getProperty(key) != null) property key, System.getProperty(key)
             }
             if (project.hasProperty('vulkan13Smoke')) property 'vulkanforge.startup', 'VULKAN:V1_3'
@@ -47,6 +47,12 @@ minecraft {
             }
             if (project.hasProperty('worldSmoke')) {
                 property 'vulkanforge.worldSmoke', 'true'
+                mods { vulkanforge { source sourceSets.smoke } }
+            }
+            if (project.hasProperty('glTailSmoke')) {
+                property 'vulkanforge.glTailSmoke', 'true'
+                property 'vulkanforge.glTailCompatibility', 'true'
+                property 'vulkanforge.startup', 'GL_VK:V1_4'
                 mods { vulkanforge { source sourceSets.smoke } }
             }
             if (project.hasProperty('gl46Smoke') || project.hasProperty('gl46Move')) {
@@ -115,6 +121,27 @@ tasks.register('offscreenBenchmarkArgs') {
     }
 }
 tasks.register('smokeGlOffscreen') { dependsOn 'smokeGl43', 'smokeGl44', 'smokeGl45', 'smokeGl46' }
+if (project.hasProperty('glTailSmoke')) {
+    tasks.matching { it.name == 'runClient' }.configureEach {
+        doFirst {
+            def output = file('run/logs/vulkanforge/gl-tail-smoke/report.txt')
+            output.parentFile.mkdirs(); output.text = 'STATUS=RUNNING\n'
+        }
+        doLast {
+            def output = file('run/logs/vulkanforge/gl-tail-smoke/report.txt')
+            def window = file('run/logs/vulkanforge/main-window-report.txt')
+            def tail = file('run/logs/vulkanforge/gl-tail-report.txt')
+            if (!output.exists() || !output.text.contains('STATUS=OK') || output.text.contains('EXIT_TIMEOUT')
+                    || !window.exists() || !window.text.contains('HYBRID_EXECUTION_PLAN=GL_TAIL')
+                    || !window.text.contains('FINAL_PRESENTED_FRAMES=0') || !window.text.contains('VALIDATION_ERRORS=0')
+                    || !tail.exists() || !tail.text.contains('CLOSED=true')) {
+                throw new GradleException('GL tail smoke failed or did not close; see run/logs/vulkanforge/gl-tail-smoke/report.txt')
+            }
+            new File(output.parentFile, 'backend.txt').bytes = window.bytes
+            new File(output.parentFile, 'presentation.txt').bytes = tail.bytes
+        }
+    }
+}
 tasks.register('smokePostChainTransform', JavaExec) {
     dependsOn 'compileSmokeJava', 'processResources'
     classpath = sourceSets.smoke.runtimeClasspath

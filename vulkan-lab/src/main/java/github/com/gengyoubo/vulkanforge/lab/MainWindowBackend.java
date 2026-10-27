@@ -80,6 +80,7 @@ public final class MainWindowBackend implements AutoCloseable {
     private Function<long[], Consumer<int[]>> terrainImporter;
     private final Function<long[], Consumer<int[]>> importer;
     private final Runnable finishGL;
+    private final boolean glTail = Boolean.getBoolean("vulkanforge.glTailCompatibility");
 
     public MainWindowBackend(String logPath, byte[] uuid, Function<long[], Consumer<int[]>> importer, Runnable finishGL) throws Exception {
         this(logPath, uuid, importer, finishGL, VulkanContext.requestedApiVersion());
@@ -121,7 +122,8 @@ public final class MainWindowBackend implements AutoCloseable {
             }
             // Check actual handle import and FBO creation before the caller replaces the visible window.
             try (var probe = new SharedPresentImage(context, 16, 16, importer)) { log("SHARED_IMAGE_PROBE=OK"); }
-            log("BACKEND=WIN32_VULKAN_SWAPCHAIN_GPU_INTEROP");
+            log("BACKEND=" + (glTail ? "WIN32_VULKAN_TERRAIN_GL_TAIL" : "WIN32_VULKAN_SWAPCHAIN_GPU_INTEROP"));
+            log("HYBRID_EXECUTION_PLAN=" + (glTail ? "GL_TAIL" : "INTERLEAVED"));
             log("GL_BINDINGS=HOST_CALLBACKS");
             log("FRAMES_IN_FLIGHT=" + FRAMES_IN_FLIGHT);
             log("ACQUIRE_MODE=" + (lateAcquire ? "LATE" : acquirer == null ? "EARLY" : alwaysDefer ? "ASYNC_ALWAYS" : "ADAPTIVE"));
@@ -144,7 +146,10 @@ public final class MainWindowBackend implements AutoCloseable {
         if ((features.optimalTilingFeatures() & VK_FORMAT_FEATURE_BLIT_SRC_BIT) == 0) throw new IllegalStateException("Shared image cannot be a blit source");
     }
 
-    public void attach(long hwnd, long hinstance) { context.attachWin32(hwnd, hinstance); log("MAIN_HWND=" + Long.toUnsignedString(hwnd)); log("SURFACE_CREATED=true"); }
+    public void attach(long hwnd, long hinstance) {
+        if (glTail) throw new IllegalStateException("GL tail plan presents through the existing GL window");
+        context.attachWin32(hwnd, hinstance); log("MAIN_HWND=" + Long.toUnsignedString(hwnd)); log("SURFACE_CREATED=true");
+    }
     public void prepare(int width, int height) { if (width > 0 && height > 0) recreate(width, height); }
     public long frames() { return frames; }
     /** {frames sampling existing targets, frames copying GL targets, allocated compatibility images}. */
@@ -203,7 +208,7 @@ public final class MainWindowBackend implements AutoCloseable {
         return world().render(width, height, list, nativeMode);
     }
     public boolean nativeComposite(int framebuffer,int width,int height,int kind,Object[] packets){
-        if(world==null)return false;
+        if(glTail || world==null)return false;
         var list=new java.util.ArrayList<Object[]>();for(Object packet:packets)list.add((Object[])packet);
         boolean supported=world.composeNative(framebuffer,width,height,kind,list);
         if(!supported)flushNativePosts();
@@ -213,10 +218,13 @@ public final class MainWindowBackend implements AutoCloseable {
         if (renderTargets == null) renderTargets = new SharedRenderTargets(context, terrainImporter, finishGL, this::log);
         return renderTargets;
     }
-    public int[] createRenderTarget(int framebuffer, int width, int height) { return targets().create(framebuffer, width, height); }
+    public int[] createRenderTarget(int framebuffer, int width, int height) {
+        if (glTail) throw new IllegalStateException("GL tail RenderTargets must remain private to GL");
+        return targets().create(framebuffer, width, height);
+    }
     public void destroyRenderTarget(int framebuffer) { flushNativePosts(); if (renderTargets != null) renderTargets.destroy(framebuffer); }
     public long[] renderTargetStats() { return renderTargets == null ? new long[6] : renderTargets.stats(); }
-    public boolean nativePost(Object[] packet) { boolean supported=world != null && world.postNative(packet);if(!supported)flushNativePosts();return supported; }
+    public boolean nativePost(Object[] packet) { boolean supported=!glTail && world != null && world.postNative(packet);if(!supported)flushNativePosts();return supported; }
     public void beginNativePostChain(){if(world!=null)world.beginPostChain();}
     public void endNativePostChain(){if(world!=null)world.endPostChain();}
     public void flushNativePosts(){if(world!=null)world.flushPosts();}
@@ -245,6 +253,7 @@ public final class MainWindowBackend implements AutoCloseable {
     public int[] renderOverlay(Object[] packets) { return renderOverlay(packets, false); }
     /** P11: {@code clearDepth} starts the overlay from depth 1.0 (hand, GUI) instead of this frame's terrain depth. */
     public int[] renderOverlay(Object[] packets, boolean clearDepth) {
+        if (glTail) return null;
         if (world == null) return null;
         var list = new java.util.ArrayList<Object[]>(packets.length);
         for (Object packet : packets) list.add((Object[]) packet);
@@ -360,6 +369,7 @@ public final class MainWindowBackend implements AutoCloseable {
     }
 
     public void present(int sourceFramebuffer, int sourceWidth, int sourceHeight, int framebufferWidth, int framebufferHeight) throws IOException {
+        if (glTail) throw new IllegalStateException("GL tail must not switch back to Vulkan for final presentation");
         measureWork();
         if (deferredAcquire()) deferredFrames++;
         finishWorldFrame();

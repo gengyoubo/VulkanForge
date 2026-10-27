@@ -14,9 +14,24 @@ import static org.lwjgl.opengl.EXTSemaphoreWin32.glImportSemaphoreWin32HandleEXT
 public final class GlInterop {
     private GlInterop() { }
     private static final boolean PROFILE = Boolean.getBoolean("vulkanforge.interopProfile");
+    private static final boolean EARLY_INPUT_FLUSH = Boolean.getBoolean("vulkanforge.earlyGlInputFlush");
     private static long waitCalls, signalCalls, flushCalls, waitNanos, signalNanos, flushNanos;
+    private static long inputFlushCalls, inputFlushNanos;
     /** CPU call duration only; this does not measure the GPU's semaphore wait span. Host GL loader owns these counters. */
     public static long[] groupedCpuStats() { return new long[]{waitCalls,signalCalls,flushCalls,waitNanos,signalNanos,flushNanos}; }
+    /** Optional scheduling experiment, on the host GL render thread after its current production work.
+     * Starts that work before CPU Vulkan recording, without changing leases or semaphore ordering.
+     * glFlush does not establish that the input has finished; the existing external wait is still required.
+     */
+    public static void flushInputsBeforeRecord() {
+        if (!EARLY_INPUT_FLUSH) return;
+        long start = PROFILE ? System.nanoTime() : 0;
+        glFlush();
+        inputFlushCalls++;
+        if (PROFILE) inputFlushNanos += System.nanoTime() - start;
+    }
+    /** Separate from grouped handoffs: the optional extra flush has no semaphore or image arguments. */
+    public static long[] inputFlushStats() { return new long[]{inputFlushCalls, inputFlushNanos}; }
     public static byte[] deviceUUID() {
         var caps = GL.getCapabilities();
         if (!(caps.GL_EXT_memory_object_win32 && caps.GL_EXT_semaphore_win32)) throw new IllegalStateException("GL Win32 external memory/semaphore extensions are required");

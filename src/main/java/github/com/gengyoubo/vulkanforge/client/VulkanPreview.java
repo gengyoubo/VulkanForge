@@ -167,7 +167,7 @@ final class VulkanPreview {
                             && (!Minecraft.useShaderTransparency() || nativeTerrain()
                             && NativeRenderTargets.shared(Minecraft.getInstance().levelRenderer.getTranslucentTarget()));
                     // P7/P8: entity and block-entity draws until AFTER_BLOCK_ENTITIES go to the Vulkan entity pass when supported.
-                    if (translucentPending) { EntityTextures.poll(); EntityDraws.beginFrame(RenderSystem.getShaderTexture(2), PRESENTER); }
+                    if (translucentPending && !NativeMainWindow.glTailCompatibility()) { EntityTextures.poll(); EntityDraws.beginFrame(RenderSystem.getShaderTexture(2), PRESENTER); }
                 }
                 else if (texture != null && bridge.status() == OffscreenBridge.Status.RUNNING) PRESENTER.draw(texture);
             }
@@ -176,11 +176,11 @@ final class VulkanPreview {
             VulkanForge.LOGGER.error("Could not capture solid terrain for Vulkan", error);
             close();
         }
-        EntityDraws.armSky(composited && enabled);
+        EntityDraws.armSky(composited && enabled && !NativeMainWindow.glTailCompatibility());
     }
     /** P11, AFTER_LEVEL: GameRenderer next clears depth and draws the held items, arms and screen effects. */
-    static boolean guiEnabled() { return enabled && direct && !inset; }
-    static boolean nativeTerrain(){return enabled&&direct&&!inset&&!Boolean.getBoolean("vulkanforge.legacyComposite");}
+    static boolean guiEnabled() { return enabled && direct && !inset && !NativeMainWindow.glTailCompatibility(); }
+    static boolean nativeTerrain(){return enabled&&direct&&!inset&&!NativeMainWindow.glTailCompatibility()&&!Boolean.getBoolean("vulkanforge.legacyComposite");}
     static void handBegin() { ordered(GuiDraws::beginHand); }
     /** Before GUI clear or present: composite a still-open hand window into the main target. */
     static void beforeSwap() {
@@ -221,7 +221,8 @@ final class VulkanPreview {
     private static long lastSky;
     static void prepareTerrain(){
         if (gl != null) { if (enabled && preparingAllowed && !prepared) { prepared = true; glOpaque(); } return; }
-        if(!preparingAllowed||prepared||!nativeTerrain()||sink==null||captureEvent==null||!NativeMainWindow.worldVisible())return;
+        boolean sharedTerrain = nativeTerrain() || (enabled && direct && !inset && NativeMainWindow.glTailCompatibility());
+        if(!preparingAllowed||prepared||!sharedTerrain||sink==null||captureEvent==null||!NativeMainWindow.worldVisible())return;
         WORLD.update(captureEvent,sink);renderShared();prepared=true;
     }
 
@@ -321,7 +322,7 @@ final class VulkanPreview {
     }
 
     private static void renderShared() {
-        renderShared(!inset && !Boolean.getBoolean("vulkanforge.legacyComposite"));
+        renderShared(!inset && !NativeMainWindow.glTailCompatibility() && !Boolean.getBoolean("vulkanforge.legacyComposite"));
     }
     private static void renderShared(boolean nativeMode) {
         if (!NativeMainWindow.worldVisible()) { uploadedEpoch = 0; return; }

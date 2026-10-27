@@ -34,6 +34,8 @@ IntelliJ IDEA：导入根目录的 `build.gradle`，将 **Gradle JVM** 和 **Pro
 
 主窗口接管在启动时完成；F8 控制地形/三角形预览，独立于主窗口的呈现方式。窗口缩放、全屏尺寸变化和 VSync 设置变化会重建 Swapchain；最小化时跳过呈现，恢复后继续。
 
+GL-VK 另有默认关闭的实验计划：`-Dvulkanforge.glTailCompatibility=true` 保留可见 OpenGL 窗口与最终 GL 输出，让 Vulkan 批量生成地形，GL 按原顺序执行合成、实体、后处理、手持物和 HUD。它不创建 Vulkan Swapchain；不透明与透明结果一组交接，帧末归还。合同、限制和验证命令见 [GL 尾部兼容模式](docs/gl-tail-compatibility.md)。
+
 启动期间继续显示 Forge 加载窗口；新窗口先隐藏，完成 Surface/Swapchain 和实际尺寸共享图像的准备，并等待 Vulkan 第一帧完成后才显示，避免提前显示空白窗口。
 
 游戏中：

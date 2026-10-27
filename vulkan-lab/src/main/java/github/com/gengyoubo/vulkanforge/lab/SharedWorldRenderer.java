@@ -68,6 +68,7 @@ final class SharedWorldRenderer implements AutoCloseable {
     private long nativeComposites, nativeEntityPasses;
     private long overlayPasses, skyDraws, handoffGroups, handoffImages;
     private final boolean optimizeInterop = !Boolean.getBoolean("vulkanforge.noInteropOptimizations");
+    private final boolean glTail = Boolean.getBoolean("vulkanforge.glTailCompatibility");
     private int postChainDepth, nativeIntervalDepth;
     private sealed interface PendingNative permits PendingPost, PendingComposite {
         SharedRenderTargets.Target target();
@@ -144,6 +145,7 @@ final class SharedWorldRenderer implements AutoCloseable {
         return render(requestedWidth, requestedHeight, sky, false);
     }
     int render(int requestedWidth, int requestedHeight, java.util.List<Object[]> sky, boolean nativeMode) {
+        if (glTail && nativeMode) throw new IllegalStateException("GL tail plan requires GL-owned terrain outputs");
         endRead();
         if (!nativeMode) finishNativeLeases();
         boolean terrain = world.ready();
@@ -217,7 +219,8 @@ final class SharedWorldRenderer implements AutoCloseable {
             var copy = VkImageCopy.calloc(1, stack).srcSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).layerCount(1))
                     .dstSubresource(r -> r.aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).layerCount(1)).extent(e -> e.set(width, height, 1));
             vkCmdCopyImage(command, slot.depth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.translucentDepth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy);
-            if (terrain && (!nativeMode || !optimizeInterop)) {
+            boolean copySceneDepth = terrain && !glTail && (!nativeMode || !optimizeInterop);
+            if (copySceneDepth) {
                 // Entities test against Vulkan terrain depth; the copy stays Vulkan-owned in TRANSFER_DST until the entity submit.
                 var scene = VkImageMemoryBarrier2.calloc(1, stack).sType$Default().srcStageMask(VK_PIPELINE_STAGE_2_NONE)
                         .dstStageMask(VK_PIPELINE_STAGE_2_COPY_BIT).dstAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
@@ -228,8 +231,8 @@ final class SharedWorldRenderer implements AutoCloseable {
                 vkCmdCopyImage(command, slot.depth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.sceneDepth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy);
             }
             depthCopies++; // Opaque -> independent translucent depth is needed for the later GL/entity ordering.
-            if (terrain && (!nativeMode || !optimizeInterop)) depthCopies++; else if (terrain) avoidedDepthCopies++;
-            slot.sceneFresh = terrain && (!nativeMode || !optimizeInterop); slot.sceneReadable = false; slot.overlays = 0;
+            if (copySceneDepth) depthCopies++; else if (terrain) avoidedDepthCopies++;
+            slot.sceneFresh = copySceneDepth; slot.sceneReadable = false; slot.overlays = 0;
             var toTest = VkImageMemoryBarrier2.calloc(1, stack);
             layoutBarrier(toTest.get(0), slot.translucentDepth, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, DEPTH_STAGES, DEPTH_ACCESS,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, true);
@@ -762,10 +765,12 @@ final class SharedWorldRenderer implements AutoCloseable {
             slot.depth = new SharedPresentImage(context, width, height, importer, true);
             slot.translucentColor = new SharedPresentImage(context, width, height, importer);
             slot.translucentDepth = new SharedPresentImage(context, width, height, importer, true);
-            slot.overlayColor = new SharedPresentImage(context, width, height, importer);
-            slot.overlayDepth = new SharedPresentImage(context, width, height, importer, true);
-            slot.sceneDepth = new GpuImage(context, width, height, VK_FORMAT_D32_SFLOAT,
-                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
+            if (!glTail) {
+                slot.overlayColor = new SharedPresentImage(context, width, height, importer);
+                slot.overlayDepth = new SharedPresentImage(context, width, height, importer, true);
+                slot.sceneDepth = new GpuImage(context, width, height, VK_FORMAT_D32_SFLOAT,
+                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
+            }
         }
         for(int i=0;i<slots.length;i++) composite.sources(i,slots[i].color.view(),slots[i].depth.view(),slots[i].translucentColor.view(),slots[i].translucentDepth.view());
         log.accept("WORLD_TARGET[" + ++generations + "]=" + width + "x" + height + " slots=" + SLOT_COUNT);

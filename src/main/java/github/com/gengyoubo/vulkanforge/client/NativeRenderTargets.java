@@ -15,7 +15,7 @@ public final class NativeRenderTargets {
 
     /** Called before RenderTarget.checkStatus, after MainTarget and TextureTarget have allocated their attachments. */
     public static void prepare(RenderTarget target) {
-        if (!NativeMainWindow.active() || Boolean.getBoolean("vulkanforge.legacyTargets") || targets.containsKey(target)
+        if (!NativeMainWindow.active() || NativeMainWindow.glTailCompatibility() || Boolean.getBoolean("vulkanforge.legacyTargets") || targets.containsKey(target)
                 || !target.useDepth || target.isStencilEnabled() || target.width <= 0 || target.height <= 0) return;
         // Startup may leave an unrelated GL error set. Attribute it here instead of failing the subsequent interop import.
         for (int error; (error = glGetError()) != GL_NO_ERROR; )

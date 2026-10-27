@@ -8,11 +8,12 @@ ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('interop_optimized',ROOT/'tools/benchmark-interop-optimized.py');common=importlib.util.module_from_spec(spec);spec.loader.exec_module(common)
 CASES=['GL46_NATIVE','GLVK_HYBRID','VK_NATIVE_OFFSCREEN'];PHASES={'TERRAIN':0,'TERRAIN_POST3':3}
 
-def run(java,case,phase,folder,guard,args,preflight=False,version='1.4'):
+def run(java,case,phase,folder,guard,args,preflight=False,version='1.4',*,jvm_properties=None):
     for attempt in range(5):
         guard.idle();folder.mkdir(parents=True,exist_ok=True);native=case=='VK_NATIVE_OFFSCREEN';gl=case=='GL46_NATIVE';scene=ROOT/'build/reports/offscreen-performance/matched-scene.bin'
         runtime=ROOT/'build/reports/offscreen-performance/gl.args' if gl else ROOT/'vulkan-lab/build/trace/bench.args'
         cmd=[java,'@'+str(runtime),'-Xms512m','-Xmx1g','-Dbench.pipeline=true','-Dbench.matchVulkanRaster=true','-Dbench.width=1920','-Dbench.height=1080','-Dbench.warmup='+str(16 if preflight else args.warmup),'-Dbench.seconds='+str(0 if preflight else args.seconds),'-Dbench.postPasses='+str(PHASES[phase]),'-Dbench.output='+str(folder),'-Dbench.label='+case,'-Dvulkanforge.vulkanVersion='+version,'-Dvulkanforge.nvidiaExtensions=','-Dvulkanforge.interopProfile=true','-Dbench.nativeInterval='+str(case=='GLVK_INTERVAL').lower()]
+        if jvm_properties:cmd += ['-D'+key+'='+str(value) for key,value in jvm_properties.items()]
         if gl:cmd+=['github.com.gengyoubo.vulkanforge.client.GlOffscreenBenchmark','4.6',str(scene)]
         elif native:cmd+=['-Dbench.scene='+str(scene),'github.com.gengyoubo.vulkanforge.lab.VkOnlyLauncher']
         else:cmd+=['-Dvulkanforge.noInteropOptimizations=false','-Dbench.scene='+str(scene),'github.com.gengyoubo.vulkanforge.lab.NativePipelineBenchmark']

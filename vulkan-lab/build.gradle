@@ -133,6 +133,14 @@ tasks.register('smokeNativePostBatch', JavaExec) {
     systemProperty 'vulkanforge.disableValidation', 'true'
 }
 
+tasks.register('smokeGlTail', JavaExec) {
+    dependsOn 'testClasses'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.lab.GlTailSmoke'
+    systemProperty 'vulkanforge.glTailCompatibility', 'true'
+    systemProperty 'vulkanforge.disableValidation', 'true'
+}
+
 tasks.register('benchmarkBindings', JavaExec) {
     dependsOn 'testClasses'
     classpath = sourceSets.test.runtimeClasspath

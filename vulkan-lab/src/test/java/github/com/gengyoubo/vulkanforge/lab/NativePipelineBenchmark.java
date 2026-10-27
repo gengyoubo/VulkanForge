@@ -18,6 +18,7 @@ public final class NativePipelineBenchmark {
             try(var pipeline=new PipelineBenchmark(width,height,new PipelineBenchmark.Renderer(){
                 public void terrain(PipelineBenchmark.Target target,int slot){
                     glDepthMask(true);glColorMask(true,true,true,true);glDisable(GL_SCISSOR_TEST);glBindFramebuffer(GL_FRAMEBUFFER,target.framebuffer());glClearColor(.5f,.7f,1,0);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+                    GlInterop.flushInputsBeforeRecord();
                     if(backend.renderWorldWithSky(width,height,new Object[0],true)==0)throw new AssertionError("Native world unavailable");
                     if(Boolean.getBoolean("bench.nativeInterval"))backend.beginNativeInterval();
                     if(!backend.nativeComposite(target.framebuffer(),width,height,0,new Object[0])||!backend.nativeComposite(target.framebuffer(),width,height,1,new Object[0]))throw new AssertionError("Native composite unavailable");
@@ -28,7 +29,7 @@ public final class NativePipelineBenchmark {
                 public void endFrame(){if(Boolean.getBoolean("bench.nativeInterval"))backend.endNativeInterval();backend.finishWorldFrame();}
                 public void beforeRead(){backend.flushNativePosts();}
                 public void audit(Path path) throws Exception {BenchmarkDrawAudit.write(backend,path.resolve("workload.txt"),true);}
-                public long[] counters(){long[] a=backend.interopStats(),b=GlInterop.groupedCpuStats(),all=java.util.Arrays.copyOf(a,a.length+b.length);System.arraycopy(b,0,all,a.length,b.length);return all;}
+                public long[] counters(){long[] a=backend.interopStats(),b=GlInterop.groupedCpuStats(),c=GlInterop.inputFlushStats(),all=java.util.Arrays.copyOf(a,a.length+b.length+c.length);System.arraycopy(b,0,all,a.length,b.length);System.arraycopy(c,0,all,a.length+b.length,c.length);return all;}
                 public double[] profile(){return backend.phaseProfile();}
             },dimensions->backend.createRenderTarget(dimensions[0],dimensions[1],dimensions[2]),backend::destroyRenderTarget)){
                 glDisable(GL_DITHER);glDisable(GL_FRAMEBUFFER_SRGB);

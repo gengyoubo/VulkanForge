@@ -6,6 +6,10 @@ Vulkan 大量实体的捕获/回放分项、去掉合批中间数组的实测和
 
 按相同输入、GPU 实际提交与颜色/深度结果核对的三层跨 API 实验见 [统一 Benchmark](unified-benchmark.md)。
 
+GL 输入生产提前 flush 的 P0 独立时序实验、开关与配对验证见 [输入调度实验](input-scheduling.md)。
+
+Vulkan 地形批次、GL 兼容绘制与最终 GL 输出的可选执行计划见 [GL 尾部兼容模式](gl-tail-compatibility.md)。
+
 进一步拆分外部共享图像交接、兼容 Draw、深度复制和交接次数的实验见 [A / B / C / D 对照](interop-ablation.md)。
 
 原生 Vulkan 的深度复制裁减与后处理提交合并，以及原版 GL / GL46 / VK14 对照方法见 [交接与复制优化](interop-optimization.md)。
