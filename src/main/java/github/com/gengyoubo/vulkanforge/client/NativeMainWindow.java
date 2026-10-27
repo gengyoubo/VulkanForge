@@ -48,7 +48,7 @@ public final class NativeMainWindow {
             LOGGER.warn("Vulkan {} is not implemented yet; keeping the original OpenGL window", startup.vulkanVersion().label);
             return legacy;
         }
-        boolean requestedGlTail = Boolean.getBoolean("vulkanforge.glTailCompatibility");
+        boolean requestedGlTail = startup.glTailCompatibility();
         if ((!requestedGlTail && !System.getProperty("vulkanforge.directPresent", "true").equalsIgnoreCase("true"))
                 || !System.getProperty("os.name").startsWith("Windows")) return legacy;
         try {
@@ -60,8 +60,8 @@ public final class NativeMainWindow {
             Class<?> type = Class.forName("github.com.gengyoubo.vulkanforge.lab.MainWindowBackend", true, loader);
             Function<long[], Consumer<int[]>> importer = GlInterop::importImage;
             Runnable finishGL = org.lwjgl.opengl.GL11::glFinish;
-            backend = type.getConstructor(String.class, byte[].class, Function.class, Runnable.class, int.class, String.class)
-                    .newInstance(logs.resolve("main-window-report.txt").toString(), uuid, importer, finishGL, startup.vulkanVersion().apiVersion, startup.nvidiaExtensionNames());
+            backend = type.getConstructor(String.class, byte[].class, Function.class, Runnable.class, int.class, String.class, boolean.class)
+                    .newInstance(logs.resolve("main-window-report.txt").toString(), uuid, importer, finishGL, startup.vulkanVersion().apiVersion, startup.nvidiaExtensionNames(), requestedGlTail);
             present = type.getMethod("present", int.class, int.class, int.class, int.class, int.class);
             beginFrame = type.getMethod("beginFrame", int.class, int.class);
             earlyAcquires = type.getMethod("earlyAcquires"); lateAcquires = type.getMethod("lateAcquires");

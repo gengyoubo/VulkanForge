@@ -37,12 +37,12 @@ minecraft {
             }
             if (project.hasProperty('tailAblation')) {
                 property 'vulkanforge.tailAblation', 'true'
-                property 'vulkanforge.glTailCompatibility', 'true'
+                if (!project.hasProperty('glTailFromConfig')) property 'vulkanforge.glTailCompatibility', 'true'
                 property 'vulkanforge.glTailDiagnostics', 'true'
                 property 'vulkanforge.tailProfile', 'true'
                 property 'vulkanforge.interopProfile', 'true'
-                property 'vulkanforge.startup', 'GL_VK:V1_4'
-                ['rounds','seconds','warmup','cases'].each { option ->
+                if (!project.hasProperty('glTailFromConfig')) property 'vulkanforge.startup', 'GL_VK:V1_4'
+                ['rounds','seconds','warmup','cases','phases'].each { option ->
                     def key = 'tailBench.' + option
                     if (project.hasProperty(key)) property key, project.property(key)
                 }
@@ -66,14 +66,19 @@ minecraft {
             }
             if (project.hasProperty('worldSmoke')) {
                 property 'vulkanforge.worldSmoke', 'true'
+                // This regression specifically checks the original Vulkan swapchain execution plan.
+                property 'vulkanforge.glTailCompatibility', 'false'
                 mods { vulkanforge { source sourceSets.smoke } }
             }
             if (project.hasProperty('glTailSmoke')) {
                 property 'vulkanforge.glTailSmoke', 'true'
-                property 'vulkanforge.glTailCompatibility', 'true'
-                property 'vulkanforge.startup', 'GL_VK:V1_4'
+                if (!project.hasProperty('glTailFromConfig')) {
+                    property 'vulkanforge.glTailCompatibility', 'true'
+                    property 'vulkanforge.startup', 'GL_VK:V1_4'
+                }
                 mods { vulkanforge { source sourceSets.smoke } }
             }
+            if (project.hasProperty('glTailFromConfig')) property 'vulkanforge.glTailFromConfig', 'true'
             if (project.hasProperty('gl46Smoke') || project.hasProperty('gl46Move')) {
                 // -Pgl46Smoke: feature/parity check in a flat world; -Pgl46Move: fast flight through a generated world.
                 property(project.hasProperty('gl46Move') ? 'vulkanforge.gl46Move' : 'vulkanforge.gl46Smoke', 'true')
@@ -117,6 +122,31 @@ tasks.register('restartSmoke', JavaExec) {
             configurations.runtimeClasspath.filter { it.name.startsWith('jna-') })
     mainClass = 'github.com.gengyoubo.vulkanforge.client.GameRestartSmoke'
     javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+}
+tasks.register('smokeRenderModeConfig', JavaExec) {
+    dependsOn 'compileSmokeJava', 'processResources'
+    classpath = sourceSets.smoke.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.config.RenderModeConfigSmoke'
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+}
+if (project.hasProperty('configSmoke')) {
+    tasks.matching { it.name == 'runClient' }.configureEach {
+        doFirst {
+            def report = file('run/logs/vulkanforge/config-smoke.txt')
+            report.parentFile.mkdirs(); report.text = 'STATUS=RUNNING\n'
+        }
+        doLast {
+            def report = file('run/logs/vulkanforge/config-smoke.txt')
+            if (!report.exists() || !report.text.contains('STATUS=OK')) throw new GradleException('Config screen smoke failed; see ' + report)
+            if (report.text.contains('PASS config-only GL_TAIL startup')) {
+                def backend = file('run/logs/vulkanforge/main-window-report.txt')
+                if (!backend.text.contains('HYBRID_EXECUTION_PLAN=GL_TAIL') || !backend.text.contains('FINAL_PRESENTED_FRAMES=0'))
+                    throw new GradleException('Saved plan did not select GL tail or close correctly')
+                def snapshot = file('build/reports/render-mode-config/config-tail-backend.txt')
+                snapshot.parentFile.mkdirs(); snapshot.bytes = backend.bytes
+            }
+        }
+    }
 }
 
 // Explicit GPU tests, using the production terrain code in hidden GL contexts and FBOs only.

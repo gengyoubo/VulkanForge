@@ -50,11 +50,14 @@ public final class TailAblationClient {
                 Files.writeString(out.resolve("pid.txt"),Long.toString(ProcessHandle.current().pid()));
                 Files.writeString(out.resolve("gl-context.txt"),glGetString(GL_VENDOR)+"\n"+glGetString(GL_RENDERER)+"\n"+glGetString(GL_VERSION)+"\n");
                 require(NativeMainWindow.glTailCompatibility(),"GL tail failed to initialize");
+                if(Boolean.getBoolean("vulkanforge.glTailFromConfig"))require(System.getProperty("vulkanforge.glTailCompatibility")==null&&System.getProperty("vulkanforge.startup")==null,"startup selection overridden by JVM flags");
                 seconds=Double.parseDouble(System.getProperty("tailBench.seconds","5"));warmup=Double.parseDouble(System.getProperty("tailBench.warmup","3"));
                 int rounds=Integer.getInteger("tailBench.rounds",3);require(rounds>0&&seconds>0&&warmup>0,"invalid durations");
                 Random random=new Random(20261027);
                 List<String> selectedCases=List.of(System.getProperty("tailBench.cases","A,B,C,D").split(","));require(selectedCases.contains("A")&&new HashSet<>(selectedCases).size()==selectedCases.size()&&List.of("A","B","C","D").containsAll(selectedCases),"invalid cases");
-                for(boolean effect:new boolean[]{false,true})for(int round=1;round<=rounds;round++){
+                List<String> phases=List.of(System.getProperty("tailBench.phases","BASE_GAME,OPTIONAL_POST").split(","));require(!phases.isEmpty()&&List.of("BASE_GAME","OPTIONAL_POST").containsAll(phases),"invalid phases");
+                for(String phase:phases)for(int round=1;round<=rounds;round++){
+                    boolean effect=phase.equals("OPTIONAL_POST");
                     List<String> cases=new ArrayList<>(selectedCases);Collections.shuffle(cases,random);for(String variant:cases)jobs.add(new Job(round,effect,variant));
                 }
                 Files.writeString(out.resolve("schedule.json"),JSON.toJson(jobs));
@@ -106,6 +109,7 @@ public final class TailAblationClient {
         Map<String,Object> row=new LinkedHashMap<>();row.putAll(timing);row.put("round",job.round());row.put("case",job.variant());row.put("phase",job.effect()?"OPTIONAL_POST":"BASE_GAME");
         row.put("start_ms",measureEpoch);row.put("end_ms",measureEpoch+Math.round(timing.get("seconds")*1000));
         row.put("camera",new double[]{mc.player.getX(),mc.player.getY(),mc.player.getZ(),mc.player.getYRot(),mc.player.getXRot()});row.put("window_focused",glfwGetWindowAttrib(mc.getWindow().getWindow(),GLFW_FOCUSED)==GLFW_TRUE);
+        row.put("selection_from_config",Boolean.getBoolean("vulkanforge.glTailFromConfig"));
         row.put("width",mc.getMainRenderTarget().viewWidth);row.put("height",mc.getMainRenderTarget().viewHeight);row.put("vk_terrain_frames",w[1]-world0[1]);row.put("vk_section_draws",w[7]-world0[7]);row.put("vk_translucent_section_draws",w[16]-world0[16]);
         row.put("vk_terrain_submits_per_frame",(i[4]-interop0[4])/frames);row.put("gl_group_calls_per_frame",(i[5]-interop0[5])/frames);row.put("gl_image_refs_per_frame",(i[8]-interop0[8])/frames);
         row.put("cpu_vk_fence_ms_per_frame",(i[10]-interop0[10])/1e6/frames);row.put("cpu_vk_queue_submit_ms_per_frame",(i[9]-interop0[9])/1e6/frames);

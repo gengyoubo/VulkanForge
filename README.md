@@ -2,6 +2,8 @@
 
 Minecraft **1.20.1 / Forge 47.4.28 / Java 17** 客户端 Vulkan 渲染实验。
 
+**GL-VK 默认使用 GL 尾部兼容计划**：Vulkan 批量绘制地形，GL 负责兼容绘制、后处理、GUI/HUD 与最终输出。配置页的“GL-VK 执行计划”对应 `renderer.glVkPlan`，可在 `GL_TAIL` 与原 `INTERLEAVED` 之间切换，重启生效。下述 Vulkan Swapchain、实体/GUI 回放说明针对原交错计划。
+
 当前已经打通四条路径：
 
 - 独立 Vulkan 1.2/1.3/1.4 窗口：交换链、动态渲染、缩放重建、三角形绘制。
@@ -9,7 +11,7 @@ Minecraft **1.20.1 / Forge 47.4.28 / Java 17** 客户端 Vulkan 渲染实验。
 - 游戏主窗口预览：同进程 Vulkan 绘制旋转三角形 → 导出共享 GPU 图像 → 原有 GL 上下文采样 → 主菜单 / HUD 显示。
 - 世界不透明和镂空方块：采集原版烘焙模型、贴图 UV、染色、环境遮蔽与光照坐标 → 分区顶点缓冲 → Vulkan 图集/光照图采样、相机变换、alpha 丢弃、D32 深度测试 → 在原版 cutout 阶段之后合成。
 
-**这是混合渲染原型。主窗口的最终呈现已交给 Vulkan；Windows 主窗口路径中的 WorldScene 已接入同一个 Vulkan 后端，solid、cutout、cutoutMipped 地形通过共享 GPU 纹理合成，正常地形帧不经过 CPU 像素读回或 FrameProtocol。** Vulkan 覆盖范围内的半透明方块与水也由 Vulkan 绘制（含 Fabulous 的独立透明目标），常见实体、方块实体和告示牌文字（P7/P8）、粒子和雨雪（P9）以及云（P10）由 Vulkan 通道回放，天空在地形提交中由 Vulkan 先行绘制（P10）。主颜色/深度及透明后处理目标使用 Vulkan 分配、GL 导入的共享图像；受支持的世界通道直接在这些目标上绘制，不再逐通道复制 GL framebuffer。最终 Vulkan 通道直接采样共享主目标，再将受支持的手持物与 GUI/HUD 依次画进 Swapchain（P11），正常路径没有额外呈现图像、GL framebuffer 复制或 Vulkan blit。范围外地形、不支持的着色器和状态仍在隐藏的 OpenGL 上下文中绘制，但不再向隐藏窗口绘制最终屏幕。关闭主窗口 Vulkan 路径时保留旧的子进程读回预览作为兼容路径。
+**在原 `INTERLEAVED` 计划中，主窗口最终呈现交给 Vulkan；Windows 主窗口路径中的 WorldScene 已接入同一个 Vulkan 后端，solid、cutout、cutoutMipped 地形通过共享 GPU 纹理合成，正常地形帧不经过 CPU 像素读回或 FrameProtocol。** Vulkan 覆盖范围内的半透明方块与水也由 Vulkan 绘制（含 Fabulous 的独立透明目标），常见实体、方块实体和告示牌文字（P7/P8）、粒子和雨雪（P9）以及云（P10）由 Vulkan 通道回放，天空在地形提交中由 Vulkan 先行绘制（P10）。主颜色/深度及透明后处理目标使用 Vulkan 分配、GL 导入的共享图像；受支持的世界通道直接在这些目标上绘制，不再逐通道复制 GL framebuffer。最终 Vulkan 通道直接采样共享主目标，再将受支持的手持物与 GUI/HUD 依次画进 Swapchain（P11），正常路径没有额外呈现图像、GL framebuffer 复制或 Vulkan blit。范围外地形、不支持的着色器和状态仍在隐藏的 OpenGL 上下文中绘制，但不再向隐藏窗口绘制最终屏幕。关闭主窗口 Vulkan 路径时保留旧的子进程读回预览作为兼容路径。
 
 ## 构建和启动
 
@@ -34,7 +36,7 @@ IntelliJ IDEA：导入根目录的 `build.gradle`，将 **Gradle JVM** 和 **Pro
 
 主窗口接管在启动时完成；F8 控制地形/三角形预览，独立于主窗口的呈现方式。窗口缩放、全屏尺寸变化和 VSync 设置变化会重建 Swapchain；最小化时跳过呈现，恢复后继续。
 
-GL-VK 另有默认关闭的实验计划：`-Dvulkanforge.glTailCompatibility=true` 保留可见 OpenGL 窗口与最终 GL 输出，让 Vulkan 批量生成地形，GL 按原顺序执行合成、实体、后处理、手持物和 HUD。它不创建 Vulkan Swapchain；不透明与透明结果一组交接，帧末归还。合同、限制和验证命令见 [GL 尾部兼容模式](docs/gl-tail-compatibility.md)。
+当前 GL-VK 默认的 `GL_TAIL` 保留可见 OpenGL 窗口与最终 GL 输出，让 Vulkan 批量生成地形，GL 按原顺序执行合成、实体、后处理、手持物和 HUD。它不创建 Vulkan Swapchain；不透明与透明结果一组交接，帧末归还。无需额外 JVM 参数；旧的 `-Dvulkanforge.glTailCompatibility=true/false` 仍可临时覆盖配置。合同、限制和验证命令见 [GL 尾部兼容模式](docs/gl-tail-compatibility.md)。
 
 启动期间继续显示 Forge 加载窗口；新窗口先隐藏，完成 Surface/Swapchain 和实际尺寸共享图像的准备，并等待 Vulkan 第一帧完成后才显示，避免提前显示空白窗口。
 
@@ -190,7 +192,7 @@ Fabulous 图形模式将半透明层合成进共享的 `translucent` 目标，�
 
 `EntityPass` 的 Vulkan 着色器移植自原版 `rendertype_entity_*` / `rendertype_text`：双光源漫反射、覆盖层与光照图 texelFetch、四种片元分支和线性/柱形雾。每次绘制的矩阵、颜色调制、光照方向和雾参数放在 256 字节的动态 uniform 中。顶点、索引和 uniform 使用每槽位环形缓冲，四边形使用与原版相同顺序的共享索引缓冲；管线按格式与混合/深度/剔除状态缓存。
 
-默认路径直接向对应的共享 framebuffer 颜色/深度回放实体，包含 GL 回退在前一通道写入的深度；Fabulous 下按实际 framebuffer 分别回放到主目标、itemEntity 等目标。绘制按连续目标分组，保持 A → B → A 的原始顺序。没有捕获到绘制的窗口不提交。旧的小窗/GL 合成兼容路径仍从不透明地形深度复制出叠加层，再将预乘颜色和深度交给 GL 合成。
+`INTERLEAVED` 直接向对应的共享 framebuffer 颜色/深度回放实体，包含 GL 回退在前一通道写入的深度；Fabulous 下按实际 framebuffer 分别回放到主目标、itemEntity 等目标。绘制按连续目标分组，保持 A → B → A 的原始顺序。没有捕获到绘制的窗口不提交。旧的小窗/GL 合成兼容路径仍从不透明地形深度复制出叠加层，再将预乘颜色和深度交给 GL 合成。
 
 尚未完成：附魔光效（`glint`）、实体阴影、发光轮廓、末影/蜘蛛眼（加法混合）、`translucentCullBlockSheet` 中的物品实体（这些在 `AFTER_BLOCK_ENTITIES` 之后才刷新）、破坏裂纹以及模组自定义着色器。
 

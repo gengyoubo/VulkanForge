@@ -80,7 +80,7 @@ public final class MainWindowBackend implements AutoCloseable {
     private Function<long[], Consumer<int[]>> terrainImporter;
     private final Function<long[], Consumer<int[]>> importer;
     private final Runnable finishGL;
-    private final boolean glTail = Boolean.getBoolean("vulkanforge.glTailCompatibility");
+    private final boolean glTail;
 
     public MainWindowBackend(String logPath, byte[] uuid, Function<long[], Consumer<int[]>> importer, Runnable finishGL) throws Exception {
         this(logPath, uuid, importer, finishGL, VulkanContext.requestedApiVersion());
@@ -92,6 +92,11 @@ public final class MainWindowBackend implements AutoCloseable {
 
     /** nvidiaExtensions: comma-separated VK_NV_* names from the config screen. */
     public MainWindowBackend(String logPath, byte[] uuid, Function<long[], Consumer<int[]>> importer, Runnable finishGL, int apiVersion, String nvidiaExtensions) throws Exception {
+        this(logPath,uuid,importer,finishGL,apiVersion,nvidiaExtensions,Boolean.getBoolean("vulkanforge.glTailCompatibility"));
+    }
+    /** Primitive startup plan crosses the isolated loader boundary without changing global JVM properties. */
+    public MainWindowBackend(String logPath, byte[] uuid, Function<long[], Consumer<int[]>> importer, Runnable finishGL, int apiVersion, String nvidiaExtensions, boolean glTail) throws Exception {
+        this.glTail=glTail;
         context = new VulkanContext(apiVersion, nvidiaExtensions);
         this.importer = importer; this.finishGL = finishGL;
         Configuration.STACK_SIZE.set(1024);
@@ -191,7 +196,7 @@ public final class MainWindowBackend implements AutoCloseable {
     private SharedWorldRenderer world() {
         if (world == null) {
             if (terrainImporter == null) throw new IllegalStateException("Missing host GL terrain importer");
-            world = new SharedWorldRenderer(context, terrainImporter, finishGL, this::log, targets());
+            world = new SharedWorldRenderer(context, terrainImporter, finishGL, this::log, targets(), glTail);
             for (Object[] t : mirroredTextures.values()) world.entityTexture((Integer) t[0], (Integer) t[1], (Integer) t[2], (Integer) t[3], (byte[]) t[4]);
         }
         return world;

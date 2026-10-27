@@ -68,7 +68,7 @@ final class SharedWorldRenderer implements AutoCloseable {
     private long nativeComposites, nativeEntityPasses;
     private long overlayPasses, skyDraws, handoffGroups, handoffImages;
     private final boolean optimizeInterop = !Boolean.getBoolean("vulkanforge.noInteropOptimizations");
-    private final boolean glTail = Boolean.getBoolean("vulkanforge.glTailCompatibility");
+    private final boolean glTail;
     private final boolean tailProfile = Boolean.getBoolean("vulkanforge.tailProfile");
     private final boolean tailDiagnostics = Boolean.getBoolean("vulkanforge.glTailDiagnostics");
     private long renderCpuCalls, renderCpuNanos, omittedTerrainFrames;
@@ -92,7 +92,8 @@ final class SharedWorldRenderer implements AutoCloseable {
     private static final long DEPTH_STAGES = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
     private static final long DEPTH_ACCESS = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
-    SharedWorldRenderer(VulkanContext context, Function<long[], Consumer<int[]>> importer, Runnable finishGL, Consumer<String> log, SharedRenderTargets renderTargets) {
+    SharedWorldRenderer(VulkanContext context, Function<long[], Consumer<int[]>> importer, Runnable finishGL, Consumer<String> log, SharedRenderTargets renderTargets, boolean glTail) {
+        this.glTail=glTail;
         this.context = context; this.importer = importer; this.finishGL = finishGL; this.log = log;
         this.renderTargets = renderTargets;
         core = new VulkanSceneCore(context,SLOT_COUNT,log);world=core.world;culler=core.culler;

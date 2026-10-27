@@ -21,9 +21,11 @@ public final class VulkanForgeConfigScreen extends Screen {
     private RenderMode mode = VulkanForgeConfig.MODE.get();
     private VulkanVersion vulkanVersion = VulkanForgeConfig.VULKAN_VERSION.get();
     private OpenGLVersion openGLVersion = VulkanForgeConfig.OPENGL_VERSION.get();
+    private GlVkPlan glVkPlan = VulkanForgeConfig.GL_VK_PLAN.get();
     private final Map<NvidiaExtension, Boolean> extensions = new EnumMap<>(NvidiaExtension.class);
     private CycleButton<VulkanVersion> vulkanButton;
     private CycleButton<OpenGLVersion> openGLButton;
+    private CycleButton<GlVkPlan> planButton;
     private final List<CycleButton<Boolean>> extensionButtons = new ArrayList<>();
     private int extensionLabelY;
     private boolean restarting;
@@ -42,12 +44,12 @@ public final class VulkanForgeConfigScreen extends Screen {
     }
 
     @Override protected void init() {
-        int column = 150, gap = 10, left = width / 2 - column - gap / 2, right = width / 2 + gap / 2, y = 38;
+        int column = 150, gap = 10, left = width / 2 - column - gap / 2, right = width / 2 + gap / 2, y = 36;
         addRenderableWidget(CycleButton.<RenderMode>builder(value -> Component.translatable("vulkanforge.config.mode." + value.name().toLowerCase(Locale.ROOT)))
                 .withValues(RenderMode.values()).withInitialValue(mode)
                 .withTooltip(value->Tooltip.create(Component.translatable("vulkanforge.config.mode."+value.name().toLowerCase(Locale.ROOT)+".tooltip")))
                 .create(left, y, column * 2 + gap, 20, Component.translatable("vulkanforge.config.mode"), (button, value) -> { mode = value; refreshActive(); }));
-        y += 24;
+        y += 22;
         vulkanButton = addRenderableWidget(CycleButton.<VulkanVersion>builder(value -> versionLabel(Component.literal(value.label), value.implemented))
                 .withValues(VulkanVersion.values()).withInitialValue(vulkanVersion)
                 .create(left, y, column, 20, Component.translatable("vulkanforge.config.vulkan_version"), (button, value) -> vulkanVersion = value));
@@ -55,8 +57,13 @@ public final class VulkanForgeConfigScreen extends Screen {
                         ? Component.translatable("vulkanforge.config.opengl_version.default") : Component.literal(value.label), value.implemented))
                 .withValues(OpenGLVersion.values()).withInitialValue(openGLVersion)
                 .create(right, y, column, 20, Component.translatable("vulkanforge.config.opengl_version"), (button, value) -> openGLVersion = value));
+        y += 22;
+        planButton = addRenderableWidget(CycleButton.<GlVkPlan>builder(value -> Component.translatable("vulkanforge.config.plan."+value.name().toLowerCase(Locale.ROOT)))
+                .withValues(GlVkPlan.values()).withInitialValue(glVkPlan)
+                .withTooltip(value -> Tooltip.create(Component.translatable("vulkanforge.config.plan."+value.name().toLowerCase(Locale.ROOT)+".tooltip")))
+                .create(left,y,column*2+gap,20,Component.translatable("vulkanforge.config.plan"),(button,value)->glVkPlan=value));
         extensionLabelY = y + 28;
-        y += 40;
+        y += 38;
         extensionButtons.clear();
         NvidiaExtension[] all = NvidiaExtension.values();
         for (int i = 0; i < all.length; i++) {
@@ -64,7 +71,7 @@ public final class VulkanForgeConfigScreen extends Screen {
             String key = "vulkanforge.config.nvidia." + extension.key();
             extensionButtons.add(addRenderableWidget(CycleButton.onOffBuilder(extensions.get(extension))
                     .withTooltip(value -> Tooltip.create(Component.literal(extension.extensionName + "\n").append(Component.translatable(key + ".tooltip"))))
-                    .create(i % 2 == 0 ? left : right, y + i / 2 * 24, column, 20, Component.translatable(key), (button, value) -> extensions.put(extension, value))));
+                    .create(i % 2 == 0 ? left : right, y + i / 2 * 22, column, 20, Component.translatable(key), (button, value) -> extensions.put(extension, value))));
         }
         var restart = restartButton = addRenderableWidget(Button.builder(Component.translatable("vulkanforge.config.restart"), button -> restart())
                 .bounds(left, height - 26, 100, 20).build());
@@ -85,6 +92,7 @@ public final class VulkanForgeConfigScreen extends Screen {
     private void refreshActive() {
         boolean vulkan = mode.usesVulkan();
         vulkanButton.active = vulkan; openGLButton.active = mode==RenderMode.GL;
+        planButton.active = mode == RenderMode.GL_VK;
         for (var button : extensionButtons) button.active = vulkan;
         if(restartButton!=null){restartButton.active=minecraft.level==null&&mode!=RenderMode.VK;restartButton.setTooltip(Tooltip.create(Component.translatable(mode==RenderMode.VK?"vulkanforge.config.mode.vk.tooltip":minecraft.level!=null?"vulkanforge.config.restart.in_world":"vulkanforge.config.restart.tooltip")));}
     }
@@ -93,6 +101,7 @@ public final class VulkanForgeConfigScreen extends Screen {
         VulkanForgeConfig.MODE.set(mode);
         VulkanForgeConfig.VULKAN_VERSION.set(vulkanVersion);
         VulkanForgeConfig.OPENGL_VERSION.set(openGLVersion);
+        VulkanForgeConfig.GL_VK_PLAN.set(glVkPlan);
         extensions.forEach((extension, value) -> VulkanForgeConfig.NVIDIA_EXTENSIONS.get(extension).set(value));
         VulkanForgeConfig.SPEC.save();
     }

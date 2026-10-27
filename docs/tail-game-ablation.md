@@ -62,3 +62,15 @@ Vulkan opaque、translucent、剔除、深度复制来自自己的 GPU 时间戳
 ```
 
 ASM 检查对实际 GameRenderer 和 PostChain 字节码进行 JVM 栈/帧验证，并覆盖计时转换与已有 PostChain 转换的两种顺序。正式计时和像素诊断不等同于通过 Vulkan 同步验证层；状态以最终后端报告为准。
+
+## 2026-10-27 已完成的结果
+
+`build/reports/tail-game-ablation/` 完成两组各三轮 A/B/C/D，共 24 个带 GL 时间戳的样本，状态 OK。基础组 FPS 中位数 A 618.59、B 741.10、C 615.31、D 880.28；同轮相对 A 的中位变化分别为 B +19.65%、C -0.01%、D +42.30%。B 改变负载，D 仍保留已初始化的 VK 设备，不能把这些比例当作等价架构的通用提升。
+
+基础组 A：GameRenderer CPU 均值的轮间中位数 0.603 ms，swapBuffers 0.886 ms，SharedWorldRenderer.render 0.085 ms；显式 Vulkan fence 等待约 0.003 ms/帧。CPU 墙钟的大头不在已测的 Vulkan fence 等待，但 swap 的墙钟不能进一步直接分成纯 CPU 运算与纯 GPU 阻塞。
+
+受控去饱和效果的 GL GPU span 约 0.126 ms；C 确实省略该链，但三轮没有得到稳定的端到端 FPS 改善（同轮变化中位数 -4.99%）。保留完整结果，不因它不符合“省略工作必然提高 FPS”的预期而删除样本。
+
+`build/reports/tail-game-cpu-only/` 另完成六个 A 控制样本，关闭新增 GL 查询，保留 CPU 分段和原有 Vulkan 计时。基础组 A 中位数 663.63 FPS，可选效果组 619.83 FPS；与带查询运行并非严格同轮配对，但差异提示 GL 探针对提交/调度节奏的影响不能忽略。不能直接把带探针的 FPS 当作未插桩生产帧率，亦不能将两次运行差额全部归因于探针。
+
+用户认为现有 600–700 FPS 已足够后，停止了尚未产生正式样本的额外完整 CPU-only 套件；已有 30 个完成样本、原始帧和诊断数据全部保留。追加目录 `tail-game-ablation-cpu/stopped.txt` 标记了主动收束，不属于通过的正式结果。下一阶段以常玩世界的长尾、移动加载、资源重载、画面及模组兼容性为主，不据此直接默认启用诊断省略开关。

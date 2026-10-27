@@ -4,6 +4,7 @@ import datetime as dt
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import statistics as st
@@ -20,12 +21,13 @@ def summarize(out):
     assert (out / 'status.txt').read_text().strip() == 'OK'
     lines = ['# 真实 Forge GL Tail 消融', '',
              '固定平坦测试世界、相机、1920×1080 无边框、视距 8、Fancy、云关闭、HUD/手持物开启。VSync 关闭，260 为 Minecraft 不执行帧率限制的选项。不是用户原有约 250 FPS 场景的重放。',
-             '每个阶段分轮随机 A/B/C/D，同一 JVM，每例先预热再计时；正式测量不读回图像、不排空 GPU。完整 CPU 原始帧与异步 GPU 查询保存在每例 frames.csv。',
+             '同一 JVM 内按报告包含的配置分轮测试，多配置时随机顺序，每例先预热再计时；正式测量不读回图像、不排空 GPU。完整 CPU 原始帧与可用 GPU 查询保存在每例 frames.csv。',
              'A 正常；B 仅省略 VK 不透明/透明 Draw，保留剔除、清除、深度复制、合成与交接，是改变画面/负载的诊断下界；C 仅允许跳过 GameRenderer 中原版 desaturate 可选效果；D 使用普通原版 GL 地形，VK 后端仍初始化但不提交地形，不等同于没有 VK 设备的严格纯 GL 启动。',
              'BASE_GAME 没有可选后处理，C 应跳过零次；OPTIONAL_POST 显式加载原版两 Pass 去饱和链，C 测的是这条受控效果的省略，不能称为所有实际后处理的收益。Fabulous 等必要链不在跳过范围。',
              'CPU 区间为调用墙钟时间，可能含驱动或 GPU 等待；GL span 是单个 GL 时钟的时间戳跨度，可能含 CPU 供给、外部等待与调度间隙。VK GPU 段来自自己的时间戳。不跨 API 相减，嵌套区间不相加。', '']
+    lines += ['新增 GL GPU 查询：' + ('关闭；n/a 表示没有采样，Vulkan 原有时间戳仍保留。' if all(r.get('gpu_capture_enabled', 1) == 0 for r in runs) else '开启；以实际完成样本数为准。'), '']
     summaries = []
-    for phase in ['BASE_GAME', 'OPTIONAL_POST']:
+    for phase in dict.fromkeys(r['phase'] for r in runs):
         cases = sorted({r['case'] for r in runs if r['phase'] == phase})
         lines += ['## ' + phase, '',
                   '| 例 | FPS 中位数 | 同轮相对 A | 帧周期 CPU P99 ms | GameRenderer CPU 均值 ms | Swap CPU 均值 ms | GL render→swap span ms |',
@@ -47,15 +49,17 @@ def summarize(out):
             rows = [r for r in runs if r['phase'] == phase and r['case'] == case]
             med = lambda key: st.median(r.get(key, 0) for r in rows)
             composite = st.median(r.get('gl_span_gl_opaque_composite_mean_ms',float('nan')) + r.get('gl_span_gl_translucent_composite_mean_ms',float('nan')) for r in rows)
+            composite_text = f'{composite:.4f}' if math.isfinite(composite) else 'n/a'
+            post_text = f'{med("gl_span_gl_post_chain_mean_ms"):.4f}' if 'gl_span_gl_post_chain_mean_ms' in rows[0] else 'n/a'
             lines.append(f'| {case} | {med("cpu_shared_render_mean_ms"):.4f} | {med("cpu_vk_fence_ms_per_frame"):.4f} | {med("cpu_vk_record_ms_per_frame"):.4f} | '
-                         f'{med("cpu_vk_queue_submit_ms_per_frame"):.4f} | {composite:.4f} | {med("gl_span_gl_post_chain_mean_ms"):.4f} | '
+                         f'{med("cpu_vk_queue_submit_ms_per_frame"):.4f} | {composite_text} | {post_text} | '
                          f'{med("vk_opaque_gpu_mean_ms"):.4f} | {med("vk_translucent_gpu_mean_ms"):.4f} |')
         lines += ['', '| 轮 | ' + ' | '.join(case + ' FPS' for case in cases) + ' |', '|---|' + '---:|' * len(cases)]
         for round_number in sorted({r['round'] for r in runs if r['phase'] == phase}):
             values = [next(r['fps'] for r in runs if r['phase'] == phase and r['round'] == round_number and r['case'] == case) for case in cases]
             lines.append('| ' + str(round_number) + ' | ' + ' | '.join(f'{value:.2f}' for value in values) + ' |')
         lines.append('')
-    lines += ['计数逐例断言：A/B/C 每个测量帧一次地形提交、两次 GL 组调用；B 地形 Section Draw 为零，D 地形提交为零且原版 GL 地形 Draw 非零。上传批次另存，不计作地形提交。',
+    lines += ['本报告包含配置：' + ', '.join(sorted({r['case'] for r in runs})) + '。所包含配置按定义逐例断言：A/B/C 每个测量帧一次地形提交、两次 GL 组调用；B 地形 Section Draw 为零；D 地形提交为零且原版 GL 地形 Draw 非零。上传批次另存，不计作地形提交。',
               'GPU 查询没有等待最后几个未完成槽，CSV 中以 NaN 明示不可用，summary 保存完成样本数和丢弃数。VK 快照只轮询已完成 fence，边界可能包含少量同配置预热帧；不将它当作逐帧严格关联的硬件轨迹。',
               '截图只作诊断，没有把 B/C 画面不同称为等价验证。逐例保留相机、目标尺寸、后处理执行/跳过次数、实际 Draw/交接/上传计数、最大 CPU 时间；不剔除慢帧。验证层状态见 backend.txt，计时关闭 validation。']
     (out / 'summary.json').write_text(json.dumps(summaries, indent=2))
@@ -72,6 +76,8 @@ def main():
     parser.add_argument('--summarize-only', action='store_true')
     parser.add_argument('--cpu-only', action='store_true')
     parser.add_argument('--cases', default='A,B,C,D')
+    parser.add_argument('--phases', default='BASE_GAME,OPTIONAL_POST')
+    parser.add_argument('--from-config', action='store_true')
     args = parser.parse_args()
     out = (ROOT / args.output).resolve()
     assert out.is_relative_to(ROOT)
@@ -106,7 +112,9 @@ def main():
     (out / 'kernel-manifest.json').write_text(json.dumps(manifest, indent=2))
     command = gradle + ['-PtailAblation', f'-PtailBench.rounds={args.rounds}', f'-PtailBench.seconds={args.seconds}',
                         f'-PtailBench.cases={args.cases}', f'-PtailBench.cpuOnly={str(args.cpu_only).lower()}',
+                        f'-PtailBench.phases={args.phases}',
                         f'-PtailBench.warmup={args.warmup}', f'-PtailBench.output={out}', 'runClient']
+    if args.from_config: command.insert(-1, '-PglTailFromConfig')
     (out / 'command.json').write_text(json.dumps(command, indent=2))
     guard = Guard()
     monitor = child = None

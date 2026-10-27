@@ -55,6 +55,11 @@ public final class GlTailClientSmoke {
                 out=mc.gameDirectory.toPath().resolve("logs/vulkanforge/gl-tail-smoke");Files.createDirectories(out);
                 for(String name:new String[]{"tail-world","vanilla-world","inventory","resized","fabulous"})Files.deleteIfExists(out.resolve(name+".png"));
                 Files.writeString(out.resolve("report.txt"),"");checkWindow(mc);
+                if(Boolean.getBoolean("vulkanforge.glTailFromConfig")){
+                    require(System.getProperty("vulkanforge.glTailCompatibility")==null&&System.getProperty("vulkanforge.startup")==null,"startup selection overridden by JVM flags");
+                    require(github.com.gengyoubo.vulkanforge.config.VulkanForgeConfig.startup().glTailCompatibility(),"saved GL tail plan ignored");
+                    log("PASS saved GL_VK / GL_TAIL startup without JVM plan or renderer override");
+                }
                 require(NativeMainWindow.presentedFrames()>0,"no GL swaps");
                 mc.options.pauseOnLostFocus=false;mc.options.renderDistance().set(4);mc.options.graphicsMode().set(net.minecraft.client.GraphicsStatus.FANCY);
                 mc.options.cloudStatus().set(net.minecraft.client.CloudStatus.OFF);mc.options.gamma().set(0.0);

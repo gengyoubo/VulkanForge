@@ -20,6 +20,7 @@ import net.minecraftforge.fml.loading.FMLPaths;
  * Three modes: GL, GL_VK and experimental VK. Vulkan 1.2..1.4 and OpenGL 4.3..4.6 are API selections.
  */
 public final class VulkanForgeConfig {
+    public enum GlVkPlan { GL_TAIL, INTERLEAVED }
     /** Legacy startup aliases. VULKAN means GL_VK, as it did before the mode split. */
     @Deprecated public enum Backend { VULKAN, OPENGL }
     //推荐1.3
@@ -64,6 +65,7 @@ public final class VulkanForgeConfig {
 
     public static final ForgeConfigSpec SPEC;
     public static final ForgeConfigSpec.EnumValue<RenderMode> MODE;
+    public static final ForgeConfigSpec.EnumValue<GlVkPlan> GL_VK_PLAN;
     public static final ForgeConfigSpec.EnumValue<VulkanVersion> VULKAN_VERSION;
     public static final ForgeConfigSpec.EnumValue<OpenGLVersion> OPENGL_VERSION;
     public static final Map<NvidiaExtension, ForgeConfigSpec.BooleanValue> NVIDIA_EXTENSIONS = new LinkedHashMap<>();
@@ -73,6 +75,8 @@ public final class VulkanForgeConfig {
         builder.comment("Startup settings: changes take effect after restarting the game.").push("renderer");
         MODE = builder.comment("Running mode: GL (OpenGL), GL_VK (hybrid with GL fallback), VK (native Vulkan; experimental coverage gate, no GL fallback).")
                 .defineEnum("mode", RenderMode.GL_VK);
+        GL_VK_PLAN = builder.comment("GL_VK execution plan. GL_TAIL batches Vulkan terrain and keeps compatibility draws/final output on GL. INTERLEAVED keeps the original Vulkan presentation path. Restart required.")
+                .defineEnum("glVkPlan", GlVkPlan.GL_TAIL);
         builder.pop();
 
         builder.push("vulkan");
@@ -92,9 +96,10 @@ public final class VulkanForgeConfig {
     }
 
     /** What this launch actually uses; the Mods-list screen only changes the next launch. */
-    public record Startup(RenderMode mode, VulkanVersion vulkanVersion, OpenGLVersion openGLVersion, Set<NvidiaExtension> nvidiaExtensions) {
+    public record Startup(RenderMode mode, VulkanVersion vulkanVersion, OpenGLVersion openGLVersion, Set<NvidiaExtension> nvidiaExtensions, GlVkPlan glVkPlan) {
         public static final Startup DEFAULTS = new Startup(RenderMode.GL_VK, VulkanVersion.V1_4, OpenGLVersion.GL_4_6, Set.of());
         public Startup { nvidiaExtensions = nvidiaExtensions.isEmpty() ? Set.of() : Collections.unmodifiableSet(EnumSet.copyOf(nvidiaExtensions)); }
+        public Startup(RenderMode mode, VulkanVersion vulkanVersion, OpenGLVersion openGLVersion, Set<NvidiaExtension> nvidiaExtensions) { this(mode,vulkanVersion,openGLVersion,nvidiaExtensions,GlVkPlan.GL_TAIL); }
         public Startup(RenderMode mode, VulkanVersion vulkanVersion, OpenGLVersion openGLVersion) { this(mode, vulkanVersion, openGLVersion, Set.of()); }
         @Deprecated public Startup(Backend backend,VulkanVersion vulkanVersion,OpenGLVersion openGLVersion){this(backend==Backend.OPENGL?RenderMode.GL:RenderMode.GL_VK,vulkanVersion,openGLVersion);}
         @Deprecated public Backend backend(){return mode==RenderMode.GL?Backend.OPENGL:Backend.VULKAN;}
@@ -105,13 +110,14 @@ public final class VulkanForgeConfig {
             for (NvidiaExtension extension : nvidiaExtensions) names.add(extension.extensionName);
             return names.toString();
         }
-        /** Vulkan Surface/Swapchain main window (Windows only, also gated by -Dvulkanforge.directPresent). */
+        /** Historical name: eligibility for the GL_VK backend; the plan chooses GL or Vulkan presentation. */
         public boolean vulkanMainWindow() { return mode == RenderMode.GL_VK && vulkanVersion.implemented; }
+        public boolean glTailCompatibility() { return mode == RenderMode.GL_VK && glVkPlan == GlVkPlan.GL_TAIL; }
         /** In-context OpenGL 4.3+ terrain renderer instead of the Vulkan bridge. */
         public boolean gl46Terrain() { return mode == RenderMode.GL && openGLVersion != OpenGLVersion.DEFAULT; }
         @Override public String toString() {
             if (mode == RenderMode.GL) return "GL " + openGLVersion.label;
-            return (mode==RenderMode.GL_VK?"GL-VK ":"VK ") + vulkanVersion.label + (nvidiaExtensions.isEmpty() ? "" : " +" + nvidiaExtensionNames());
+            return (mode==RenderMode.GL_VK?"GL-VK ":"VK ") + vulkanVersion.label + (mode==RenderMode.GL_VK?" / "+glVkPlan:"") + (nvidiaExtensions.isEmpty() ? "" : " +" + nvidiaExtensionNames());
         }
     }
     private static Startup startup;
@@ -123,7 +129,7 @@ public final class VulkanForgeConfig {
      * overrides the file for this launch only, e.g. for smoke runs.
      */
     public static synchronized Startup startup() {
-        if (startup == null) startup = override(read(FMLPaths.CONFIGDIR.get().resolve("vulkanforge-client.toml")), System.getProperty("vulkanforge.startup"));
+        if (startup == null) startup = overridePlan(override(read(FMLPaths.CONFIGDIR.get().resolve("vulkanforge-client.toml")), System.getProperty("vulkanforge.startup")), System.getProperty("vulkanforge.glTailCompatibility"));
         return startup;
     }
 
@@ -132,8 +138,14 @@ public final class VulkanForgeConfig {
         String[] parts = value.split(":", 2);
         RenderMode mode = RenderMode.parse(parts[0],file.mode());
         String version = parts.length > 1 ? parts[1] : null;
-        return mode.usesVulkan() ? new Startup(mode, value(version, file.vulkanVersion()), file.openGLVersion(), file.nvidiaExtensions())
-                : new Startup(mode, file.vulkanVersion(), value(version, file.openGLVersion()), file.nvidiaExtensions());
+        return mode.usesVulkan() ? new Startup(mode, value(version, file.vulkanVersion()), file.openGLVersion(), file.nvidiaExtensions(), file.glVkPlan())
+                : new Startup(mode, file.vulkanVersion(), value(version, file.openGLVersion()), file.nvidiaExtensions(), file.glVkPlan());
+    }
+
+    /** Legacy JVM switch overrides this launch only; it is never written back to the saved plan. */
+    static Startup overridePlan(Startup file,String raw) {
+        if(raw==null)return file;
+        return new Startup(file.mode(),file.vulkanVersion(),file.openGLVersion(),file.nvidiaExtensions(),Boolean.parseBoolean(raw)?GlVkPlan.GL_TAIL:GlVkPlan.INTERLEAVED);
     }
 
     static Startup read(Path file) {
@@ -146,10 +158,14 @@ public final class VulkanForgeConfig {
             RenderMode mode=RenderMode.parse(config.get("renderer.mode"),RenderMode.parse(config.get("renderer.backend"),Startup.DEFAULTS.mode()));
             Startup result=new Startup(mode,
                     value(config.get("vulkan.version"), Startup.DEFAULTS.vulkanVersion()),
-                    value(config.get("opengl.version"), Startup.DEFAULTS.openGLVersion()), nvidia);
-            if(!config.contains("renderer.mode")||config.contains("renderer.backend")||!mode.name().equals(config.get("renderer.mode"))) {
+                    value(config.get("opengl.version"), Startup.DEFAULTS.openGLVersion()), nvidia,
+                    value(config.get("renderer.glVkPlan"),Startup.DEFAULTS.glVkPlan()));
+            if(!config.contains("renderer.mode")||config.contains("renderer.backend")||!mode.name().equals(config.get("renderer.mode"))
+                    ||!result.glVkPlan().name().equals(config.get("renderer.glVkPlan"))) {
                 config.set("renderer.mode",mode.name());config.remove("renderer.backend");
+                config.set("renderer.glVkPlan",result.glVkPlan().name());
                 config.setComment("renderer.mode","GL / GL_VK / VK; legacy VULKAN migrates to GL_VK. Restart required.");
+                config.setComment("renderer.glVkPlan","GL_TAIL (recommended) / INTERLEAVED; applies to GL_VK only. Restart required.");
                 try{config.save();}catch(RuntimeException error){com.mojang.logging.LogUtils.getLogger().warn("Could not persist renderer.mode migration ({})",error.getClass().getSimpleName());}
             }
             return result;

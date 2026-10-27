@@ -1,6 +1,14 @@
 # GL-VK：GL 尾部兼容执行计划
 
-实验开关：`-Dvulkanforge.glTailCompatibility=true`，默认关闭，重启生效。只适用于 Windows 的 GL_VK 模式，同 GPU 的外部内存/信号量互操作能力仍然必需。GL 模式保持原实现；VK 模式的完整游戏覆盖门禁不变。
+GL-VK 现已默认使用 GL 尾部兼容计划。游戏 Mods → VulkanForge → 配置中的“GL-VK 执行计划”可选择 GL 尾部兼容或原交错模式，保存后重启生效。对应配置：
+
+```toml
+[renderer]
+mode = "GL_VK"
+glVkPlan = "GL_TAIL"
+```
+
+旧配置缺少 `glVkPlan` 时迁移为 `GL_TAIL`；显式保存的 `INTERLEAVED` 会保留。只适用于 Windows 的 GL_VK 模式，同 GPU 的外部内存/信号量互操作能力仍然必需。GL 模式忽略此计划；VK 模式的完整游戏覆盖门禁不变。诊断开关与执行计划独立，正常启动不启用消融或新增查询。
 
 ## 第一阶段的实际分工
 
@@ -27,7 +35,7 @@ Fabulous 的透明目标/后处理保持 GL：现有接管合同无法对私有 
 
 第一版导出两份地形的颜色与深度，而不是只导出最终颜色；还保留两次 GL 全屏合成和一次必要深度复制。这样可以在原有实体与透明阶段之间插入 GL 内容，且无需中途重新取得共享主目标的所有权。
 
-先前 `FINAL_COLOR_GL` 的 1106 FPS 不能作为此计划的实测性能。它使用不同的资源图，省略了兼容中间阶段，且没有中途 Forge GL 绘制。本版没有新增性能提升承诺；默认保持现有交错模式。
+先前 `FINAL_COLOR_GL` 的 1106 FPS 不能作为此计划的实测性能。它使用不同的资源图，省略了兼容中间阶段，且没有中途 Forge GL 绘制。原交错模式仍可通过 `glVkPlan = "INTERLEAVED"` 选择。
 
 稳定地形帧的预期实际计数：
 
@@ -49,17 +57,21 @@ Fabulous 的透明目标/后处理保持 GL：现有接管合同无法对私有 
 ## 使用与验证
 
 ```powershell
-# 手动启动实验计划；不修改 TOML 默认模式
-.\gradlew.bat '-Dvulkanforge.glTailCompatibility=true' runClient
+# 普通启动读取保存的 GL_VK / GL_TAIL 配置，无需特殊 JVM 参数
+.\gradlew.bat runClient
 
 # 真实 GPU：GL 插入前后深度遮挡、两帧槽、缩放、实际计数和拒绝 Vulkan 再进入
 .\gradlew.bat --no-parallel :vulkan-lab:smokeGlTail :vulkan-lab:smokeNativePostBatch build
 
 # 完整 Forge：临时世界、地形/水/玻璃/牛/箱子、原版对照、手持物与物品栏、缩放/全屏、F8、重载与 Fabulous
 .\gradlew.bat --no-parallel -PglTailSmoke runClient
+# 验证完全由保存的配置选择计划，不提供 JVM 渲染器/计划覆盖
+.\gradlew.bat --no-parallel -PglTailSmoke -PglTailFromConfig runClient
+# 配置菜单保存往返与无覆盖启动
+.\gradlew.bat --no-parallel -PconfigSmoke runClient
 ```
 
-`glTailCompatibility` 显式选择此计划，优先于旧的 `directPresent=false` 呈现选项。初始化失败仍回到原 GL 窗口，测试会明确检查实际启用的计划，不把失败回退算成 Vulkan 测试通过。
+旧 JVM 开关 `-Dvulkanforge.glTailCompatibility=true/false` 继续作为单次启动覆盖，优先于 TOML，且不改写保存值。启动快照通过布尔参数把选中计划传给隔离后端及地形执行器，不使用写入全局 JVM 属性来同步配置。GL_TAIL 本身使用 GL 呈现；`directPresent=false` 只在原交错计划中关闭 Vulkan 主窗口。初始化失败仍回到原 GL 窗口，测试会明确检查实际启用的计划，不把失败回退算成 Vulkan 测试通过。
 
 报告：
 
@@ -82,6 +94,28 @@ RTX 3050 Laptop：Vulkan 1.2 / 1.3 / 1.4 独立 GPU 检查通过，验证 GL 插
 
 GL 尾部完整游戏的最终后端与呈现报告归档在 `run/logs/vulkanforge/gl-tail-smoke/backend.txt` 和 `presentation.txt`，避免下一次启动覆盖证据。普通 `main-window-report.txt` 是最近一次启动的报告。
 
-本轮是功能与交接计数验收，未进行 GL 尾部与默认混合模式的同场景配对 FPS / P99 测量，保持默认关闭。验证层报告不可用，未声称通过 Vulkan 同步验证。
+以上是初版功能与交接计数验收。后续真实游戏消融和计时探针对照见 [游戏消融记录](tail-game-ablation.md)；配置接入后 GL_TAIL 成为 GL-VK 默认计划。验证层报告不可用，未声称通过 Vulkan 同步验证。
 
 原默认交错模式另以 Vulkan 1.3 跑完整 `worldSmoke` 回归，通过实体/粒子/天气/手持物/HUD、GL 回退顺序、Fabulous、资源重载、缩放/最小化恢复/全屏和世界切换。报告保存在 `build/reports/gl-tail-default-regression/`，没有用 GL 尾部模式替代该回归。
+
+## 配置接入后的复测
+
+游戏配置已接入 `renderer.glVkPlan`，当前开发游戏目录保存 `mode = "GL_VK"`、`glVkPlan = "GL_TAIL"`。配置页可保存两种执行计划，旧配置迁移、CLI 临时覆盖、模式/版本切换与扩展保留均通过检查；显式计划通过基本类型参数传入后端和地形执行器，不依赖 JVM 属性同步。
+
+`-PglTailSmoke -PglTailFromConfig runClient` 无 JVM 渲染器/计划覆盖启动成功，完整功能回归通过。稳定区间 918 个地形帧均为每帧一次地形提交、两次 GL 组调用；RGB 平均绝对差为 1.797 / 255，深度差超过 2e-4 的像素比例为 1.620%，没有声称零误差。手持物/HUD/物品栏、窗口缩放/全屏、F8 重开、资源重载与 Fabulous 回退通过，最终 25800 次 GL swap、Vulkan Present 为零，资源正常关闭。
+
+正常 A 的性能复测命令：
+
+```powershell
+python tools/benchmark-tail-game.py --java-home '<JDK17目录>' --rounds 3 --seconds 5 --warmup 3 --cases A --phases BASE_GAME --cpu-only --from-config --output build/reports/gl-tail-config-retest
+```
+
+1920×1080 无边框、视距 8、Fancy、云关闭、VSync 关闭、取消帧率上限；保留 HUD/手持物。关闭新增 GL 时间戳查询，保留 CPU 分段和原有 VK 时间戳。没有 B/C/D 省略或替换，总计 9179 个测量帧。
+
+| 组 | FPS | 帧周期 CPU P99 ms |
+|---|---:|---:|
+| 1 | 584.10 | 4.2154 |
+| 2 | 606.85 | 3.7719 |
+| 3 | 627.03 | 3.0811 |
+
+FPS 中位数 606.85。三个样本均验证从配置选择计划、每帧一次地形提交与两次 GL 组调用；省略地形/跳过可选后处理均为零。完整原始帧、参数、温度/频率、源码/class 归档及报告在 `build/reports/gl-tail-config-retest/`，已知 Java GPU 工作负载并发检测为空。不是用户原有世界的同场景重放，不将与此前样本的差异直接归因于本次配置接入。验证层仍不可用。

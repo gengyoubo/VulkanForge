@@ -18,7 +18,9 @@ public final class GlTailSmoke {
         if (window == 0) throw new AssertionError("GL context");
         glfwMakeContextCurrent(window); org.lwjgl.opengl.GL.createCapabilities();
         Path out=Path.of(System.getProperty("vulkanforge.smokeReportDir","build/reports/gl-tail-smoke")); Files.createDirectories(out);
-        try (MainWindowBackend backend=new MainWindowBackend(out.resolve("backend.txt").toString(),GlInterop.deviceUUID(),GlInterop::importImage,org.lwjgl.opengl.GL11::glFinish)) {
+        // The explicit startup plan must win even when the old standalone JVM switch is false.
+        System.setProperty("vulkanforge.glTailCompatibility","false");
+        try (MainWindowBackend backend=new MainWindowBackend(out.resolve("backend.txt").toString(),GlInterop.deviceUUID(),GlInterop::importImage,org.lwjgl.opengl.GL11::glFinish,VulkanContext.requestedApiVersion(),"",true)) {
             var send=backend.worldCommands(GlInterop::importTerrain);
             Consumer<WorldProtocol.Command> command=c->send.accept(WorldProtocol.pack(c));
             command.accept(new WorldProtocol.Reset(1)); command.accept(new WorldProtocol.Atlas(1,1,1,new byte[]{-1,-1,-1,-1}));
