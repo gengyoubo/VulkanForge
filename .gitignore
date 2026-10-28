@@ -6,6 +6,7 @@ run/
 run-native/
 run-gl46/
 run-fps/
+run-shaders/
 run-data/
 .bootstrap/
 hs_err_pid*

@@ -123,7 +123,7 @@ public final class NativeDeviceState {
                 Object[] attributes=program.attributes.entrySet().stream().map(entry->new Object[]{entry.getKey(),entry.getValue()}).toArray();
                 program.samplers=(String[])NativeGameWindow.call("program",value,vertex,fragment,attributes);program.linked=true;return null;}
             case "glGetProgrami":return number(a,1)==35714&&programs.get(number(a,0)).linked?1:0;
-            case "glDeleteProgram":programs.remove(number(a,0));NativeGameWindow.call("deleteProgram",number(a,0));return null;
+            case "glDeleteProgram":{int owner=number(a,0);programs.remove(owner);locations.entrySet().removeIf(entry->entry.getValue().program()==owner);locationIds.keySet().removeIf(key->key.startsWith(owner+":"));NativeGameWindow.call("deleteProgram",owner);return null;}
             case "glUseProgram":currentProgram=number(a,0);return null;
             case "glGetUniformLocation":{int owner=number(a,0);String name=a[1].toString(),key=owner+":"+name;return locationIds.computeIfAbsent(key,unused->{int value=id();locations.put(value,new Location(owner,name));return value;});}
             case "glUniform1i":case "glUniform1iv":case "glUniform2iv":case "glUniform3iv":case "glUniform4iv":case "glUniform1fv":case "glUniform2fv":case "glUniform3fv":case "glUniform4fv":case "glUniformMatrix2fv":case "glUniformMatrix3fv":case "glUniformMatrix4fv":uniform(a);return null;
@@ -158,6 +158,7 @@ public final class NativeDeviceState {
             case "glGetBoolean":return number(a,0)==2930?depthMask:on(number(a,0));
             case "glGetBooleanv":{ByteBuffer out=(ByteBuffer)a[1];if(number(a,0)==3107){for(int i=0;i<4;i++)out.put(out.position()+i,(byte)((colorMask>>i)&1));}else out.put(out.position(),(byte)(number(a,0)==2930&&depthMask?1:0));return null;}
             case "glGetFloat":return number(a,0)==32824?offsetFactor:number(a,0)==10752?offsetUnits:0f;
+            case "glGetFloatv":{if(number(a,0)!=3106)throw unsupported("native float vector query "+a[0]);if(a[1] instanceof float[] out)System.arraycopy(clearColor,0,out,0,4);else ((FloatBuffer)a[1]).duplicate().put(clearColor);return null;}
             // These fences protect CPU staging/arena copies, which complete synchronously above.
             // Real Vulkan staging and in-flight mesh versions retain their own executor fences.
             case "glFenceSync":{long value=id();cpuFences.add(value);return value;}
@@ -182,7 +183,7 @@ public final class NativeDeviceState {
         mapping.bytes().duplicate().position(offset).limit(offset+size).get(data,mapping.offset()+offset,size);buffers.put(target,data);bufferVersions.put(target,++bufferGeneration);
     }
     private static boolean on(int value){return enabled.getOrDefault(value,false);}
-    private static int integer(int value){return switch(value){case 3379->8192;case 32873->boundTextures[activeTexture];case 34016->33984+activeTexture;case 34964->arrayBuffer;case 34965->array().indices;case 36006->drawTarget;case 36010->readTarget;case 35725->currentProgram;case 32969->src;case 32968->dst;case 32971->srcAlpha;case 32970->dstAlpha;case 32777->equation;case 34877->equationAlpha;case 2932->depthFunc;case 2885->cullFace;case 2886->frontFace;default->integers.getOrDefault(value,0);};}
+    private static int integer(int value){return switch(value){case 3379->8192;case 32873->boundTextures[activeTexture];case 34016->33984+activeTexture;case 34964->arrayBuffer;case 34965->array().indices;case 34229->vao;case 36006->drawTarget;case 36010->readTarget;case 35725->currentProgram;case 32969->src;case 32968->dst;case 32971->srcAlpha;case 32970->dstAlpha;case 32777->equation;case 34877->equationAlpha;case 2932->depthFunc;case 2885->cullFace;case 2886->frontFace;default->integers.getOrDefault(value,0);};}
     private static void image(Object[] a) {
         int width=number(a,3),height=number(a,4);if(number(a,0)==32868){proxyWidth=width<=8192&&height<=8192?width:0;return;}
         if(number(a,1)!=0)return;Page page=page();page.width=width;page.height=height;page.internal=number(a,2);page.rgba=new byte[Math.multiplyExact(Math.multiplyExact(width,height),4)];page.version++;

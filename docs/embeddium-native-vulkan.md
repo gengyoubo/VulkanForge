@@ -56,3 +56,5 @@ GPU 检查需先将 `VK_LAYER_PATH` 指向已安装的 Khronos 校验层，并�
 - 窗口为 `GLFW_NO_API`，没有 OpenGL 上下文或禁止入口调用，Vulkan 校验错误为零。
 
 证据在 `logs/vulkanforge/native-game-smoke/embeddium.txt` 和 `native-game-report.txt`；后端计数名为 `embeddiumTerrainDraws`，适配器计数名为 `embeddiumMultiDrawBatches`。截图来自实际 Swapchain。上述功能检查不代表性能提升，不替代完整资源包、维度、第三方 shader 或所有 Embeddium 扩展的覆盖。
+
+2026-10-29 在 RTX 3050 Laptop GPU 上，启用 Khronos 同步校验的完整世界检查通过。世界取证时实际渲染器为 `SodiumWorldRenderer`，可见 section 为 4，收到 2376 个多重绘制批次、记录 9470 次 Embeddium Vulkan 地形绘制；这些是该取证时刻的累计值。关闭时共呈现 1527 帧，记录 60220 次原生绘制，`VALIDATION_ERRORS=0`、`FORBIDDEN_GL_CALLS=0`、`OPENGL_CONTEXTS=0`、`CLOSED=true`。证据及世界、背包、缩放、重载、Fabulous 截图归档在 `build/reports/embeddium-native-20261029/with-embeddium/`。

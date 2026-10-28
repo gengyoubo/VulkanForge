@@ -1,4 +1,13 @@
 {
+  "vulkanforge.shaders.title": "Shader Packs",
+  "vulkanforge.shaders.off": "Shaders OFF",
+  "vulkanforge.shaders.apply": "Apply",
+  "vulkanforge.shaders.reload": "Reload",
+  "vulkanforge.shaders.options": "Pack Settings",
+  "vulkanforge.shaders.folder": "Open Pack Folder",
+  "vulkanforge.shaders.active": "Active: %s",
+  "vulkanforge.shaders.loading": "Loading: %s",
+  "vulkanforge.shaders.profile": "Profile",
   "key.vulkanforge.preview": "Toggle Vulkan terrain / menu preview",
   "key.vulkanforge.inset": "Switch Vulkan terrain between full view and inset",
   "key.vulkanforge.triangle": "Open separate Vulkan triangle window",

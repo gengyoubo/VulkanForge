@@ -10,7 +10,13 @@ base { archivesName = mod_id }
 java.toolchain.languageVersion = JavaLanguageVersion.of(17)
 sourceSets.main.java.srcDir 'bridge-protocol/src/main/java'
 sourceSets.main.java.srcDir 'gl-interop/src/main/java'
+sourceSets.main.java.srcDir 'shader-pack/src/main/java'
 sourceSets {
+    shaderPackTest {
+        java.srcDir 'shader-pack/src/test/java'
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += output + compileClasspath
+    }
     nativeBootstrap { }
     nativeBootstrapTest {
         compileClasspath += sourceSets.nativeBootstrap.output + sourceSets.nativeBootstrap.runtimeClasspath
@@ -48,6 +54,14 @@ minecraft {
                 property 'vulkanforge.nativeGameSmoke', 'true'
                 if (project.hasProperty('nativeSmokeHidden')) property 'vulkanforge.nativeSmokeHidden', 'true'
                 if (project.hasProperty('nativeMenuOnly')) property 'vulkanforge.nativeMenuOnly', 'true'
+                mods { vulkanforge { source sourceSets.smoke } }
+            }
+            if (project.hasProperty('shaderPackSmoke')) {
+                def shaderMode=project.findProperty('shaderPackMode') ?: 'VK'
+                workingDirectory project.file('run-shaders/' + shaderMode)
+                property 'vulkanforge.startup', shaderMode=='VK' ? 'VK:V1_4' : 'GL:DEFAULT'
+                property 'vulkanforge.shaderPackSmoke', shaderMode
+                property 'shaderPack.output', project.file(project.findProperty('shaderPack.output') ?: 'build/reports/shader-packs/' + shaderMode).absolutePath
                 mods { vulkanforge { source sourceSets.smoke } }
             }
             if (project.hasProperty('gameFps')) {
@@ -166,6 +180,12 @@ tasks.register('smokeNativeBuffers', JavaExec) {
     mainClass = 'github.com.gengyoubo.vulkanforge.client.NativeBuffersSmoke'
     systemProperty 'vulkanforge.nativeBootstrap', 'true'
 }
+
+tasks.register('smokeShaderPack', JavaExec) {
+    dependsOn 'shaderPackTestClasses'
+    classpath = sourceSets.shaderPackTest.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.shaderpack.ShaderPackSmoke'
+}
 tasks.named('assemble') { dependsOn 'nativeBootstrapJar' }
 tasks.matching { it.name == 'runClient' }.configureEach { dependsOn 'nativeBootstrapJar' }
 if (project.hasProperty('gameFps')) tasks.matching { it.name == 'runClient' }.configureEach {
@@ -181,6 +201,21 @@ if (project.hasProperty('gameFps')) tasks.matching { it.name == 'runClient' }.co
         def backend = new File(project.file('run-fps/' + fpsMode), 'logs/vulkanforge/' + (fpsMode == 'VK' ? 'native-game-report.txt' : 'gl46-report.txt'))
         if (backend.exists()) new File(output, 'backend.txt').bytes = backend.bytes
         if (fpsMode == 'VK' && (!backend.exists() || !backend.text.contains('CLOSED=true'))) throw new GradleException('Native FPS backend did not close cleanly')
+    }
+}
+if(project.hasProperty('shaderPackSmoke')) tasks.matching { it.name=='runClient' }.configureEach {
+    def shaderMode=project.findProperty('shaderPackMode') ?: 'VK'
+    def reports=project.file(project.findProperty('shaderPack.output') ?: 'build/reports/shader-packs/' + shaderMode)
+    doFirst {
+        def directory=project.file('run-shaders/' + shaderMode);directory.mkdirs();new File(directory,'options.txt').text='renderDistance:3\nsimulationDistance:5\nguiScale:2\nmaxFps:60\nenableVsync:false\nfullscreen:false\nonboardAccessibility:false\n'
+        reports.mkdirs();new File(reports,'result.txt').text='STATUS=RUNNING\n'
+    }
+    doLast {
+        if(!new File(reports,'result.txt').text.contains('STATUS=OK'))throw new GradleException('Shader pack smoke failed: ' + reports)
+        if(shaderMode=='VK'){
+            def backend=new File(project.file('run-shaders/VK'),'logs/vulkanforge/native-game-report.txt');new File(reports,'backend.txt').bytes=backend.bytes
+            if(!backend.text.contains('CLOSED=true')||!backend.text.contains('VALIDATION_ERRORS=0'))throw new GradleException('Shader pack backend did not close cleanly')
+        }
     }
 }
 if (project.hasProperty('nativeGame') || project.hasProperty('nativeGameSmoke')) tasks.matching { it.name == 'runClient' }.configureEach {

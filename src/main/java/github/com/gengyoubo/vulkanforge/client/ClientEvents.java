@@ -5,6 +5,7 @@ import github.com.gengyoubo.vulkanforge.VulkanForge;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.Component;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.event.RegisterKeyMappingsEvent;
 import net.minecraftforge.client.event.ScreenEvent;
@@ -21,6 +22,8 @@ import org.lwjgl.glfw.GLFW;
 
 @Mod.EventBusSubscriber(modid = VulkanForge.MOD_ID, value = Dist.CLIENT)
 public final class ClientEvents {
+    @SubscribeEvent public static void shaderPackScreen(ScreenEvent.Init.Post event){String name=event.getScreen().getClass().getName();if(event.getScreen() instanceof net.minecraft.client.gui.screens.VideoSettingsScreen||name.endsWith(".SodiumOptionsGUI"))event.addListener(net.minecraft.client.gui.components.Button.builder(Component.translatable("vulkanforge.shaders.title"),button->Minecraft.getInstance().setScreen(new github.com.gengyoubo.vulkanforge.client.shader.ShaderPackScreen(event.getScreen()))).bounds(event.getScreen().width-100,3,96,20).build());}
+    @SubscribeEvent public static void shaderPackFrame(TickEvent.RenderTickEvent event){if(event.phase==TickEvent.Phase.START)github.com.gengyoubo.vulkanforge.client.shader.ShaderPackRuntime.beginFrame();}
     private static final KeyMapping PREVIEW = new KeyMapping("key.vulkanforge.preview",
             InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_F8, "key.categories.vulkanforge");
     private static final KeyMapping TRIANGLE = new KeyMapping("key.vulkanforge.triangle",
@@ -44,7 +47,7 @@ public final class ClientEvents {
     @SubscribeEvent
     public static void terrain(RenderLevelStageEvent event) {
         // This stage carries the view pose; AFTER_LEVEL in 1.20.1 carries a different pose stack.
-        if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_SKY) VulkanPreview.skyEnd(event);
+        if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_SKY) {VulkanPreview.skyEnd(event);if(github.com.gengyoubo.vulkanforge.client.shader.ShaderPackRuntime.active())github.com.gengyoubo.vulkanforge.client.shader.ShaderPackRuntime.matrices(new org.joml.Matrix4f(com.mojang.blaze3d.systems.RenderSystem.getProjectionMatrix()),new org.joml.Matrix4f(event.getPoseStack().last().pose()));}
         else if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_LEVEL) VulkanPreview.handBegin();
         else if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_CUTOUT_BLOCKS) VulkanPreview.terrain(event);
         else if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_BLOCK_ENTITIES) VulkanPreview.entities();
@@ -77,7 +80,7 @@ public final class ClientEvents {
     }
 
     @SubscribeEvent
-    public static void shutdown(GameShuttingDownEvent event) { VulkanPreview.close(); }
+    public static void shutdown(GameShuttingDownEvent event) { github.com.gengyoubo.vulkanforge.client.shader.ShaderPackRuntime.close();VulkanPreview.close(); }
 
     private static void launchTriangle() {
         boolean started = LabLauncher.triangle();

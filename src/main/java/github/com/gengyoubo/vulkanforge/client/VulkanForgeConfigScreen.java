@@ -44,6 +44,7 @@ public final class VulkanForgeConfigScreen extends Screen {
     }
 
     @Override protected void init() {
+        addRenderableWidget(Button.builder(Component.translatable("vulkanforge.shaders.title"),button->minecraft.setScreen(new github.com.gengyoubo.vulkanforge.client.shader.ShaderPackScreen(this))).bounds(width-100,3,96,20).build());
         int column = 150, gap = 10, left = width / 2 - column - gap / 2, right = width / 2 + gap / 2, y = 36;
         addRenderableWidget(CycleButton.<RenderMode>builder(value -> Component.translatable("vulkanforge.config.mode." + value.name().toLowerCase(Locale.ROOT)))
                 .withValues(RenderMode.values()).withInitialValue(mode)

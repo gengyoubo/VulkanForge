@@ -1,4 +1,13 @@
 {
+  "vulkanforge.shaders.title": "光影包",
+  "vulkanforge.shaders.off": "关闭光影",
+  "vulkanforge.shaders.apply": "应用",
+  "vulkanforge.shaders.reload": "重新加载",
+  "vulkanforge.shaders.options": "光影设置",
+  "vulkanforge.shaders.folder": "打开光影文件夹",
+  "vulkanforge.shaders.active": "当前：%s",
+  "vulkanforge.shaders.loading": "正在加载：%s",
+  "vulkanforge.shaders.profile": "预设",
   "key.vulkanforge.preview": "开关 Vulkan 地形 / 主菜单预览",
   "key.vulkanforge.inset": "切换 Vulkan 地形全屏 / 小窗对照",
   "key.vulkanforge.triangle": "打开独立 Vulkan 三角形窗口",

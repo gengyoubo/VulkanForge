@@ -82,6 +82,11 @@ public final class NativeGameBackend implements AutoCloseable {
         return next.samplers.toArray(String[]::new);
     }
     public void deleteProgram(int id){beginFrame();NativeShaderProgram old=programs.remove(id);if(old!=null)retired.add(old::close);}
+    /** Validate a fullscreen pack pipeline before publishing a hot-reload candidate. */
+    public void prepareShaderPackProgram(int id){
+        beginFrame();NativeShaderProgram program=Objects.requireNonNull(programs.get(id),"Shader pack program");
+        program.pipeline(new int[]{0,1,0,1,0,32774,32774,0,0,515,0,2305,15,6914,0,4,0},new int[][]{{0,3,5126,0,0,0,20,0},{1,2,5126,0,0,12,20,0}},20);
+    }
     public void texture(int id,int width,int height,int flags,byte[] rgba) {
         beginFrame();if(width<=0||height<=0||(long)width*height*4!=rgba.length)throw new IllegalArgumentException("Invalid native texture "+id);
         GpuImage gpu=new GpuImage(context,width,height,VK_FORMAT_R8G8B8A8_UNORM,VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT,VK_IMAGE_ASPECT_COLOR_BIT);
