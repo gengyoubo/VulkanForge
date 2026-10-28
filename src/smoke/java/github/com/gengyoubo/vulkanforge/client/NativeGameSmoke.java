@@ -43,7 +43,7 @@ public final class NativeGameSmoke {
                 mc.createWorldOpenFlows().createFreshLevel(name,new LevelSettings(name,GameType.CREATIVE,false,Difficulty.PEACEFUL,true,new GameRules(),WorldDataConfiguration.DEFAULT),new WorldOptions(1234L,false,false),registries->registries.registryOrThrow(Registries.WORLD_PRESET).getHolderOrThrow(WorldPresets.FLAT).value().createWorldDimensions());
             }else if(stage==2&&mc.level!=null&&mc.player!=null&&mc.screen==null){buildScene(mc);next(3);}
             else if(stage==3&&++ticks>100){NativeGameWindow.captureNext(report.resolve("world.png"));next(4);}
-            else if(stage==4&&++ticks>10){verify(report.resolve("world.png"));long[] stats=NativeGameWindow.stats();require(stats[6]>0,"Terrain was not drawn by Vulkan");require(stats[7]>0,"No native entity/item draws");mc.setScreen(new net.minecraft.client.gui.screens.inventory.InventoryScreen(mc.player));next(5);}
+            else if(stage==4&&++ticks>10){verify(report.resolve("world.png"));long[] stats=NativeGameWindow.stats();require(stats[6]>0,"Terrain was not drawn by Vulkan");require(stats[7]>0,"No native entity/item draws");verifyEmbeddium();mc.setScreen(new net.minecraft.client.gui.screens.inventory.InventoryScreen(mc.player));next(5);}
             else if(stage==5&&++ticks>20){NativeGameWindow.captureNext(report.resolve("inventory.png"));next(6);}
             else if(stage==6&&++ticks>10){verify(report.resolve("inventory.png"));mc.setScreen(null);beforeResize=NativeGameWindow.extent();if(mc.getWindow().isFullscreen())mc.getWindow().toggleFullScreen();GLFW.glfwRestoreWindow(mc.getWindow().getWindow());GLFW.glfwSetWindowSize(mc.getWindow().getWindow(),1024,640);next(7);}
             else if(stage==7&&++ticks>20){resizedExtent=NativeGameWindow.extent();require(!java.util.Arrays.equals(beforeResize,resizedExtent),"Window did not resize");NativeGameWindow.captureNext(report.resolve("resized.png"));next(8);}
@@ -74,6 +74,14 @@ public final class NativeGameSmoke {
         require(System.getProperty("vulkanforge.forbiddenGlCalls","missing").equals("0"),"Forbidden GL entry point was attempted");
         long[] stats=NativeGameWindow.stats();require(stats[0]>0&&stats[1]>0&&stats[5]==0,"No native game draws or validation error");
         Files.writeString(report.resolve("result.txt"),"STATUS=OK\nSCOPE="+(Boolean.getBoolean("vulkanforge.nativeMenuOnly")?"MINECRAFT_MAIN_MENU":"MINECRAFT_WORLD")+"\nOPENGL_CONTEXTS=0\nFORBIDDEN_GL_CALLS=0\nNATIVE_STATS="+java.util.Arrays.toString(stats)+"\n");stage=99;mc.stop();
+    }
+    private static void verifyEmbeddium()throws Exception {
+        if(!net.minecraftforge.fml.ModList.get().isLoaded("embeddium"))return;
+        Class<?> type=Class.forName("me.jellysquid.mods.sodium.client.render.SodiumWorldRenderer");Object renderer=type.getMethod("instance").invoke(null);
+        int visible=(Integer)type.getMethod("getVisibleChunkCount").invoke(renderer);
+        var stats=NativeGameWindow.diagnostics();
+        require(visible>0&&stats.getOrDefault("embeddiumMultiDrawBatches",0L)>0&&stats.getOrDefault("embeddiumTerrainDraws",0L)>0,"Embeddium's actual terrain renderer did not submit visible chunks to Vulkan");
+        Files.writeString(report.resolve("embeddium.txt"),"RENDERER="+type.getName()+"\nVISIBLE_SECTIONS="+visible+"\nNATIVE_DIAGNOSTICS="+stats+"\n");
     }
     private static void verify(Path path)throws Exception {var image=javax.imageio.ImageIO.read(path.toFile());require(image!=null,"Missing native game screenshot");java.util.Set<Integer> colors=new java.util.HashSet<>();for(int y=0;y<image.getHeight();y+=3)for(int x=0;x<image.getWidth();x+=3)colors.add(image.getRGB(x,y));require(colors.size()>64,"Native game screenshot is blank");}
     private static void require(boolean value,String reason){if(!value)throw new AssertionError(reason);}

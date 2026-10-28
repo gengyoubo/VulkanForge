@@ -99,6 +99,8 @@ CPU 纹理、顶点/索引、原版着色器源码、uniform 与绘制状态
 
 ## 当前限制
 
+Embeddium 0.3.31 的地形接入、原生引导要求与验证方法见 [Embeddium 纯 Vulkan 接入](embeddium-native-vulkan.md)。
+
 实际分辨率筛选、静态地形重复上传与 CPU/GPU 分项的测量结果，见 [原生 VK 性能诊断](native-performance-diagnosis.md)。本轮常驻几何与提交优化的结果见 [原生 VK 优化对比](native-optimization-results.md)。当前兼容执行器仍保留原版逐 draw 提交结构。
 
 - 这是实验性后端，仍保留原版 CPU 状态转换与逐 draw 提交；静态地形已常驻显存，动态几何仍按帧上传。纹理目前仅使用基础 mip，远处纹理过滤尚未达到原版完整效果。

@@ -31,6 +31,7 @@ public final class NativeGameWindow {
         if(startup.mode()!=dev.vulkanforge.bridge.RenderMode.VK)throw new IllegalStateException("Native bootstrap requires VK mode");
         try {
             GLFW.glfwDefaultWindowHints();GLFW.glfwWindowHint(GLFW.GLFW_CLIENT_API,GLFW.GLFW_NO_API);
+            if(Boolean.getBoolean("vulkanforge.nativeGameSmoke")&&Boolean.getBoolean("vulkanforge.nativeSmokeHidden"))GLFW.glfwWindowHint(GLFW.GLFW_VISIBLE,GLFW.GLFW_FALSE);
             window=GLFW.glfwCreateWindow(width.getAsInt(),height.getAsInt(),title.get(),monitor.getAsLong(),0);
             if(window==0)throw new IllegalStateException("Native game NO_API window creation failed");
             long hwnd=GLFWNativeWin32.glfwGetWin32Window(window),instance=JNI.callPP(hwnd,-6,User32.getLibrary().getFunctionAddress("GetWindowLongPtrW"));

@@ -58,12 +58,33 @@ public final class NativeBootstrap {
         boolean gl = name.startsWith("org/lwjgl/opengl/");
         boolean early = name.equals("net/minecraftforge/fml/loading/ImmediateWindowHandler");
         boolean glfw = name.equals("org/lwjgl/glfw/GLFW");
+        boolean embeddium = name.startsWith("me/jellysquid/mods/sodium/") || name.startsWith("org/embeddedt/embeddium/");
         boolean game = name.startsWith("com/mojang/blaze3d/") || name.startsWith("net/minecraft/client/")
-                || name.startsWith("net/minecraftforge/client/") || name.startsWith("github/com/gengyoubo/vulkanforge/client/");
+                || name.startsWith("net/minecraftforge/client/") || name.startsWith("github/com/gengyoubo/vulkanforge/client/") || embeddium;
         if (!gl && !early && !glfw && !game) return null;
         ClassNode node = new ClassNode(); new ClassReader(bytes).accept(node, 0);
         boolean changed = false;
         for (MethodNode method : node.methods) {
+            if(name.equals("me/jellysquid/mods/sodium/mixin/SodiumMixinPlugin")&&method.name.equals("isMixinEnabled")&&method.desc.equals("(Ljava/lang/String;)Z")) {
+                // Plugin-supplied mixins bypass shouldApplyMixin in Mixin 0.8, so filter its list at the existing selector too.
+                InsnList filter=new InsnList();LabelNode original=new LabelNode();filter.add(new VarInsnNode(Opcodes.ALOAD,1));filter.add(new LdcInsnNode("workarounds."));
+                filter.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,"java/lang/String","startsWith","(Ljava/lang/String;)Z",false));filter.add(new JumpInsnNode(Opcodes.IFEQ,original));filter.add(new InsnNode(Opcodes.ICONST_0));filter.add(new InsnNode(Opcodes.IRETURN));filter.add(original);filter.add(new FrameNode(Opcodes.F_SAME,0,null,0,null));method.instructions.insert(filter);changed=true;
+            }
+            if(name.equals("me/jellysquid/mods/sodium/mixin/SodiumMixinPlugin")&&method.name.equals("shouldApplyMixin")&&method.desc.equals("(Ljava/lang/String;Ljava/lang/String;)Z")) {
+                // Vulkan owns the NO_API window. Keep Embeddium's terrain/meshing mixins; its WGL context workarounds cannot run.
+                method.instructions.clear();method.tryCatchBlocks.clear();if(method.localVariables!=null)method.localVariables.clear();method.instructions.add(new VarInsnNode(Opcodes.ALOAD,2));method.instructions.add(new LdcInsnNode("me.jellysquid.mods.sodium.mixin.workarounds."));
+                method.instructions.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,"java/lang/String","startsWith","(Ljava/lang/String;)Z",false));method.instructions.add(new InsnNode(Opcodes.ICONST_1));method.instructions.add(new InsnNode(Opcodes.IXOR));method.instructions.add(new InsnNode(Opcodes.IRETURN));changed=true;continue;
+            }
+            if(name.equals("me/jellysquid/mods/sodium/client/gl/functions/BufferStorageFunctions")&&method.name.equals("pickBest")) {
+                // Embeddium's ordinary staging uploads feed CPU-owned arena versions. Vulkan owns the real upload ring and fences.
+                method.instructions.clear();method.instructions.add(new InsnNode(Opcodes.ACONST_NULL));method.instructions.add(new InsnNode(Opcodes.ARETURN));method.tryCatchBlocks.clear();if(method.localVariables!=null)method.localVariables.clear();changed=true;continue;
+            }
+            if(name.equals("me/jellysquid/mods/sodium/client/gl/arena/staging/MappedStagingBuffer")&&method.name.equals("isSupported")) {
+                method.instructions.clear();method.instructions.add(new InsnNode(Opcodes.ICONST_0));method.instructions.add(new InsnNode(Opcodes.IRETURN));method.tryCatchBlocks.clear();if(method.localVariables!=null)method.localVariables.clear();changed=true;continue;
+            }
+            if(name.equals("me/jellysquid/mods/sodium/client/gui/SodiumGameOptionPages")&&method.name.equals("supportsNoErrorContext")) {
+                method.instructions.clear();method.instructions.add(new InsnNode(Opcodes.ICONST_0));method.instructions.add(new InsnNode(Opcodes.IRETURN));method.tryCatchBlocks.clear();if(method.localVariables!=null)method.localVariables.clear();changed=true;continue;
+            }
             if (gl && (method.access & Opcodes.ACC_ABSTRACT) == 0) {
                 trap(method, name + "." + method.name); changed = true; continue;
             }

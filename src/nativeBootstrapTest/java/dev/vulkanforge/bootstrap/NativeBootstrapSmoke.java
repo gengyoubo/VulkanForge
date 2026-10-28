@@ -25,10 +25,20 @@ public final class NativeBootstrapSmoke {
             try{glfw.getMethod("glfwMakeContextCurrent",long.class).invoke(null,7L);throw new AssertionError("Context binding escaped");}
             catch(InvocationTargetException expected){require(expected.getCause() instanceof IllegalStateException,"Context guard absent");}
         } finally {if(previous==null)System.clearProperty("vulkanforge.forbiddenGlCalls");else System.setProperty("vulkanforge.forbiddenGlCalls",previous);}
-        System.out.println("NATIVE_BOOTSTRAP_SMOKE=OK (saved config/API/legacy aliases, inactive GL modes, verified GL traps and forced NO_API window creation)");
+        Class<?> plugin=define("me/jellysquid/mods/sodium/mixin/SodiumMixinPlugin",embeddiumPluginProbe());
+        Object instance=plugin.getConstructor().newInstance();var selector=plugin.getDeclaredMethod("isMixinEnabled",String.class);selector.setAccessible(true);
+        require(!(Boolean)selector.invoke(instance,"workarounds.context_creation.WindowMixin"),"Plugin-provided WGL mixin escaped native filtering");
+        require((Boolean)selector.invoke(instance,"features.render.world.WorldRendererMixin"),"Embeddium terrain renderer was disabled");
+        require((Boolean)selector.invoke(instance,"features.render.immediate.buffer_builder.BufferBuilderMixin"),"Embeddium CPU meshing was disabled");
+        System.out.println("NATIVE_BOOTSTRAP_SMOKE=OK (saved modes, GL traps, NO_API windows, Embeddium terrain/meshing retained, WGL workarounds gated)");
     }
     private static Class<?> define(String name,byte[] original){byte[] transformed=NativeBootstrap.rewrite(name,original);return new ClassLoader(ClassLoader.getPlatformClassLoader()){Class<?> load(){return defineClass(name.replace('/','.'),transformed,0,transformed.length);}}.load();}
     private static byte[] glProbe(){ClassWriter writer=new ClassWriter(0);writer.visit(Opcodes.V17,Opcodes.ACC_PUBLIC,"org/lwjgl/opengl/NativeGuardProbe",null,"java/lang/Object",null);writer.visitMethod(Opcodes.ACC_PUBLIC|Opcodes.ACC_STATIC|Opcodes.ACC_NATIVE,"glGetError","()I",null,null).visitEnd();writer.visitEnd();return writer.toByteArray();}
+    private static byte[] embeddiumPluginProbe(){
+        ClassWriter writer=new ClassWriter(ClassWriter.COMPUTE_MAXS);writer.visit(Opcodes.V17,Opcodes.ACC_PUBLIC,"me/jellysquid/mods/sodium/mixin/SodiumMixinPlugin",null,"java/lang/Object",null);
+        var ctor=writer.visitMethod(Opcodes.ACC_PUBLIC,"<init>","()V",null,null);ctor.visitCode();ctor.visitVarInsn(Opcodes.ALOAD,0);ctor.visitMethodInsn(Opcodes.INVOKESPECIAL,"java/lang/Object","<init>","()V",false);ctor.visitInsn(Opcodes.RETURN);ctor.visitMaxs(0,0);ctor.visitEnd();
+        var selector=writer.visitMethod(Opcodes.ACC_PRIVATE,"isMixinEnabled","(Ljava/lang/String;)Z",null,null);selector.visitCode();selector.visitInsn(Opcodes.ICONST_1);selector.visitInsn(Opcodes.IRETURN);selector.visitMaxs(0,0);selector.visitEnd();writer.visitEnd();return writer.toByteArray();
+    }
     private static byte[] glfwProbe(){ClassWriter writer=new ClassWriter(ClassWriter.COMPUTE_MAXS);writer.visit(Opcodes.V17,Opcodes.ACC_PUBLIC,"org/lwjgl/glfw/GLFW",null,"java/lang/Object",null);writer.visitField(Opcodes.ACC_PUBLIC|Opcodes.ACC_STATIC,"api","I",null,null).visitEnd();
         var hint=writer.visitMethod(Opcodes.ACC_PUBLIC|Opcodes.ACC_STATIC,"glfwWindowHint","(II)V",null,null);hint.visitCode();hint.visitVarInsn(Opcodes.ILOAD,1);hint.visitFieldInsn(Opcodes.PUTSTATIC,"org/lwjgl/glfw/GLFW","api","I");hint.visitInsn(Opcodes.RETURN);hint.visitMaxs(0,0);hint.visitEnd();
         var create=writer.visitMethod(Opcodes.ACC_PUBLIC|Opcodes.ACC_STATIC,"glfwCreateWindow","()J",null,null);create.visitCode();create.visitFieldInsn(Opcodes.GETSTATIC,"org/lwjgl/glfw/GLFW","api","I");create.visitInsn(Opcodes.I2L);create.visitInsn(Opcodes.LRETURN);create.visitMaxs(0,0);create.visitEnd();

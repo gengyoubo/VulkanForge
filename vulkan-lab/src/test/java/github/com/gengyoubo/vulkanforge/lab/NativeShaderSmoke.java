@@ -27,6 +27,14 @@ public final class NativeShaderSmoke {
                 require(packed.get(12)==.2f,"Next draw overwrote the preceding uniform range");
                 require(context.validationErrors()==0,"Optimized unused float input with an integer VBO attribute caused a validation error");
             }
+            try(NativeShaderProgram program=new NativeShaderProgram(context,"#version 330\nin uint Packed;\nvoid main(){gl_Position=vec4(float(Packed & 1u),0,0,1);}","#version 330\nout vec4 fragColor;\nvoid main(){fragColor=vec4(1);}",Map.of("Packed",0))) {
+                int[] state={0,1,0,1,0,32774,32774,1,1,515,0,2305,15,6914,0,4,0};
+                require(program.pipeline(state,new int[][]{{0,1,5125,0,1,0,4,1}},4)!=0,"Unsigned packed Embeddium vertex input");
+            }
+            try(NativeShaderProgram program=new NativeShaderProgram(context,"#version 330\nin uvec4 a_PosId;\nin ivec2 a_LightCoord;\nuniform vec3 u_RegionOffset;\nvoid main(){gl_Position=vec4(vec3(a_PosId.xyz)+u_RegionOffset+vec3(a_LightCoord,0),1);}","#version 330\nout vec4 fragColor;\nvoid main(){fragColor=vec4(1);}",Map.of("a_PosId",0,"a_LightCoord",3))) {
+                int[] state={0,1,0,1,0,32774,32774,1,1,515,0,2305,15,6914,0,4,0};
+                require(program.pipeline(state,new int[][]{{0,4,5123,0,1,0,12,1},{3,2,5123,0,1,8,12,1}},12)!=0,"Embeddium unsigned16 light coordinates must widen to shader int32");
+            }
             require(context.validationErrors()==0,"Native shader resource shutdown validation error");
         }
         System.out.println("NATIVE_SHADER_SMOKE=OK (unused float/integer input removal, missing-input rejection, VBO-independent pipeline reuse, zero validation errors)");

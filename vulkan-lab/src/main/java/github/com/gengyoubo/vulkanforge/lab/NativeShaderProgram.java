@@ -16,7 +16,7 @@ final class NativeShaderProgram implements AutoCloseable {
     final List<String> samplers = new ArrayList<>();
     private final Map<String,Uniform> uniforms = new LinkedHashMap<>();
     private final VulkanContext context;
-    final boolean terrain, entity;
+    final boolean terrain, entity, embeddium;
     long textureLayout,layout,vertex,fragment;
     private final Map<PipelineKey,Long> pipelines = new HashMap<>();
     private final float[] uniformScratch=new float[256];
@@ -41,7 +41,8 @@ final class NativeShaderProgram implements AutoCloseable {
     }
     NativeShaderProgram(VulkanContext context,String vertexSource,String fragmentSource,Map<String,Integer> attributes) {
         this.context=context;
-        terrain=vertexSource.contains("ChunkOffset");
+        embeddium=vertexSource.contains("u_RegionOffset")&&vertexSource.contains("a_PosId");
+        terrain=vertexSource.contains("ChunkOffset")||embeddium;
         entity=vertexSource.contains("UV1")&&vertexSource.contains("Normal")&&!terrain;
         int next=0; Matcher matcher=UNIFORM.matcher(vertexSource+"\n"+fragmentSource);
         while(matcher.find()) {
@@ -88,6 +89,12 @@ final class NativeShaderProgram implements AutoCloseable {
                 Integer attribute=attributes.get(name);if(attribute==null)throw new UnsupportedOperationException("Unbound native vertex attribute "+name);location=attribute;
             } else if(!isVertex&&direction.equals("out"))location=0;
             else location=varying.computeIfAbsent(name,unused->varying.size()); // GL permits unused fragment inputs absent from the vertex stage.
+            if(embeddium&&isVertex&&direction.equals("in")&&name.equals("a_LightCoord")&&matcher.group(3).equals("ivec2")) {
+                // Embeddium feeds UNSIGNED_SHORT to an ivec2 in GL. Vulkan requires matching input numeric classes.
+                // Fetch unsigned, then widen/cast to int32, preserving 0..65535 rather than reinterpreting as signed16.
+                // Keep the define inside the original #ifdef so the uncompressed uint branch remains unchanged.
+                matcher.appendReplacement(replaced,Matcher.quoteReplacement("layout(location="+location+") in uvec2 nativeUnsignedLightCoord;\n#define a_LightCoord ivec2(nativeUnsignedLightCoord)\n"));continue;
+            }
             matcher.appendReplacement(replaced,Matcher.quoteReplacement("layout(location="+location+") "+matcher.group(1).trim()+" "+direction+" "+matcher.group(3)+" "+name+";"));
         }
         matcher.appendTail(replaced);source=replaced.toString();int line=source.indexOf('\n');
@@ -140,6 +147,7 @@ final class NativeShaderProgram implements AutoCloseable {
     private static int format(int size,int type,boolean normalized,boolean integer) {
         int[] formats=switch(type){
             case 5126->new int[]{VK_FORMAT_R32_SFLOAT,VK_FORMAT_R32G32_SFLOAT,VK_FORMAT_R32G32B32_SFLOAT,VK_FORMAT_R32G32B32A32_SFLOAT};
+            case 5125->{if(!integer)throw new UnsupportedOperationException("Native uint attribute requires integer input");yield new int[]{VK_FORMAT_R32_UINT,VK_FORMAT_R32G32_UINT,VK_FORMAT_R32G32B32_UINT,VK_FORMAT_R32G32B32A32_UINT};}
             case 5121->integer?new int[]{VK_FORMAT_R8_UINT,VK_FORMAT_R8G8_UINT,VK_FORMAT_R8G8B8A8_UINT,VK_FORMAT_R8G8B8A8_UINT}:normalized?new int[]{VK_FORMAT_R8_UNORM,VK_FORMAT_R8G8_UNORM,VK_FORMAT_R8G8B8A8_UNORM,VK_FORMAT_R8G8B8A8_UNORM}:new int[]{VK_FORMAT_R8_USCALED,VK_FORMAT_R8G8_USCALED,VK_FORMAT_R8G8B8A8_USCALED,VK_FORMAT_R8G8B8A8_USCALED};
             case 5120->integer?new int[]{VK_FORMAT_R8_SINT,VK_FORMAT_R8G8_SINT,VK_FORMAT_R8G8B8A8_SINT,VK_FORMAT_R8G8B8A8_SINT}:normalized?new int[]{VK_FORMAT_R8_SNORM,VK_FORMAT_R8G8_SNORM,VK_FORMAT_R8G8B8A8_SNORM,VK_FORMAT_R8G8B8A8_SNORM}:new int[]{VK_FORMAT_R8_SSCALED,VK_FORMAT_R8G8_SSCALED,VK_FORMAT_R8G8B8A8_SSCALED,VK_FORMAT_R8G8B8A8_SSCALED};
             case 5122->integer?new int[]{VK_FORMAT_R16_SINT,VK_FORMAT_R16G16_SINT,VK_FORMAT_R16G16B16_SINT,VK_FORMAT_R16G16B16A16_SINT}:normalized?new int[]{VK_FORMAT_R16_SNORM,VK_FORMAT_R16G16_SNORM,VK_FORMAT_R16G16B16_SNORM,VK_FORMAT_R16G16B16A16_SNORM}:new int[]{VK_FORMAT_R16_SSCALED,VK_FORMAT_R16G16_SSCALED,VK_FORMAT_R16G16B16_SSCALED,VK_FORMAT_R16G16B16A16_SSCALED};

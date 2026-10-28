@@ -33,6 +33,9 @@ minecraft {
             mods { vulkanforge { source sourceSets.main } }
         }
         client {
+            // Dependency refmaps use SRG names; the ForgeGradle client uses official mapped names.
+            property 'mixin.env.remapRefMap', 'true'
+            property 'mixin.env.refMapRemappingFile', project.file('build/createSrgToMcp/output.srg').absolutePath
             // The agent reads the saved mode before Forge; it stays inert for GL/GL_VK.
             jvmArg '-javaagent:' + project.file('build/libs/vulkanforge-native-bootstrap.jar').absolutePath
             if (!project.hasProperty('nativeGame') && System.getProperty('vulkanforge.startup') != null)
@@ -43,6 +46,7 @@ minecraft {
             }
             if (project.hasProperty('nativeGameSmoke')) {
                 property 'vulkanforge.nativeGameSmoke', 'true'
+                if (project.hasProperty('nativeSmokeHidden')) property 'vulkanforge.nativeSmokeHidden', 'true'
                 if (project.hasProperty('nativeMenuOnly')) property 'vulkanforge.nativeMenuOnly', 'true'
                 mods { vulkanforge { source sourceSets.smoke } }
             }
@@ -136,7 +140,7 @@ repositories {
 }
 dependencies {
     minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
-    //implementation fg.deobf("curse.maven:embeddium-908741:5681725")
+    if (!project.hasProperty('withoutEmbeddium')) implementation fg.deobf("curse.maven:embeddium-908741:5681725")
     nativeBootstrapImplementation 'org.ow2.asm:asm-tree:9.5'
 }
 
@@ -154,6 +158,13 @@ tasks.register('smokeNativeBootstrap', JavaExec) {
     classpath = sourceSets.nativeBootstrapTest.runtimeClasspath
     mainClass = 'dev.vulkanforge.bootstrap.NativeBootstrapSmoke'
     javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+}
+
+tasks.register('smokeNativeBuffers', JavaExec) {
+    dependsOn 'smokeClasses'
+    classpath = sourceSets.smoke.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.client.NativeBuffersSmoke'
+    systemProperty 'vulkanforge.nativeBootstrap', 'true'
 }
 tasks.named('assemble') { dependsOn 'nativeBootstrapJar' }
 tasks.matching { it.name == 'runClient' }.configureEach { dependsOn 'nativeBootstrapJar' }

@@ -40,7 +40,7 @@ public final class NativeGameBackend implements AutoCloseable {
     private final List<Runnable> retired=new ArrayList<>();
     private final List<Object[]> commands=new ArrayList<>();
     private final long[] samplers=new long[4];
-    private long pool,fence,descriptors,frames,draws,uploads,terrainDraws,entityDraws;
+    private long pool,fence,descriptors,frames,draws,uploads,terrainDraws,entityDraws,embeddiumTerrainDraws;
     private VkCommandBuffer command;
     private GpuBuffer vertices,indices,uniforms;
     private boolean pending,frameOpen,closed;
@@ -168,7 +168,8 @@ public final class NativeGameBackend implements AutoCloseable {
                     vkCmdBindVertexBuffers(command,0,stack.longs(residentVertex==null?vertices.buffer:residentVertex.gpu.buffer),stack.longs(residentVertex==null?vertexOffset:0));
                     long indexBuffer=residentIndex==null?indices.buffer:residentIndex.gpu.buffer,indexByteOffset=residentIndex==null?indexOffset:indexStart(p);int indexType=(Integer)p[3]==5123?VK_INDEX_TYPE_UINT16:VK_INDEX_TYPE_UINT32;
                     if(boundIndex!=indexBuffer||boundIndexOffset!=indexByteOffset||boundIndexType!=indexType){vkCmdBindIndexBuffer(command,indexBuffer,indexByteOffset,indexType);boundIndex=indexBuffer;boundIndexOffset=indexByteOffset;boundIndexType=indexType;}
-                    vkCmdDrawIndexed(command,(Integer)p[4],1,0,0,0);draws++;if(program.terrain)terrainDraws++;if(program.entity)entityDraws++;drawIndex++;
+                    int baseVertex=p.length>12&&((long[])p[12]).length>5?Math.toIntExact(((long[])p[12])[5]):0;
+                    vkCmdDrawIndexed(command,(Integer)p[4],1,0,baseVertex,0);draws++;if(program.terrain)terrainDraws++;if(program.embeddium)embeddiumTerrainDraws++;if(program.entity)entityDraws++;drawIndex++;
                 } else {
                     if(active!=null){vkCmdEndRendering(command);active=null;}
                     if(kind==1){Target output=(Target)entry[1];begin(output,stack);int mask=(Integer)entry[2];var clears=VkClearAttachment.calloc(((mask&16384)!=0?1:0)+((mask&256)!=0?1:0),stack);int at=0;
@@ -226,7 +227,7 @@ public final class NativeGameBackend implements AutoCloseable {
     }
     public long[] stats(){return new long[]{frames,draws,uploads,programs.size(),targets.size(),context.validationErrors(),terrainDraws,entityDraws};}
     public Map<String,Long> diagnostics(){
-        Map<String,Long> result=new LinkedHashMap<>(presentation.diagnostics());result.putAll(geometry.stats());
+        Map<String,Long> result=new LinkedHashMap<>(presentation.diagnostics());result.putAll(geometry.stats());result.put("embeddiumTerrainDraws",embeddiumTerrainDraws);
         String[] names={"frames","draws","terrainDraws","entityDraws","vertexBytes","indexBytes","uniformBytes","terrainVertexBytes","terrainIndexBytes","descriptorSets","sceneSubmits","textureBytes","sceneFenceWaitNs","uploadDrainNs","flushInclusiveNs","hostCopyNs","descriptorCpuNs","sceneSubmitNs"};
         long[] values={frames,draws,terrainDraws,entityDraws,vertexBytes,indexBytes,uniformBytes,terrainVertexBytes,terrainIndexBytes,descriptorSets,sceneSubmits,textureBytes,sceneFenceWaitNs,uploadDrainNs,flushCpuNs,hostCopyNs,descriptorCpuNs,sceneSubmitNs};
         for(int i=0;i<names.length;i++)result.put(names[i],values[i]);long[] upload=context.uploads.stats();result.put("uploadSubmits",upload[0]);result.put("uploadBytes",upload[2]);
