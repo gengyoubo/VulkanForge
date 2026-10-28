@@ -18,6 +18,7 @@ public final class NativeGameWindow {
     private static long window;
     private static Object backend;
     private static URLClassLoader loader;
+    private static long frameSerial;
     private static final Map<String,Method> methods=new HashMap<>();
     private NativeGameWindow() { }
     public static boolean enabled(){return Boolean.getBoolean("vulkanforge.nativeBootstrap");}
@@ -59,7 +60,8 @@ public final class NativeGameWindow {
         else if(name!=GLFW.GLFW_CONTEXT_VERSION_MAJOR&&name!=GLFW.GLFW_CONTEXT_VERSION_MINOR&&name!=GLFW.GLFW_OPENGL_PROFILE&&name!=GLFW.GLFW_OPENGL_FORWARD_COMPAT&&name!=GLFW.GLFW_OPENGL_DEBUG_CONTEXT&&name!=GLFW.GLFW_CONTEXT_CREATION_API)GLFW.glfwWindowHint(name,value);
     }
     public static void swapInterval(int interval){if(backend!=null)call("setVsync",interval!=0);}
-    static void beginFrame(){if(backend!=null)call("beginFrame");}
+    static void beginFrame(){if(backend!=null){frameSerial++;call("beginFrame");}}
+    static long frameSerial(){return frameSerial;}
     static void present() {
         var target=Minecraft.getInstance().getMainRenderTarget();if(target==null)return;
         int[] width={0},height={0};GLFW.glfwGetFramebufferSize(window,width,height);
@@ -67,6 +69,10 @@ public final class NativeGameWindow {
         if(!System.getProperty("vulkanforge.forbiddenGlCalls","0").equals("0"))throw new IllegalStateException("A forbidden OpenGL call occurred");
     }
     public static long[] stats(){return backend==null?new long[8]:(long[])call("stats");}
+    @SuppressWarnings("unchecked") public static Map<String,Long> diagnostics(){
+        Map<String,Long> result=new LinkedHashMap<>((Map<String,Long>)call("diagnostics"));
+        result.putAll(NativeDeviceState.diagnostics());return result;
+    }
     public static void captureNext(Path path){call("captureNext",path.toAbsolutePath().toString());}
     static void close() {
         try{if(backend!=null)call("close");}

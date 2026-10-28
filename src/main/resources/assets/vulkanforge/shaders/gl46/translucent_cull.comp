@@ -1,0 +1,69 @@
+#version 460 core
+// Compacts the translucent sections of one pass, far-to-near, into a DrawElementsIndirectCommand list on the GPU.
+// The CPU uploads the ordered list only when its order or membership changes; each frame this shader keeps the
+// entries that vanilla marked visible and pass the frustum, in their original order, and writes the GPU draw count.
+layout(local_size_x = 1024) in;
+layout(std140, binding = 0) uniform Frame {
+    mat4 viewProjection;
+    ivec4 cameraBlock;
+    vec4 cameraFraction;
+    vec4 fogColor;
+    vec4 fog;
+    uvec4 counts;
+};
+// header.x: number of entries. draw: x first index, y index count, z first vertex, w section slot.
+struct Layer { ivec4 origin; vec4 minimum; vec4 maximum; uvec4 draw; };
+struct Command { uint count; uint instanceCount; uint firstIndex; int baseVertex; uint baseInstance; };
+layout(std430, binding = 4) readonly buffer Layers { uvec4 header; Layer layers[]; };
+layout(std430, binding = 1) writeonly buffer Commands { Command commands[]; };
+layout(std430, binding = 2) buffer Count { uint drawCount; };
+// One bit per slot: vanilla's renderChunksInFrustum set for this frame (all ones when unavailable).
+layout(std430, binding = 3) readonly buffer Visibility { uint visible[]; };
+
+shared uint partial[1024];
+
+vec3 corner(Layer layer, uint index) {
+    return vec3((index & 1u) == 0u ? layer.minimum.x : layer.maximum.x,
+                (index & 2u) == 0u ? layer.minimum.y : layer.maximum.y,
+                (index & 4u) == 0u ? layer.minimum.z : layer.maximum.z);
+}
+
+// Same frustum convention as cull.comp; the bounds are this translucent layer's own, not the section's opaque bounds.
+bool drawable(Layer layer) {
+    uint slot = layer.draw.w;
+    if ((visible[slot >> 5u] & (1u << (slot & 31u))) == 0u) return false;
+    vec3 base = vec3(layer.origin.xyz - cameraBlock.xyz) - cameraFraction.xyz;
+    uint outside = 63u;
+    for (uint c = 0u; c < 8u; c++) {
+        vec4 clip = viewProjection * vec4(base + corner(layer, c), 1.0);
+        outside &= (clip.x < -clip.w ? 1u : 0u) | (clip.x > clip.w ? 2u : 0u)
+                 | (clip.y < -clip.w ? 4u : 0u) | (clip.y > clip.w ? 8u : 0u)
+                 | (clip.z < -clip.w ? 16u : 0u) | (clip.z > clip.w ? 32u : 0u);
+    }
+    return outside == 0u;
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint n = header.x;
+    // Each invocation owns a contiguous run of entries, so the scan keeps the far-to-near order.
+    uint per = (n + 1023u) / 1024u;
+    uint begin = min(t * per, n), end = min(begin + per, n);
+    uint kept = 0u;
+    for (uint i = begin; i < end; i++) if (drawable(layers[i])) kept++;
+    partial[t] = kept;
+    barrier();
+    // Inclusive Hillis-Steele scan; reads finish before the barrier that precedes each write.
+    for (uint step = 1u; step < 1024u; step <<= 1u) {
+        uint add = t >= step ? partial[t - step] : 0u;
+        barrier();
+        partial[t] += add;
+        barrier();
+    }
+    uint slot = t == 0u ? 0u : partial[t - 1u];
+    if (t == 1023u) drawCount = partial[1023];
+    for (uint i = begin; i < end; i++) {
+        if (!drawable(layers[i])) continue;
+        commands[slot++] = Command(layers[i].draw.y, 1u, layers[i].draw.x, int(layers[i].draw.z), layers[i].draw.w);
+    }
+}

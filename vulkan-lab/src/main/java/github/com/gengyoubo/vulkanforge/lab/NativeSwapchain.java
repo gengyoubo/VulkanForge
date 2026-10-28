@@ -15,6 +15,11 @@ import static org.lwjgl.vulkan.KHRSwapchain.*;
 
 /** Vulkan-private terrain -> sampled fullscreen pass -> WSI. Never exports images or calls GL. */
 final class NativeSwapchain implements AutoCloseable {
+    private static final boolean PROFILE=Boolean.getBoolean("vulkanforge.nativeProfile");
+    private GpuTimers timers;
+    private long acquireNs,slotWaitNs,imageWaitNs,submitNs,presentNs,recordNs,submits;
+    private static long stamp(){return PROFILE?System.nanoTime():0;}
+    private static long elapsed(long start){return PROFILE?System.nanoTime()-start:0;}
     private static final class Slot {
         VkCommandBuffer command;
         long acquired, fence;
@@ -57,6 +62,7 @@ final class NativeSwapchain implements AutoCloseable {
                 check(vkCreateFence(context.device, VkFenceCreateInfo.calloc(stack).sType$Default().flags(VK_FENCE_CREATE_SIGNALED_BIT), null, h), "native present fence");
                 slot.fence = h.get(0);
             }
+            if(PROFILE)timers=new GpuTimers(context,slots.length,log,"NATIVE_PRESENT");
         } catch (RuntimeException | Error error) { close(); throw error; }
     }
 
@@ -77,7 +83,9 @@ final class NativeSwapchain implements AutoCloseable {
         waitSlot(slotIndex);
         try (var stack = MemoryStack.stackPush()) {
             var index = stack.ints(0);
+            long acquireStart=stamp();
             int result = vkAcquireNextImageKHR(context.device, swapchain, 1_000_000_000L, slots[slotIndex].acquired, 0, index);
+            acquireNs+=elapsed(acquireStart);
             if (result == VK_ERROR_OUT_OF_DATE_KHR) { dirty = true; return false; }
             if (result == VK_TIMEOUT || result == VK_NOT_READY) return false;
             if (result != VK_SUBOPTIMAL_KHR) check(result, "native acquire image");
@@ -171,6 +179,7 @@ final class NativeSwapchain implements AutoCloseable {
     }
 
     private void submit(VulkanRenderImage source, boolean cancelled) {
+        long recordStart=stamp();
         Slot slot = slots[currentSlot];
         CaptureBuffer proof = null;
         boolean submitted = false;
@@ -181,6 +190,7 @@ final class NativeSwapchain implements AutoCloseable {
             }
             check(vkResetCommandBuffer(slot.command, 0), "reset native present command");
             check(vkBeginCommandBuffer(slot.command, VkCommandBufferBeginInfo.calloc(stack).sType$Default().flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)), "begin native present command");
+            if(timers!=null){timers.begin(slot.command,currentSlot);timers.start(slot.command,currentSlot,0,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);}
             transition(slot.command, stack, images[image], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                     // Chain the layout transition after the acquire semaphore's COLOR_ATTACHMENT_OUTPUT wait.
                     // NONE here would let the transition execute before the presentation engine releases the image.
@@ -202,17 +212,22 @@ final class NativeSwapchain implements AutoCloseable {
             transition(slot.command, stack, images[image], proof != null ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                     proof != null ? VK_PIPELINE_STAGE_2_COPY_BIT : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                     proof != null ? VK_ACCESS_2_TRANSFER_READ_BIT : VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, 0);
+            if(timers!=null)timers.end(slot.command,currentSlot,0,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             check(vkEndCommandBuffer(slot.command), "end native present command");
             check(vkResetFences(context.device, slot.fence), "reset native present fence");
             var info = VkSubmitInfo2.calloc(1, stack).sType$Default()
                     .pWaitSemaphoreInfos(VkSemaphoreSubmitInfo.calloc(1, stack).sType$Default().semaphore(slot.acquired).stageMask(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT))
                     .pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1, stack).sType$Default().commandBuffer(slot.command))
                     .pSignalSemaphoreInfos(VkSemaphoreSubmitInfo.calloc(1, stack).sType$Default().semaphore(finished[image]).stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT));
+            long submitStart=stamp();
             check(vkQueueSubmit2(context.queue, info, slot.fence), "native present submit"); slot.pending = submitted = true;
+            submitNs+=elapsed(submitStart);submits++;if(timers!=null)timers.submitted(currentSlot);
             check(vkResetFences(context.device, presentFences[image]), "reset native presentation fence");
+            long presentStart=stamp();
             int result = vkQueuePresentKHR(context.queue, VkPresentInfoKHR.calloc(stack).sType$Default()
                     .pNext(VkSwapchainPresentFenceInfoEXT.calloc(stack).sType$Default().pFences(stack.longs(presentFences[image])))
                     .pWaitSemaphores(stack.longs(finished[image])).swapchainCount(1).pSwapchains(stack.longs(swapchain)).pImageIndices(stack.ints(image)));
+            presentNs+=elapsed(presentStart);
             // OUT_OF_DATE/SURFACE_LOST still enqueue the semaphore wait and present fence.
             if (result != VK_ERROR_OUT_OF_HOST_MEMORY && result != VK_ERROR_OUT_OF_DEVICE_MEMORY && result != VK_ERROR_DEVICE_LOST)
                 presentPending[image] = true;
@@ -228,6 +243,7 @@ final class NativeSwapchain implements AutoCloseable {
                 capture = null;
             }
         } finally {
+            recordNs+=elapsed(recordStart);
             if (proof != null) {
                 if (submitted && slot.pending) waitSlot(currentSlot);
                 proof.close();
@@ -237,11 +253,13 @@ final class NativeSwapchain implements AutoCloseable {
 
     void waitSlot(int index) {
         Slot slot = slots[index];
-        if (slot.pending) { check(vkWaitForFences(context.device, slot.fence, true, 5_000_000_000L), "wait native present slot"); slot.pending = false; }
+        if (slot.pending) { long start=stamp();check(vkWaitForFences(context.device, slot.fence, true, 5_000_000_000L), "wait native present slot");slotWaitNs+=elapsed(start);slot.pending = false;if(timers!=null)timers.collect(index); }
     }
     private void waitPresentImage(int index) {
         if (presentPending[index]) {
+            long start=stamp();
             check(vkWaitForFences(context.device, presentFences[index], true, 5_000_000_000L), "wait native presentation resources");
+            imageWaitNs+=elapsed(start);
             presentPending[index] = false;
         }
     }
@@ -254,6 +272,12 @@ final class NativeSwapchain implements AutoCloseable {
     int generations() { return generations; }
     long cancellations() { return cancellations; }
     long skippedExtents() { return skippedExtents; }
+    java.util.Map<String,Long> diagnostics(){
+        var result=new java.util.LinkedHashMap<String,Long>();
+        String[] names={"acquireNs","presentSlotWaitNs","presentImageWaitNs","presentSubmitNs","queuePresentNs","presentRecordInclusiveNs","presentSubmits"};
+        long[] values={acquireNs,slotWaitNs,imageWaitNs,submitNs,presentNs,recordNs,submits};for(int i=0;i<names.length;i++)result.put(names[i],values[i]);
+        if(timers!=null){double[] metric=timers.metric(0);result.put("presentGpuSamples",(long)metric[0]);result.put("presentGpuNs",Math.round(metric[1]*1e6));}return result;
+    }
     private void requireOpen() { if (closed) throw new IllegalStateException("Native swapchain is closed"); }
     private static int clamp(int value, int min, int max) { return Math.max(min, Math.min(max, value)); }
     private static void transition(VkCommandBuffer command, MemoryStack stack, long image, int from, int to, long srcStage, long srcAccess, long dstStage, long dstAccess) {
@@ -278,8 +302,10 @@ final class NativeSwapchain implements AutoCloseable {
             cancel();
             check(vkDeviceWaitIdle(context.device), "native presentation shutdown");
             waitPresentations();
+            if(timers!=null){timers.collectAll();timers.report(log);}
         } finally {
             closed = true;
+            if(timers!=null)timers.close();
             destroySwapchain();
             for (Slot slot : slots) {
                 if (slot.fence != 0) vkDestroyFence(context.device, slot.fence, null);

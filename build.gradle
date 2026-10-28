@@ -46,6 +46,23 @@ minecraft {
                 if (project.hasProperty('nativeMenuOnly')) property 'vulkanforge.nativeMenuOnly', 'true'
                 mods { vulkanforge { source sourceSets.smoke } }
             }
+            if (project.hasProperty('gameFps')) {
+                def fpsMode = project.findProperty('fpsMode') ?: 'VK'
+                if (!(fpsMode in ['VK', 'GL', 'GL46'])) throw new GradleException('fpsMode must be VK, GL or GL46')
+                workingDirectory project.file('run-fps/' + fpsMode)
+                property 'vulkanforge.startup', fpsMode == 'VK' ? 'VK:V1_4' : fpsMode == 'GL46' ? 'GL:GL_4_6' : 'GL:DEFAULT'
+                property 'vulkanforge.gameFps', fpsMode
+                property 'fps.output', project.file(project.findProperty('fps.output') ?: 'build/reports/game-fps/' + fpsMode).absolutePath
+                ['seconds','warmup','rounds','width','height','distance'].each { option ->
+                    if (project.hasProperty('fps.' + option)) property 'fps.' + option, project.property('fps.' + option)
+                }
+                property 'vulkanforge.gl46.profileGpu', 'false'
+                property 'vulkanforge.gl46.verifyState', 'false'
+                property 'vulkanforge.disableValidation', 'true'
+                mods { vulkanforge { source sourceSets.smoke } }
+            }
+            if (project.hasProperty('nativeDiagnostics') || project.hasProperty('nativeProfile')) property 'vulkanforge.nativeDiagnostics', 'true'
+            if (project.hasProperty('nativeProfile')) property 'vulkanforge.nativeProfile', 'true'
             ['vulkanforge.entityProfile', 'vulkanforge.entityLegacyBatch', 'vulkanforge.noInteropOptimizations', 'vulkanforge.earlyGlInputFlush', 'vulkanforge.glTailCompatibility'].each { key ->
                 if (System.getProperty(key) != null) property key, System.getProperty(key)
             }
@@ -135,6 +152,21 @@ tasks.register('smokeNativeBootstrap', JavaExec) {
 }
 tasks.named('assemble') { dependsOn 'nativeBootstrapJar' }
 tasks.matching { it.name == 'runClient' }.configureEach { dependsOn 'nativeBootstrapJar' }
+if (project.hasProperty('gameFps')) tasks.matching { it.name == 'runClient' }.configureEach {
+    def fpsMode = project.findProperty('fpsMode') ?: 'VK'
+    def output = project.file(project.findProperty('fps.output') ?: 'build/reports/game-fps/' + fpsMode)
+    doFirst {
+        def game = project.file('run-fps/' + fpsMode); game.mkdirs()
+        new File(game, 'options.txt').text = 'renderDistance:8\nsimulationDistance:5\nguiScale:2\nmaxFps:260\nenableVsync:false\nfullscreen:false\nonboardAccessibility:false\nmipmapLevels:0\n'
+        output.mkdirs(); new File(output, 'status.txt').text = 'RUNNING\n'
+    }
+    doLast {
+        if (new File(output, 'status.txt').text.trim() != 'OK') throw new GradleException('FPS measurement failed: ' + output)
+        def backend = new File(project.file('run-fps/' + fpsMode), 'logs/vulkanforge/' + (fpsMode == 'VK' ? 'native-game-report.txt' : 'gl46-report.txt'))
+        if (backend.exists()) new File(output, 'backend.txt').bytes = backend.bytes
+        if (fpsMode == 'VK' && (!backend.exists() || !backend.text.contains('CLOSED=true'))) throw new GradleException('Native FPS backend did not close cleanly')
+    }
+}
 if (project.hasProperty('nativeGame') || project.hasProperty('nativeGameSmoke')) tasks.matching { it.name == 'runClient' }.configureEach {
     dependsOn 'nativeBootstrapJar'
     doFirst {

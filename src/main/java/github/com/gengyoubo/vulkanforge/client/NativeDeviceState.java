@@ -6,6 +6,11 @@ import org.lwjgl.system.MemoryUtil;
 
 /** CPU resource/state adapter for Blaze3D. It never loads an OpenGL entry point. Unknown operations fail closed. */
 public final class NativeDeviceState {
+    private static final boolean DIAGNOSTICS=Boolean.getBoolean("vulkanforge.nativeDiagnostics"),PROFILE=Boolean.getBoolean("vulkanforge.nativeProfile");
+    private static long adapterCalls,adapterNs,drawAdapterNs,bufferGeneration,terrainSubmissions,unchangedTerrainSubmissions,unchangedTerrainBytes,indexSliceBytes;
+    private static final Map<Integer,Long> bufferVersions=new HashMap<>();
+    private record BufferUse(long version,long frame) { }
+    private static final Map<Integer,BufferUse> terrainUses=new HashMap<>();
     private static int sequence=1,activeTexture,arrayBuffer,vao,drawTarget,readTarget,currentProgram,proxyWidth;
     private static final int[] boundTextures=new int[32],viewport={0,0,1,1},scissor={0,0,1,1};
     private static final Map<Integer,Boolean> enabled=new HashMap<>();
@@ -20,7 +25,7 @@ public final class NativeDeviceState {
     private static final Map<Integer,Framebuffer> framebuffers=new HashMap<>();
     private static final class Shader {int type;String source;}
     private static final Map<Integer,Shader> shaders=new HashMap<>();
-    private static final class Program {final List<Integer> shaders=new ArrayList<>();final Map<String,Integer> attributes=new LinkedHashMap<>();final Map<String,float[]> values=new LinkedHashMap<>();String[] samplers={};boolean linked;}
+    private static final class Program {final List<Integer> shaders=new ArrayList<>();final Map<String,Integer> attributes=new LinkedHashMap<>();final Map<String,float[]> values=new LinkedHashMap<>();String[] samplers={};boolean linked,terrain;}
     private static final Map<Integer,Program> programs=new HashMap<>();
     private record Location(int program,String name) { }
     private static final Map<Integer,Location> locations=new HashMap<>();
@@ -39,6 +44,15 @@ public final class NativeDeviceState {
     private static Program program(){Program value=programs.get(currentProgram);if(value==null)throw new IllegalStateException("No native shader program is bound");return value;}
     private static Page page(){Page value=pages.get(boundTextures[activeTexture]);if(value==null)throw new IllegalStateException("No native texture is bound");return value;}
     public static Object call(String operation,Object[] a) {
+        if(!PROFILE)return execute(operation,a);
+        long start=System.nanoTime();
+        try{return execute(operation,a);}finally{long spent=System.nanoTime()-start;adapterCalls++;adapterNs+=spent;if(operation.equals("glDrawElements"))drawAdapterNs+=spent;}
+    }
+    public static Map<String,Long> diagnostics(){
+        Map<String,Long> result=new LinkedHashMap<>();result.put("adapterCalls",adapterCalls);result.put("adapterInclusiveNs",adapterNs);result.put("adapterDrawInclusiveNs",drawAdapterNs);
+        result.put("terrainBufferSubmissions",terrainSubmissions);result.put("unchangedTerrainResubmissions",unchangedTerrainSubmissions);result.put("unchangedTerrainBytes",unchangedTerrainBytes);result.put("indexSliceBytes",indexSliceBytes);return result;
+    }
+    private static Object execute(String operation,Object[] a) {
         if(!NativeGameWindow.enabled())throw new IllegalStateException("Native adapter used outside the native bootstrap");
         switch(operation) {
             case "createCapabilities":return null; // Window discards the GL result; the Vulkan device is already initialized.
@@ -50,7 +64,7 @@ public final class NativeDeviceState {
                 throw unsupported(operation);
             }
             case "glDeleteTextures":for(int value:ids(a[0])){pages.remove(value);NativeGameWindow.call("deleteTexture",value);}return null;
-            case "glDeleteBuffers":for(int value:ids(a[0])){buffers.remove(value);mapped.remove(value);}return null;
+            case "glDeleteBuffers":for(int value:ids(a[0])){buffers.remove(value);mapped.remove(value);bufferVersions.remove(value);terrainUses.remove(value);}return null;
             case "glDeleteVertexArrays":for(int value:ids(a[0]))arrays.remove(value);return null;
             case "glDeleteFramebuffers":for(int value:ids(a[0])){framebuffers.remove(value);NativeGameWindow.call("deleteTarget",value);}return null;
             case "glBindTexture":if(number(a,0)!=3553)throw unsupported(operation+" target "+a[0]);boundTextures[activeTexture]=number(a,1);if(number(a,1)>0)pages.computeIfAbsent(number(a,1),key->new Page());return null;
@@ -73,9 +87,9 @@ public final class NativeDeviceState {
                 for(int y=0;y<page.height;y++)MemoryUtil.memByteBuffer(destination+(long)(y+skipRows)*stride+skipPixels*4L,page.width*4).put(pixels,y*page.width*4,page.width*4);return null;
             }
             case "glBindBuffer":if(number(a,0)==34963)array().indices=number(a,1);else if(number(a,0)==34962)arrayBuffer=number(a,1);else integers.put(number(a,0),number(a,1));return null;
-            case "glBufferData":{int target=buffer(number(a,0));if(a[1] instanceof ByteBuffer bytes){byte[] data=new byte[bytes.remaining()];bytes.duplicate().get(data);buffers.put(target,data);}else buffers.put(target,new byte[Math.toIntExact(((Number)a[1]).longValue())]);return null;}
+            case "glBufferData":{int target=buffer(number(a,0));if(a[1] instanceof ByteBuffer bytes){byte[] data=new byte[bytes.remaining()];bytes.duplicate().get(data);buffers.put(target,data);}else buffers.put(target,new byte[Math.toIntExact(((Number)a[1]).longValue())]);if(DIAGNOSTICS)bufferVersions.put(target,++bufferGeneration);return null;}
             case "glMapBuffer":{int target=buffer(number(a,0));byte[] data=Objects.requireNonNull(buffers.get(target),"Native mapped buffer");ByteBuffer bytes=ByteBuffer.allocateDirect(data.length).order(ByteOrder.nativeOrder());bytes.put(data).clear();mapped.put(target,bytes);return bytes;}
-            case "glUnmapBuffer":{int target=buffer(number(a,0));ByteBuffer bytes=mapped.remove(target);if(bytes!=null)bytes.duplicate().clear().get(buffers.get(target));return true;}
+            case "glUnmapBuffer":{int target=buffer(number(a,0));ByteBuffer bytes=mapped.remove(target);if(bytes!=null){bytes.duplicate().clear().get(buffers.get(target));if(DIAGNOSTICS)bufferVersions.put(target,++bufferGeneration);}return true;}
             case "glBindVertexArray":vao=number(a,0);array();return null;
             case "glVertexAttribPointer":case "glVertexAttribIPointer": {
                 boolean integer=operation.equals("glVertexAttribIPointer");int stride=number(a,integer?3:4),offset=Math.toIntExact(((Number)a[integer?4:5]).longValue());
@@ -97,6 +111,7 @@ public final class NativeDeviceState {
             case "glGetAttribLocation":return programs.get(number(a,0)).attributes.getOrDefault(a[1].toString(),-1);
             case "glLinkProgram":{int value=number(a,0);Program program=programs.get(value);String vertex=null,fragment=null;for(int shaderId:program.shaders){Shader shader=shaders.get(shaderId);if(shader.type==35633)vertex=shader.source;else if(shader.type==35632)fragment=shader.source;}
                 if(vertex==null||fragment==null)throw new IllegalStateException("Native program lacks vertex or fragment source");
+                program.terrain=vertex.contains("ChunkOffset");
                 if(program.attributes.isEmpty()){var inputs=java.util.regex.Pattern.compile("(?m)^\\s*in\\s+\\w+\\s+(\\w+)\\s*;").matcher(vertex);while(inputs.find())program.attributes.put(inputs.group(1),program.attributes.size());}
                 Object[] attributes=program.attributes.entrySet().stream().map(entry->new Object[]{entry.getKey(),entry.getValue()}).toArray();
                 program.samplers=(String[])NativeGameWindow.call("program",value,vertex,fragment,attributes);program.linked=true;return null;}
@@ -176,6 +191,13 @@ public final class NativeDeviceState {
         for(int[] attr:attributes)if(attr[6]!=stride||attr[7]!=vertexBuffer)throw unsupported("multiple native vertex streams");
         byte[] vertexBytes=Objects.requireNonNull(buffers.get(vertexBuffer),"Native vertex data"),allIndices=Objects.requireNonNull(buffers.get(array.indices),"Native index data");int indexBytes=type==5123?2:type==5125?4:0;if(indexBytes==0)throw unsupported("native index type "+type);
         byte[] indexData=Arrays.copyOfRange(allIndices,Math.toIntExact(offset),Math.toIntExact(offset)+count*indexBytes);
+        if(DIAGNOSTICS){
+            indexSliceBytes+=indexData.length;
+            if(program.terrain){terrainSubmissions++;long version=bufferVersions.getOrDefault(vertexBuffer,0L),frame=NativeGameWindow.frameSerial();
+                BufferUse old=terrainUses.put(vertexBuffer,new BufferUse(version,frame));
+                if(old!=null&&old.version()==version&&old.frame()!=frame){unchangedTerrainSubmissions++;unchangedTerrainBytes+=vertexBytes.length;}
+            }
+        }
         int[] textures=new int[program.samplers.length];for(int i=0;i<textures.length;i++){float[] value=program.values.get(program.samplers[i]);int unit=value==null?0:(int)value[0];textures[i]=boundTextures[unit];ensureTexture(textures[i]);}
         int[] state={on(3042)?1:0,src,dst,srcAlpha,dstAlpha,equation,equationAlpha,on(2929)&&framebuffers.get(drawTarget).depth>0?1:0,depthMask?1:0,depthFunc,on(2884)?cullFace:0,frontFace,colorMask,6914,on(32823)?1:0,mode,0};
         int[] box=clip(drawTarget),area={viewport[0],viewport[1],viewport[2],viewport[3],box[0],box[1],box[2],box[3]};

@@ -16,6 +16,7 @@ import static github.com.gengyoubo.vulkanforge.lab.VulkanCommands.vkQueueSubmit2
 
 /** Ordered game draw/resource executor. All incoming objects are CPU data; every GPU object is private Vulkan. */
 public final class NativeGameBackend implements AutoCloseable {
+    private static final boolean DIAGNOSTICS=Boolean.getBoolean("vulkanforge.nativeDiagnostics"),PROFILE=Boolean.getBoolean("vulkanforge.nativeProfile");
     private static final int MAX_DRAWS=16384;
     private final VulkanContext context;
     private final PrintWriter report;
@@ -36,6 +37,11 @@ public final class NativeGameBackend implements AutoCloseable {
     private VkCommandBuffer command;
     private GpuBuffer vertices,indices,uniforms;
     private boolean pending,frameOpen,closed;
+    private GpuTimers timers;
+    private long vertexBytes,indexBytes,uniformBytes,terrainVertexBytes,terrainIndexBytes,descriptorSets,sceneSubmits,textureBytes;
+    private long sceneFenceWaitNs,uploadDrainNs,flushCpuNs,hostCopyNs,descriptorCpuNs,sceneSubmitNs;
+    private static long stamp(){return PROFILE?System.nanoTime():0;}
+    private static long elapsed(long start){return PROFILE?System.nanoTime()-start:0;}
     public NativeGameBackend(String reportPath,long hwnd,long hinstance,int api,String extensions,boolean validation)throws IOException {
         Path path=Path.of(reportPath).toAbsolutePath();Files.createDirectories(path.getParent());report=new PrintWriter(Files.newBufferedWriter(path),true);
         context=new VulkanContext(api,extensions);NativeSwapchain created=null;
@@ -52,14 +58,15 @@ public final class NativeGameBackend implements AutoCloseable {
                         .addressModeU((i&2)!=0?VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE:VK_SAMPLER_ADDRESS_MODE_REPEAT).addressModeV((i&2)!=0?VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE:VK_SAMPLER_ADDRESS_MODE_REPEAT).addressModeW(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),null,h),"native game sampler");samplers[i]=h.get(0);}
             }
             report.println("BACKEND=VK_NATIVE_GAME\nOPENGL_CONTEXTS=0\nSHARED_IMAGES=0\nEXTERNAL_SEMAPHORES=0\nVALIDATION="+(context.validationEnabled()?"ENABLED":"UNAVAILABLE"));
+            if(PROFILE)timers=new GpuTimers(context,1,report::println,"NATIVE_SCENE");
         }catch(RuntimeException|Error error){if(created!=null)created.close();context.close();report.close();throw error;}
         presentation=created;
         texture(0,1,1,0,new byte[]{-1,-1,-1,-1});
     }
     public void beginFrame() {
         if(closed)throw new IllegalStateException("Native game backend closed");if(frameOpen)return;
-        if(pending){check(vkWaitForFences(context.device,fence,true,10_000_000_000L),"native game frame complete");pending=false;}
-        presentation.waitSlot(0);context.uploads.drain();
+        if(pending){long start=stamp();check(vkWaitForFences(context.device,fence,true,10_000_000_000L),"native game frame complete");sceneFenceWaitNs+=elapsed(start);pending=false;if(timers!=null)timers.collect(0);}
+        presentation.waitSlot(0);long drainStart=stamp();context.uploads.drain();uploadDrainNs+=elapsed(drainStart);
         for(Runnable action:retired)action.run();retired.clear();frameOpen=true;
     }
     public String[] program(int id,String vertex,String fragment,Object[] bindings) {
@@ -77,7 +84,7 @@ public final class NativeGameBackend implements AutoCloseable {
             vkCmdCopyBufferToImage(cmd,staging.buffer,gpu.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VkBufferImageCopy.calloc(1,stack).bufferOffset(offset).imageSubresource(r->r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1)).imageExtent(e->e.set(width,height,1)));
             transition(cmd,stack,image,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT|VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         });
-        Texture old=textures.put(id,new Texture(image,samplers[flags&3]));if(old!=null&&!isTarget(old.image()))retired.add(old.image().gpu::close);uploads++;
+        Texture old=textures.put(id,new Texture(image,samplers[flags&3]));if(old!=null&&!isTarget(old.image()))retired.add(old.image().gpu::close);uploads++;if(DIAGNOSTICS)textureBytes+=rgba.length;
     }
     public void textureSampler(int id,int flags){Texture texture=textures.get(id);if(texture!=null)textures.put(id,new Texture(texture.image(),samplers[flags&3]));}
     public void deleteTexture(int id){beginFrame();Texture old=textures.remove(id);if(old!=null&&!isTarget(old.image()))retired.add(old.image().gpu::close);}
@@ -101,6 +108,7 @@ public final class NativeGameBackend implements AutoCloseable {
     private GpuBuffer ensure(GpuBuffer buffer,int size,int usage){if(buffer!=null&&buffer.mapped.capacity()>=size)return buffer;if(buffer!=null)buffer.close();return new GpuBuffer(context,Math.max(4096,Integer.highestOneBit(Math.max(1,size-1))<<1),usage);}
     private void flush() {
         if(commands.isEmpty())return;
+        long flushStart=stamp();
         int vb=0,ib=0,count=0;for(Object[] entry:commands)if((Integer)entry[0]==0){Object[] p=(Object[])entry[3];vb=Math.addExact(vb,((byte[])p[1]).length);ib=Math.addExact(ib,(((byte[])p[2]).length+3)&~3);count++;}
         if(count>MAX_DRAWS||vb>256*1024*1024)throw new UnsupportedOperationException("Native frame upload budget exceeded; no draws discarded");
         vertices=ensure(vertices,vb,VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);indices=ensure(indices,ib,VK_BUFFER_USAGE_INDEX_BUFFER_BIT);uniforms=ensure(uniforms,count*1024,VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
@@ -108,6 +116,7 @@ public final class NativeGameBackend implements AutoCloseable {
         try(var frameStack=MemoryStack.stackPush()) {
             check(vkResetDescriptorPool(context.device,descriptors,0),"reset native game descriptors");check(vkResetCommandBuffer(command,0),"reset native game command");
             check(vkBeginCommandBuffer(command,VkCommandBufferBeginInfo.calloc(frameStack).sType$Default().flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)),"begin native game command");
+            if(timers!=null){timers.begin(command,0);timers.start(command,0,0,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);}
             Target active=null;int drawIndex=0;
             for(Object[] entry:commands) {
                 try(var stack=MemoryStack.stackPush()) {
@@ -116,17 +125,22 @@ public final class NativeGameBackend implements AutoCloseable {
                     Target output=(Target)entry[1];NativeShaderProgram program=(NativeShaderProgram)entry[2];Object[] p=(Object[])entry[3];Texture[] inputs=(Texture[])entry[4];
                     boolean transition=false;for(Texture input:inputs){if(input.image()==output.color()||input.image()==output.depth())throw new UnsupportedOperationException("Native framebuffer feedback");if(input.image().layout!=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)transition=true;}
                     if(active!=output||transition){if(active!=null)vkCmdEndRendering(command);for(Texture input:inputs)transition(command,stack,input.image(),VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT|VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);begin(output,stack);active=output;}
+                    long copyStart=stamp();
                     byte[] vertexBytes=(byte[])p[1],indexBytes=(byte[])p[2];int vertexOffset=vertexData.position(),indexOffset=indexData.position();vertexData.put(vertexBytes);indexData.put(indexBytes).position((indexData.position()+3)&~3);
                     values.position(drawIndex*256);values.put(program.values((Object[])p[10]));
+                    hostCopyNs+=elapsed(copyStart);
+                    if(DIAGNOSTICS){this.vertexBytes+=vertexBytes.length;this.indexBytes+=indexBytes.length;uniformBytes+=1024;if(program.terrain){terrainVertexBytes+=vertexBytes.length;terrainIndexBytes+=indexBytes.length;}}
                     int[] state=(int[])p[7],viewport=(int[])p[8];float[] raster=(float[])p[9];
                     vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,program.pipeline(state,(int[][])p[6],(Integer)p[5]));
                     vkCmdSetViewport(command,0,VkViewport.calloc(1,stack).x(viewport[0]).y(viewport[1]).width(viewport[2]).height(viewport[3]).maxDepth(1));
                     vkCmdSetScissor(command,0,VkRect2D.calloc(1,stack).offset(o->o.set(viewport[4],viewport[5])).extent(e->e.set(viewport[6],viewport[7])));
                     vkCmdSetDepthBias(command,raster[1],0,raster[0]);
+                    long descriptorStart=stamp();
                     var descriptor=stack.mallocLong(1);check(vkAllocateDescriptorSets(context.device,VkDescriptorSetAllocateInfo.calloc(stack).sType$Default().descriptorPool(descriptors).pSetLayouts(stack.longs(program.textureLayout)),descriptor),"native draw descriptors");
                     var writes=VkWriteDescriptorSet.calloc(inputs.length+1,stack);
                     for(int i=0;i<inputs.length;i++){Texture input=inputs[i];writes.get(i).sType$Default().dstSet(descriptor.get(0)).dstBinding(i).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1).pImageInfo(VkDescriptorImageInfo.calloc(1,stack).sampler(input.sampler()).imageView(input.image().gpu.view).imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));}
                     writes.get(inputs.length).sType$Default().dstSet(descriptor.get(0)).dstBinding(inputs.length).descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC).pBufferInfo(VkDescriptorBufferInfo.calloc(1,stack).buffer(uniforms.buffer).range(1024));vkUpdateDescriptorSets(context.device,writes,null);
+                    descriptorCpuNs+=elapsed(descriptorStart);descriptorSets++;
                     vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,program.layout,0,descriptor,stack.ints(drawIndex*1024));
                     vkCmdBindVertexBuffers(command,0,stack.longs(vertices.buffer),stack.longs(vertexOffset));vkCmdBindIndexBuffer(command,indices.buffer,indexOffset,(Integer)p[3]==5123?VK_INDEX_TYPE_UINT16:VK_INDEX_TYPE_UINT32);
                     vkCmdDrawIndexed(command,(Integer)p[4],1,0,0,0);draws++;if(program.terrain)terrainDraws++;if(program.entity)entityDraws++;drawIndex++;
@@ -143,10 +157,12 @@ public final class NativeGameBackend implements AutoCloseable {
             if(active!=null)vkCmdEndRendering(command);
             // The presentation pass consumes the final color in COLOR_ATTACHMENT_OPTIMAL.
             for(Target target:targets.values())if(target.color().layout!=VK_IMAGE_LAYOUT_UNDEFINED)transition(command,frameStack,target.color(),VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+            if(timers!=null)timers.end(command,0,0,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             check(vkEndCommandBuffer(command),"end native game command");context.uploads.flush();check(vkResetFences(context.device,fence),"reset native game fence");
-            check(vkQueueSubmit2(context.queue,VkSubmitInfo2.calloc(1,frameStack).sType$Default().pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1,frameStack).sType$Default().commandBuffer(command)),fence),"native game submit");pending=true;
+            long submitStart=stamp();check(vkQueueSubmit2(context.queue,VkSubmitInfo2.calloc(1,frameStack).sType$Default().pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1,frameStack).sType$Default().commandBuffer(command)),fence),"native game submit");sceneSubmitNs+=elapsed(submitStart);sceneSubmits++;pending=true;if(timers!=null)timers.submitted(0);
         }
         commands.clear();
+        flushCpuNs+=elapsed(flushStart);
     }
     private void begin(Target target,MemoryStack stack) {
         boolean colorNew=target.color().layout==VK_IMAGE_LAYOUT_UNDEFINED,depthNew=target.depth().layout==VK_IMAGE_LAYOUT_UNDEFINED;
@@ -168,7 +184,7 @@ public final class NativeGameBackend implements AutoCloseable {
     /** Explicit game screenshot/thumbnail readback. Never used to transport a normal rendered frame. */
     public byte[] readTexture(int id) {
         beginFrame();flush();
-        if(pending){check(vkWaitForFences(context.device,fence,true,10_000_000_000L),"wait native screenshot source");pending=false;}
+        if(pending){check(vkWaitForFences(context.device,fence,true,10_000_000_000L),"wait native screenshot source");pending=false;if(timers!=null)timers.collect(0);}
         context.uploads.drain();Texture source=textures.get(id);if(source==null||source.image().depth)throw new UnsupportedOperationException("Native screenshot requires a color texture");
         Image image=source.image();int width=image.gpu.width,height=image.gpu.height,size=Math.multiplyExact(Math.multiplyExact(width,height),4),previous=image.layout;
         try(GpuBuffer storage=new GpuBuffer(context,size,VK_BUFFER_USAGE_TRANSFER_DST_BIT);var stack=MemoryStack.stackPush()) {
@@ -184,5 +200,24 @@ public final class NativeGameBackend implements AutoCloseable {
         }
     }
     public long[] stats(){return new long[]{frames,draws,uploads,programs.size(),targets.size(),context.validationErrors(),terrainDraws,entityDraws};}
-    @Override public void close(){if(closed)return;closed=true;presentation.close();if(context.device!=null)vkDeviceWaitIdle(context.device);context.uploads.drain();for(Runnable action:retired)action.run();retired.clear();Set<Image> images=Collections.newSetFromMap(new IdentityHashMap<>());for(Texture texture:textures.values())images.add(texture.image());for(Target target:targets.values()){images.add(target.color());images.add(target.depth());}for(Image image:images)image.gpu.close();for(NativeShaderProgram program:programs.values())program.close();if(vertices!=null)vertices.close();if(indices!=null)indices.close();if(uniforms!=null)uniforms.close();for(long sampler:samplers)if(sampler!=0)vkDestroySampler(context.device,sampler,null);vkDestroyDescriptorPool(context.device,descriptors,null);vkDestroyFence(context.device,fence,null);vkDestroyCommandPool(context.device,pool,null);report.println("FINAL_PRESENTED_FRAMES="+frames+"\nNATIVE_DRAWS="+draws+"\nCPU_TEXTURE_UPLOADS="+uploads+"\nVALIDATION_ERRORS="+context.validationErrors());context.close();report.println("CLOSED=true");report.close();}
+    public Map<String,Long> diagnostics(){
+        Map<String,Long> result=new LinkedHashMap<>(presentation.diagnostics());
+        String[] names={"frames","draws","terrainDraws","entityDraws","vertexBytes","indexBytes","uniformBytes","terrainVertexBytes","terrainIndexBytes","descriptorSets","sceneSubmits","textureBytes","sceneFenceWaitNs","uploadDrainNs","flushInclusiveNs","hostCopyNs","descriptorCpuNs","sceneSubmitNs"};
+        long[] values={frames,draws,terrainDraws,entityDraws,vertexBytes,indexBytes,uniformBytes,terrainVertexBytes,terrainIndexBytes,descriptorSets,sceneSubmits,textureBytes,sceneFenceWaitNs,uploadDrainNs,flushCpuNs,hostCopyNs,descriptorCpuNs,sceneSubmitNs};
+        for(int i=0;i<names.length;i++)result.put(names[i],values[i]);long[] upload=context.uploads.stats();result.put("uploadSubmits",upload[0]);result.put("uploadBytes",upload[2]);
+        if(timers!=null){double[] metric=timers.metric(0);result.put("sceneGpuSamples",(long)metric[0]);result.put("sceneGpuNs",Math.round(metric[1]*1e6));}return result;
+    }
+    private void closeDiagnostics(){if(timers!=null){timers.collectAll();timers.report(report::println);timers.close();}if(DIAGNOSTICS)report.println("NATIVE_DIAGNOSTICS="+diagnostics());}
+    @Override public void close(){
+        if(closed)return;closed=true;presentation.close();if(context.device!=null)vkDeviceWaitIdle(context.device);
+        context.uploads.drain();closeDiagnostics();
+        for(Runnable action:retired)action.run();retired.clear();Set<Image> images=Collections.newSetFromMap(new IdentityHashMap<>());
+        for(Texture texture:textures.values())images.add(texture.image());for(Target target:targets.values()){images.add(target.color());images.add(target.depth());}
+        for(Image image:images)image.gpu.close();for(NativeShaderProgram program:programs.values())program.close();
+        if(vertices!=null)vertices.close();if(indices!=null)indices.close();if(uniforms!=null)uniforms.close();
+        for(long sampler:samplers)if(sampler!=0)vkDestroySampler(context.device,sampler,null);
+        vkDestroyDescriptorPool(context.device,descriptors,null);vkDestroyFence(context.device,fence,null);vkDestroyCommandPool(context.device,pool,null);
+        report.println("FINAL_PRESENTED_FRAMES="+frames+"\nNATIVE_DRAWS="+draws+"\nCPU_TEXTURE_UPLOADS="+uploads+"\nVALIDATION_ERRORS="+context.validationErrors());
+        context.close();report.println("CLOSED=true");report.close();
+    }
 }
