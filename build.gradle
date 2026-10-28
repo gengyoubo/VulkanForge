@@ -129,9 +129,14 @@ minecraft {
         server { args '--nogui' }
     }
 }
-
+repositories {
+    maven {
+        url "https://cursemaven.com"
+    }
+}
 dependencies {
     minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+    //implementation fg.deobf("curse.maven:embeddium-908741:5681725")
     nativeBootstrapImplementation 'org.ow2.asm:asm-tree:9.5'
 }
 

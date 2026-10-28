@@ -31,7 +31,7 @@ public final class GameFpsBenchmark {
     private static final List<Map<String,Object>> results=new ArrayList<>();
     private static final long launched=System.nanoTime();
     private static int stage,ticks,count,round;
-    private static long warmStart,last,measureStart,presentedStart;
+    private static long warmStart,last,measureStart,presentedStart,startEpoch;
     private static Map<String,Long> diagnosticsStart;
     private static final java.lang.management.ThreadMXBean CPU=java.lang.management.ManagementFactory.getThreadMXBean();
     private static long allocatedStart,cpuStart;
@@ -54,7 +54,8 @@ public final class GameFpsBenchmark {
                 mc.options.mipmapLevels().set(0);mc.options.fov().set(70);mc.options.hideGui=false;mc.options.renderDebug=false;
                 mc.options.framerateLimit().set(260);mc.options.enableVsync().set(false);mc.getWindow().setFramerateLimit(260);mc.getWindow().updateVsync(false);
                 if(mc.getWindow().isFullscreen())mc.getWindow().toggleFullScreen();
-                long handle=mc.getWindow().getWindow();GLFW.glfwRestoreWindow(handle);GLFW.glfwSetWindowSize(handle,WIDTH,HEIGHT);GLFW.glfwFocusWindow(handle);
+                long handle=mc.getWindow().getWindow();GLFW.glfwRestoreWindow(handle);GLFW.glfwSetWindowAttrib(handle,GLFW.GLFW_DECORATED,GLFW.GLFW_FALSE);
+                GLFW.glfwSetWindowMonitor(handle,0,0,0,WIDTH,HEIGHT,GLFW.GLFW_DONT_CARE);GLFW.glfwFocusWindow(handle);
                 if(MODE.equals("VK"))require(NativeGameWindow.enabled()&&GLFW.glfwGetCurrentContext()==0,"Native VK absent / GL context exists");
                 else require(!NativeGameWindow.enabled()&&!NativeMainWindow.active(),"GL launch entered Vulkan/hybrid path");
                 String name="FPS "+MODE+" "+System.currentTimeMillis();
@@ -67,6 +68,7 @@ public final class GameFpsBenchmark {
                 warmStart=System.nanoTime();stage=3;
                 Map<String,Object> scene=new LinkedHashMap<>();scene.put("mode",MODE);scene.put("startup",VulkanForgeConfig.startup().toString());
                 scene.put("resolution",List.of(WIDTH,HEIGHT));scene.put("distance",DISTANCE);scene.put("simulationDistance",5);scene.put("seed",1234);
+                scene.put("window","BORDERLESS");
                 scene.put("camera",List.of(.5,68,11,180,18));scene.put("graphics","FANCY");scene.put("mipmaps",0);scene.put("clouds","OFF");
                 scene.put("vsync",false);scene.put("fpsLimit","UNLIMITED (260)");scene.put("hud",true);scene.put("cows",60);scene.put("warmupSeconds",WARMUP);
                 scene.put("secondsPerRound",SECONDS);scene.put("rounds",ROUNDS);scene.put("scope","ACTUAL_MINECRAFT_PRESENTED_FRAMES");
@@ -77,7 +79,11 @@ public final class GameFpsBenchmark {
                 }
                 Files.writeString(output.resolve("scene.json"),JSON.toJson(scene));
             } else if(stage>=3&&stage<=5) {
-                require(mc.player!=null&&mc.screen==null&&mc.getOverlay()==null,"World interrupted during measurement");
+                if(stage<5&&mc.screen instanceof net.minecraft.client.gui.screens.PauseScreen){
+                    com.mojang.logging.LogUtils.getLogger().info("FPS_DISCARD pause screen interrupted {} round {}",MODE,round+1);
+                    mc.setScreen(null);stage=3;warmStart=System.nanoTime();return;
+                }
+                require(mc.player!=null&&mc.screen==null&&mc.getOverlay()==null,"World interrupted during measurement: screen="+(mc.screen==null?"null":mc.screen.getClass().getName())+", overlay="+(mc.getOverlay()==null?"null":mc.getOverlay().getClass().getName()));
                 mc.player.setYRot(180);mc.player.setXRot(18);mc.player.yRotO=180;mc.player.xRotO=18;
                 require(mc.player.distanceToSqr(.5,68,11)<.04,"Camera moved");
                 require(mc.getMainRenderTarget().viewWidth==WIDTH&&mc.getMainRenderTarget().viewHeight==HEIGHT,"Framebuffer extent changed");
@@ -97,7 +103,7 @@ public final class GameFpsBenchmark {
                 com.mojang.logging.LogUtils.getLogger().info("FPS_MEASURE {} round {}",MODE,round+1);
                 count=0;presentedStart=MODE.equals("VK")?NativeGameWindow.stats()[0]:0;
                 diagnosticsStart=MODE.equals("VK")?NativeGameWindow.diagnostics():Map.of();allocatedStart=allocated();cpuStart=threadCpu();
-                measureStart=last=System.nanoTime();stage=4;return;
+                startEpoch=System.currentTimeMillis();measureStart=last=System.nanoTime();stage=4;return;
             }
             require(count<periods.length,"Frame sample capacity exceeded");periods[count++]=now-last;last=now;
             if((now-measureStart)/1e9>=SECONDS)finishRound(mc,now);
@@ -109,6 +115,7 @@ public final class GameFpsBenchmark {
         long[] sorted=Arrays.copyOf(periods,count);Arrays.sort(sorted);long total=0;for(long period:sorted)total+=period;
         int slow=Math.max(1,(count+99)/100);long tail=0;for(int i=count-slow;i<count;i++)tail+=sorted[i];
         Map<String,Object> row=new LinkedHashMap<>();row.put("mode",MODE);row.put("round",++round);row.put("frames",count);row.put("seconds",total/1e9);
+        row.put("startEpochMs",startEpoch);row.put("endEpochMs",System.currentTimeMillis());
         row.put("fps",count*1e9/total);row.put("onePercentLowFps",slow*1e9/tail);row.put("frameP50Ms",sorted[(count-1)/2]/1e6);
         row.put("frameP95Ms",sorted[(count-1)*95/100]/1e6);row.put("frameP99Ms",sorted[(count-1)*99/100]/1e6);row.put("maxMs",sorted[count-1]/1e6);
         if(allocatedStart>=0&&allocatedEnd>=0)row.put("renderThreadAllocatedBytes",allocatedEnd-allocatedStart);

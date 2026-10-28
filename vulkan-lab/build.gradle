@@ -103,6 +103,14 @@ tasks.register('smokeNativeShader', JavaExec) {
     if (rootProject.hasProperty('validationSmoke')) systemProperty 'vulkanforge.requireValidation', 'true'
 }
 
+tasks.register('smokeNativeGeometry', JavaExec) {
+    dependsOn 'testClasses'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.lab.VkOnlyLauncher'
+    args 'github.com.gengyoubo.vulkanforge.lab.NativeGeometrySmoke'
+    if (rootProject.hasProperty('validationSmoke')) systemProperty 'vulkanforge.requireValidation', 'true'
+}
+
 tasks.register('smokeResources', JavaExec) {
     dependsOn 'testClasses'
     classpath = sourceSets.test.runtimeClasspath

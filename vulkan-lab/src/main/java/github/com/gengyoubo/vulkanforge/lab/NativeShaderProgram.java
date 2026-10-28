@@ -18,8 +18,27 @@ final class NativeShaderProgram implements AutoCloseable {
     private final VulkanContext context;
     final boolean terrain, entity;
     long textureLayout,layout,vertex,fragment;
-    private final Map<String,Long> pipelines = new HashMap<>();
+    private final Map<PipelineKey,Long> pipelines = new HashMap<>();
+    private final float[] uniformScratch=new float[256];
     private Map<Integer,Integer> vertexInputs=Map.of();
+    /** Numeric lookup key: no per-draw strings, streams or cloned vertex layouts. Stored keys own their arrays. */
+    private final class PipelineKey {
+        final int[] state;final int[][] attributes;final int stride,hash;
+        PipelineKey(int[] state,int[][] attributes,int stride){
+            this.state=state;this.attributes=attributes;this.stride=stride;int h=31*Arrays.hashCode(state)+stride,count=0;
+            for(int[] attribute:attributes)if(vertexInputs.containsKey(attribute[0])){for(int i=0;i<6;i++)h=31*h+attribute[i];count++;}
+            if(count!=vertexInputs.size())throw new UnsupportedOperationException("Native draw lacks shader vertex inputs: "+vertexInputs.keySet());hash=h;
+        }
+        @Override public int hashCode(){return hash;}
+        @Override public boolean equals(Object other){
+            if(!(other instanceof NativeShaderProgram.PipelineKey key)||stride!=key.stride||!Arrays.equals(state,key.state))return false;
+            int a=0,b=0;
+            while(true){while(a<attributes.length&&!vertexInputs.containsKey(attributes[a][0]))a++;while(b<key.attributes.length&&!vertexInputs.containsKey(key.attributes[b][0]))b++;
+                if(a==attributes.length||b==key.attributes.length)return a==attributes.length&&b==key.attributes.length;
+                for(int i=0;i<6;i++)if(attributes[a][i]!=key.attributes[b][i])return false;a++;b++;
+            }
+        }
+    }
     NativeShaderProgram(VulkanContext context,String vertexSource,String fragmentSource,Map<String,Integer> attributes) {
         this.context=context;
         terrain=vertexSource.contains("ChunkOffset");
@@ -82,17 +101,20 @@ final class NativeShaderProgram implements AutoCloseable {
     }
     float[] values(Object[] values) {
         float[] result=new float[256];
+        fillValues(values,result);return result;
+    }
+    void writeValues(Object[] entries,java.nio.FloatBuffer output,int offset){Arrays.fill(uniformScratch,0);fillValues(entries,uniformScratch);output.put(offset,uniformScratch);}
+    private void fillValues(Object[] values,float[] result){
         for(Object value:values){Object[] entry=(Object[])value;Uniform uniform=uniforms.get((String)entry[0]);if(uniform==null)continue;float[] data=(float[])entry[1];int rows=uniform.columns();
             if(rows>1){for(int c=0;c<rows;c++)for(int r=0;r<rows;r++)result[(uniform.slot()+c)*4+r]=data[c*rows+r];}
             else System.arraycopy(data,0,result,uniform.slot()*4,Math.min(data.length,4));}
-        return result;
     }
     long pipeline(int[] state,int[][] attributes,int stride) {
+        PipelineKey key=new PipelineKey(state,attributes,stride);Long existing=pipelines.get(key);if(existing!=null)return existing;
         int[][] consumed=Arrays.stream(attributes).filter(attribute->vertexInputs.containsKey(attribute[0])).toArray(int[][]::new);
         if(consumed.length!=vertexInputs.size())throw new UnsupportedOperationException("Native draw lacks shader vertex inputs: "+vertexInputs.keySet());
         // Buffer names are resource identities, not pipeline state. Chunk recycling must reuse the same pipeline.
         int[][] layoutAttributes=Arrays.stream(consumed).map(attribute->Arrays.copyOf(attribute,6)).toArray(int[][]::new);
-        String key=Arrays.toString(state)+Arrays.deepToString(layoutAttributes)+stride;Long existing=pipelines.get(key);if(existing!=null)return existing;
         try(var stack=MemoryStack.stackPush()) {
             var stages=VkPipelineShaderStageCreateInfo.calloc(2,stack);
             stages.get(0).sType$Default().stage(VK_SHADER_STAGE_VERTEX_BIT).module(vertex).pName(stack.UTF8("main"));stages.get(1).sType$Default().stage(VK_SHADER_STAGE_FRAGMENT_BIT).module(fragment).pName(stack.UTF8("main"));
@@ -112,7 +134,7 @@ final class NativeShaderProgram implements AutoCloseable {
                     .pDepthStencilState(VkPipelineDepthStencilStateCreateInfo.calloc(stack).sType$Default().depthTestEnable(state[7]!=0).depthWriteEnable(state[8]!=0).depthCompareOp(compare(state[9])))
                     .pColorBlendState(VkPipelineColorBlendStateCreateInfo.calloc(stack).sType$Default().pAttachments(blend))
                     .pDynamicState(VkPipelineDynamicStateCreateInfo.calloc(stack).sType$Default().pDynamicStates(stack.ints(VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR,VK_DYNAMIC_STATE_DEPTH_BIAS)));
-            var out=stack.mallocLong(1);check(vkCreateGraphicsPipelines(context.device,0,info,null,out),"native game graphics pipeline");pipelines.put(key,out.get(0));return out.get(0);
+            var out=stack.mallocLong(1);check(vkCreateGraphicsPipelines(context.device,0,info,null,out),"native game graphics pipeline");pipelines.put(new PipelineKey(state.clone(),layoutAttributes,stride),out.get(0));return out.get(0);
         }
     }
     private static int format(int size,int type,boolean normalized,boolean integer) {

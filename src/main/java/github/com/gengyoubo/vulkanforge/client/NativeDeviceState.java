@@ -17,7 +17,7 @@ public final class NativeDeviceState {
     private static final Map<Integer,Integer> integers=new HashMap<>();
     private static final Map<Integer,byte[]> buffers=new HashMap<>();
     private static final Map<Integer,ByteBuffer> mapped=new HashMap<>();
-    private static final class VertexArray {int indices;final Map<Integer,int[]> attributes=new TreeMap<>();final Set<Integer> enabled=new HashSet<>();}
+    private static final class VertexArray {int indices;int[][] layout;final Map<Integer,int[]> attributes=new TreeMap<>();final Set<Integer> enabled=new HashSet<>();}
     private static final Map<Integer,VertexArray> arrays=new HashMap<>();
     private static final class Page {int width,height,internal;byte[] rgba;long version,uploaded;int flags;boolean target;final Map<Integer,Integer> parameters=new HashMap<>();}
     private static final Map<Integer,Page> pages=new HashMap<>();
@@ -25,7 +25,7 @@ public final class NativeDeviceState {
     private static final Map<Integer,Framebuffer> framebuffers=new HashMap<>();
     private static final class Shader {int type;String source;}
     private static final Map<Integer,Shader> shaders=new HashMap<>();
-    private static final class Program {final List<Integer> shaders=new ArrayList<>();final Map<String,Integer> attributes=new LinkedHashMap<>();final Map<String,float[]> values=new LinkedHashMap<>();String[] samplers={};boolean linked,terrain;}
+    private static final class Program {final List<Integer> shaders=new ArrayList<>();final Map<String,Integer> attributes=new LinkedHashMap<>();final Map<String,float[]> values=new LinkedHashMap<>();final Map<String,Object[]> entries=new LinkedHashMap<>();Object[] snapshot;String[] samplers={};boolean linked,terrain;}
     private static final Map<Integer,Program> programs=new HashMap<>();
     private record Location(int program,String name) { }
     private static final Map<Integer,Location> locations=new HashMap<>();
@@ -50,7 +50,7 @@ public final class NativeDeviceState {
     }
     public static Map<String,Long> diagnostics(){
         Map<String,Long> result=new LinkedHashMap<>();result.put("adapterCalls",adapterCalls);result.put("adapterInclusiveNs",adapterNs);result.put("adapterDrawInclusiveNs",drawAdapterNs);
-        result.put("terrainBufferSubmissions",terrainSubmissions);result.put("unchangedTerrainResubmissions",unchangedTerrainSubmissions);result.put("unchangedTerrainBytes",unchangedTerrainBytes);result.put("indexSliceBytes",indexSliceBytes);return result;
+        result.put("terrainBufferSubmissions",terrainSubmissions);result.put("unchangedTerrainBufferDraws",unchangedTerrainSubmissions);result.put("unchangedTerrainReferencedBytes",unchangedTerrainBytes);result.put("indexSliceBytes",indexSliceBytes);return result;
     }
     private static Object execute(String operation,Object[] a) {
         if(!NativeGameWindow.enabled())throw new IllegalStateException("Native adapter used outside the native bootstrap");
@@ -64,7 +64,7 @@ public final class NativeDeviceState {
                 throw unsupported(operation);
             }
             case "glDeleteTextures":for(int value:ids(a[0])){pages.remove(value);NativeGameWindow.call("deleteTexture",value);}return null;
-            case "glDeleteBuffers":for(int value:ids(a[0])){buffers.remove(value);mapped.remove(value);bufferVersions.remove(value);terrainUses.remove(value);}return null;
+            case "glDeleteBuffers":for(int value:ids(a[0])){buffers.remove(value);mapped.remove(value);bufferVersions.remove(value);terrainUses.remove(value);NativeGameWindow.call("deleteBuffer",value);}return null;
             case "glDeleteVertexArrays":for(int value:ids(a[0]))arrays.remove(value);return null;
             case "glDeleteFramebuffers":for(int value:ids(a[0])){framebuffers.remove(value);NativeGameWindow.call("deleteTarget",value);}return null;
             case "glBindTexture":if(number(a,0)!=3553)throw unsupported(operation+" target "+a[0]);boundTextures[activeTexture]=number(a,1);if(number(a,1)>0)pages.computeIfAbsent(number(a,1),key->new Page());return null;
@@ -87,16 +87,16 @@ public final class NativeDeviceState {
                 for(int y=0;y<page.height;y++)MemoryUtil.memByteBuffer(destination+(long)(y+skipRows)*stride+skipPixels*4L,page.width*4).put(pixels,y*page.width*4,page.width*4);return null;
             }
             case "glBindBuffer":if(number(a,0)==34963)array().indices=number(a,1);else if(number(a,0)==34962)arrayBuffer=number(a,1);else integers.put(number(a,0),number(a,1));return null;
-            case "glBufferData":{int target=buffer(number(a,0));if(a[1] instanceof ByteBuffer bytes){byte[] data=new byte[bytes.remaining()];bytes.duplicate().get(data);buffers.put(target,data);}else buffers.put(target,new byte[Math.toIntExact(((Number)a[1]).longValue())]);if(DIAGNOSTICS)bufferVersions.put(target,++bufferGeneration);return null;}
+            case "glBufferData":{int target=buffer(number(a,0));if(a[1] instanceof ByteBuffer bytes){byte[] data=new byte[bytes.remaining()];bytes.duplicate().get(data);buffers.put(target,data);}else buffers.put(target,new byte[Math.toIntExact(((Number)a[1]).longValue())]);bufferVersions.put(target,++bufferGeneration);return null;}
             case "glMapBuffer":{int target=buffer(number(a,0));byte[] data=Objects.requireNonNull(buffers.get(target),"Native mapped buffer");ByteBuffer bytes=ByteBuffer.allocateDirect(data.length).order(ByteOrder.nativeOrder());bytes.put(data).clear();mapped.put(target,bytes);return bytes;}
-            case "glUnmapBuffer":{int target=buffer(number(a,0));ByteBuffer bytes=mapped.remove(target);if(bytes!=null){bytes.duplicate().clear().get(buffers.get(target));if(DIAGNOSTICS)bufferVersions.put(target,++bufferGeneration);}return true;}
+            case "glUnmapBuffer":{int target=buffer(number(a,0));ByteBuffer bytes=mapped.remove(target);if(bytes!=null){byte[] data=new byte[bytes.capacity()];bytes.duplicate().clear().get(data);buffers.put(target,data);bufferVersions.put(target,++bufferGeneration);}return true;}
             case "glBindVertexArray":vao=number(a,0);array();return null;
             case "glVertexAttribPointer":case "glVertexAttribIPointer": {
                 boolean integer=operation.equals("glVertexAttribIPointer");int stride=number(a,integer?3:4),offset=Math.toIntExact(((Number)a[integer?4:5]).longValue());
-                array().attributes.put(number(a,0),new int[]{number(a,0),number(a,1),number(a,2),!integer&&flag(a,3)?1:0,integer?1:0,offset,stride,arrayBuffer});return null;
+                array().attributes.put(number(a,0),new int[]{number(a,0),number(a,1),number(a,2),!integer&&flag(a,3)?1:0,integer?1:0,offset,stride,arrayBuffer});array().layout=null;return null;
             }
-            case "glEnableVertexAttribArray":array().enabled.add(number(a,0));return null;
-            case "glDisableVertexAttribArray":array().enabled.remove(number(a,0));return null;
+            case "glEnableVertexAttribArray":if(array().enabled.add(number(a,0)))array().layout=null;return null;
+            case "glDisableVertexAttribArray":if(array().enabled.remove(number(a,0)))array().layout=null;return null;
             case "glCreateShader":{int value=id();Shader shader=new Shader();shader.type=number(a,0);shaders.put(value,shader);return value;}
             case "nglShaderSource":{Shader shader=shaders.get(number(a,0));StringBuilder source=new StringBuilder();var pointers=MemoryUtil.memPointerBuffer(((Number)a[2]).longValue(),number(a,1));for(int i=0;i<pointers.remaining();i++)source.append(MemoryUtil.memUTF8(pointers.get(i)));shader.source=source.toString();return null;}
             case "glShaderSource":{Shader shader=shaders.get(number(a,0));shader.source=a[1].toString();return null;}
@@ -176,7 +176,8 @@ public final class NativeDeviceState {
     private static void uniform(Object[] a) {
         Location location=locations.get(number(a,0));if(location==null)return;Object input=a[a.length-1];float[] values;
         if(input instanceof FloatBuffer data){values=new float[data.remaining()];data.duplicate().get(values);}else if(input instanceof IntBuffer data){values=new float[data.remaining()];for(int i=0;i<values.length;i++)values[i]=data.get(data.position()+i);}else values=new float[]{((Number)input).floatValue()};
-        programs.get(location.program()).values.put(location.name(),values);
+        Program program=programs.get(location.program());program.values.put(location.name(),values);
+        program.entries.put(location.name(),new Object[]{location.name(),values});program.snapshot=null;
     }
     private static void prepareTarget(int id) {
         if(id==0){int[] size=NativeGameWindow.extent();Framebuffer window=framebuffers.computeIfAbsent(0,key->new Framebuffer());if(window.color==0){window.color=id();window.depth=id();Page color=new Page(),depth=new Page();color.target=depth.target=true;pages.put(window.color,color);pages.put(window.depth,depth);}pages.get(window.color).width=size[0];pages.get(window.color).height=size[1];}
@@ -187,12 +188,11 @@ public final class NativeDeviceState {
     private static void ensureTexture(int id) {if(id==0)return;Page page=pages.get(id);if(page==null)throw new IllegalStateException("Unknown native texture "+id);if(page.target)return;if(page.uploaded!=page.version){NativeGameWindow.call("texture",id,page.width,page.height,page.flags,page.rgba);page.uploaded=page.version;}}
     private static void draw(int mode,int count,int type,long offset) {
         if(count==0)return;prepareTarget(drawTarget);if(on(3058)||on(2960))throw unsupported("logic-op/stencil draw");Program program=program();VertexArray array=array();
-        int[][] attributes=array.enabled.stream().sorted().map(array.attributes::get).filter(Objects::nonNull).toArray(int[][]::new);if(attributes.length==0)throw new IllegalStateException("Native draw has no vertex attributes");int stride=attributes[0][6],vertexBuffer=attributes[0][7];
+        int[][] attributes=array.layout;if(attributes==null){attributes=array.enabled.stream().sorted().map(array.attributes::get).filter(Objects::nonNull).toArray(int[][]::new);array.layout=attributes;}if(attributes.length==0)throw new IllegalStateException("Native draw has no vertex attributes");int stride=attributes[0][6],vertexBuffer=attributes[0][7];
         for(int[] attr:attributes)if(attr[6]!=stride||attr[7]!=vertexBuffer)throw unsupported("multiple native vertex streams");
         byte[] vertexBytes=Objects.requireNonNull(buffers.get(vertexBuffer),"Native vertex data"),allIndices=Objects.requireNonNull(buffers.get(array.indices),"Native index data");int indexBytes=type==5123?2:type==5125?4:0;if(indexBytes==0)throw unsupported("native index type "+type);
-        byte[] indexData=Arrays.copyOfRange(allIndices,Math.toIntExact(offset),Math.toIntExact(offset)+count*indexBytes);
+        Objects.checkFromIndexSize(Math.toIntExact(offset),Math.multiplyExact(count,indexBytes),allIndices.length);
         if(DIAGNOSTICS){
-            indexSliceBytes+=indexData.length;
             if(program.terrain){terrainSubmissions++;long version=bufferVersions.getOrDefault(vertexBuffer,0L),frame=NativeGameWindow.frameSerial();
                 BufferUse old=terrainUses.put(vertexBuffer,new BufferUse(version,frame));
                 if(old!=null&&old.version()==version&&old.frame()!=frame){unchangedTerrainSubmissions++;unchangedTerrainBytes+=vertexBytes.length;}
@@ -201,8 +201,9 @@ public final class NativeDeviceState {
         int[] textures=new int[program.samplers.length];for(int i=0;i<textures.length;i++){float[] value=program.values.get(program.samplers[i]);int unit=value==null?0:(int)value[0];textures[i]=boundTextures[unit];ensureTexture(textures[i]);}
         int[] state={on(3042)?1:0,src,dst,srcAlpha,dstAlpha,equation,equationAlpha,on(2929)&&framebuffers.get(drawTarget).depth>0?1:0,depthMask?1:0,depthFunc,on(2884)?cullFace:0,frontFace,colorMask,6914,on(32823)?1:0,mode,0};
         int[] box=clip(drawTarget),area={viewport[0],viewport[1],viewport[2],viewport[3],box[0],box[1],box[2],box[3]};
-        Object[] values=program.values.entrySet().stream().map(entry->new Object[]{entry.getKey(),entry.getValue()}).toArray();
-        NativeGameWindow.call("draw",drawTarget,new Object[]{currentProgram,vertexBytes,indexData,type,count,stride,attributes,state,area,new float[]{offsetFactor,offsetUnits},values,textures});
+        Object[] values=program.snapshot;if(values==null){values=program.entries.values().toArray();program.snapshot=values;}
+        long[] resources={vertexBuffer,bufferVersions.getOrDefault(vertexBuffer,0L),array.indices,bufferVersions.getOrDefault(array.indices,0L),offset};
+        NativeGameWindow.call("draw",drawTarget,new Object[]{currentProgram,vertexBytes,allIndices,type,count,stride,attributes,state,area,new float[]{offsetFactor,offsetUnits},values,textures,resources});
     }
     private static UnsupportedOperationException unsupported(String operation){return new UnsupportedOperationException("Unimplemented native operation (GL fallback forbidden): "+operation);}
 }

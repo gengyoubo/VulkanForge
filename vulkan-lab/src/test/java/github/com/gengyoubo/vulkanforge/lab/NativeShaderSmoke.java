@@ -9,7 +9,7 @@ public final class NativeShaderSmoke {
         org.lwjgl.system.Configuration.STACK_SIZE.set(4096);
         try(VulkanContext context=new VulkanContext()) {
             context.initialize(0,VK.getInstanceVersionSupported(),Boolean.getBoolean("vulkanforge.requireValidation"));
-            String vertex="#version 150\nin vec3 Position;\nin vec4 Color;\nin vec2 UV1;\nout vec4 vertexColor;\nvoid main(){gl_Position=vec4(Position,1);vertexColor=Color;}";
+            String vertex="#version 150\nin vec3 Position;\nin vec4 Color;\nin vec2 UV1;\nuniform mat3 NormalMat;\nuniform vec4 ColorModulator;\nout vec4 vertexColor;\nvoid main(){gl_Position=vec4(NormalMat*Position,1);vertexColor=Color*ColorModulator;}";
             String fragment="#version 150\nin vec4 vertexColor;\nout vec4 fragColor;\nvoid main(){fragColor=vertexColor;}";
             try(NativeShaderProgram program=new NativeShaderProgram(context,vertex,fragment,Map.of("Position",0,"Color",1,"UV1",2))) {
                 int[] state={0,1,0,1,0,32774,32774,1,1,515,0,2305,15,6914,0,4,0};
@@ -19,6 +19,12 @@ public final class NativeShaderSmoke {
                 require(program.pipeline(state,replacement,20)==first,"Changing only a VBO name created a new native pipeline");
                 try{program.pipeline(state,new int[][]{attributes[1],attributes[2]},20);throw new AssertionError("Missing shader input was silently accepted");}
                 catch(UnsupportedOperationException expected){require(expected.getMessage().contains("vertex inputs"),"Missing input diagnostic");}
+                var packed=java.nio.FloatBuffer.allocate(512);
+                program.writeValues(new Object[]{new Object[]{"NormalMat",new float[]{1,2,3,4,5,6,7,8,9}},new Object[]{"ColorModulator",new float[]{.2f,.3f,.4f,.5f}}},packed,0);
+                require(packed.get(0)==1&&packed.get(3)==0&&packed.get(4)==4&&packed.get(8)==7&&packed.get(12)==.2f,"Uniform std140 matrix/vector layout");
+                program.writeValues(new Object[0],packed,256);
+                for(int i=256;i<512;i++)require(packed.get(i)==0,"Uniform scratch leaked a previous draw's values");
+                require(packed.get(12)==.2f,"Next draw overwrote the preceding uniform range");
                 require(context.validationErrors()==0,"Optimized unused float input with an integer VBO attribute caused a validation error");
             }
             require(context.validationErrors()==0,"Native shader resource shutdown validation error");
