@@ -81,7 +81,12 @@ public final class NativeDeviceState {
                 if(a[0] instanceof int[] values){for(int i=0;i<values.length;i++){values[i]=id();if(operation.equals("glGenTextures"))pages.put(values[i],new Page());}return null;}
                 throw unsupported(operation);
             }
-            case "glDeleteTextures":for(int value:ids(a[0])){pages.remove(value);NativeGameWindow.call("deleteTexture",value);}return null;
+            case "glIsTexture":return pages.containsKey(number(a,0));
+            case "glIsBuffer":return buffers.containsKey(number(a,0));
+            case "glIsVertexArray":return number(a,0)!=0&&arrays.containsKey(number(a,0));
+            case "glIsFramebuffer":return number(a,0)!=0&&framebuffers.containsKey(number(a,0));
+            case "glIsProgram":return programs.containsKey(number(a,0));
+            case "glDeleteTextures":for(int value:ids(a[0])){pages.remove(value);for(int unit=0;unit<boundTextures.length;unit++)if(boundTextures[unit]==value)boundTextures[unit]=0;NativeGameWindow.call("deleteTexture",value);}return null;
             case "glDeleteBuffers":for(int value:ids(a[0])){buffers.remove(value);sharedBufferSnapshots.remove(value);mapped.remove(value);bufferVersions.remove(value);terrainUses.remove(value);NativeGameWindow.call("deleteBuffer",value);}return null;
             case "glDeleteVertexArrays":for(int value:ids(a[0]))arrays.remove(value);return null;
             case "glDeleteFramebuffers":for(int value:ids(a[0])){framebuffers.remove(value);NativeGameWindow.call("deleteTarget",value);}return null;

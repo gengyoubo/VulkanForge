@@ -156,9 +156,10 @@ final class ShaderPackGraph implements AutoCloseable {
     /** Whether any dimension replaces chunk terrain shaders, which a third-party chunk renderer would bypass. */
     boolean terrain(){for(var chain:dimensions.values())if(ShaderPackWorldPrograms.resolve("rendertype_solid",ShaderPackWorldPrograms.Phase.TERRAIN,chain.plan().world().keySet()).isPresent())return true;return false;}
     private ShaderPackTarget side(int index,boolean alternate){return targets.get(index)[alternate?1:0];}
+    private boolean allocationMatches(String key,RenderTarget scene){return key.equals(allocated)&&scene.viewWidth==allocatedWidth&&scene.viewHeight==allocatedHeight&&scene.getDepthTextureId()==allocatedDepth;}
     private void allocate(String key,Chain chain,RenderTarget scene){
         int width=scene.viewWidth,height=scene.viewHeight,depth=scene.getDepthTextureId();
-        if(key.equals(allocated)&&width==allocatedWidth&&height==allocatedHeight&&depth==allocatedDepth)return;
+        if(allocationMatches(key,scene))return;
         release();allocated=key;allocatedWidth=width;allocatedHeight=height;allocatedDepth=depth;
         for(var color:chain.plan().colors().values()){
             ShaderPackTarget[] pair=new ShaderPackTarget[2];targets.put(color.index(),pair);boolean mipmapped=chain.mipmapped().contains(color.index())&&!color.integer();
@@ -245,6 +246,7 @@ final class ShaderPackGraph implements AutoCloseable {
         if(chain==null||chain.plan().world().isEmpty()||failure!=null||scene.viewWidth<1||scene.viewHeight<1)return false;
         if(Minecraft.useShaderTransparency())throw new ShaderPackException("Fabulous graphics cannot be combined with shader pack world programs; select Fancy or Fast graphics");
         try(ShaderPackState state=new ShaderPackState(16)){
+            if(allocated!=null&&!allocationMatches(key,scene))state.retiring();
             allocate(key,chain,scene);ShaderPackState.fullscreen();
             for(var color:chain.plan().colors().values())if(color.clear())for(var target:targets.get(color.index()))target.clear(color.clearColor());
             globals.celestial(chain.plan().sunRotation(),chain.plan().shadowInterval(),chain.plan().shadowDistance());frameUniforms=uniforms(partialTick,scene.viewWidth,scene.viewHeight);run(chain,chain.prepare(),scene,frameUniforms);
@@ -282,7 +284,10 @@ final class ShaderPackGraph implements AutoCloseable {
         var format=vanilla.getVertexFormat();// Only terrain shaders receive a chunk offset; elsewhere the position is already camera-relative.
         var world=ShaderPackGlsl.world(pass.source(),options,values,Set.copyOf(format.getElementAttributeNames()),vanilla.CHUNK_OFFSET!=null,pass.alphaTest());
         String name="vulkanforge_pack_"+SERIAL.incrementAndGet();
-        StringBuilder json=new StringBuilder("{\"vertex\":\"").append(name).append("\",\"fragment\":\"").append(name).append("\",\"samplers\":[");
+        // ShaderInstance only binds attribute locations when its JSON lists them. Without this, driver-assigned
+        // locations do not match the already-built Minecraft vertex buffers (Position, Color, UV0, ...).
+        StringBuilder json=new StringBuilder("{\"vertex\":\"").append(name).append("\",\"fragment\":\"").append(name).append("\",\"attributes\":[")
+            .append(String.join(",",format.getElementAttributeNames().stream().map(attribute->"\""+attribute+"\"").toList())).append("],\"samplers\":[");
         json.append(String.join(",",world.engineSamplers().stream().map(sampler->"{\"name\":\""+sampler+"\"}").toList())).append("],\"uniforms\":[");
         List<String> uniforms=new ArrayList<>();
         for(String uniform:world.engineUniforms())uniforms.add(switch(uniform){
@@ -407,6 +412,7 @@ final class ShaderPackGraph implements AutoCloseable {
         // World-program packs only render inside a level frame; their scene color is never the input.
         if(chain==null||!chain.plan().world().isEmpty())return;
         try(ShaderPackState state=new ShaderPackState(16)){
+            if(allocated!=null&&!allocationMatches(key,scene))state.retiring();
             allocate(key,chain,scene);ShaderPackState.fullscreen();
             for(var color:chain.plan().colors().values())if(color.clear())for(var target:targets.get(color.index()))target.clear(color.clearColor());
             if(targets.containsKey(0))blit(scene.frameBufferId,width,height,side(0,false));

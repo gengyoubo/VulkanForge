@@ -14,6 +14,9 @@ final class ShaderPackState implements AutoCloseable {
     private final boolean[] mask=new boolean[4],enabled;
     private static final int[] FLAGS={GL_BLEND,GL_DEPTH_TEST,GL_CULL_FACE,GL_SCISSOR_TEST,GL_POLYGON_OFFSET_FILL,GL_STENCIL_TEST,GL_COLOR_LOGIC_OP};
     private final int originalTexture=glGetInteger(GL_TEXTURE_BINDING_2D);
+    private boolean retiring;
+    /** A retiring graph may delete objects captured here; never rebind their now-invalid GL names. */
+    ShaderPackState retiring(){retiring=true;return this;}
     ShaderPackState(int textureUnits){
         textures=new int[textureUnits];enabled=new boolean[FLAGS.length];for(int i=0;i<FLAGS.length;i++)enabled[i]=glIsEnabled(FLAGS[i]);
         try(MemoryStack stack=MemoryStack.stackPush()){
@@ -25,9 +28,10 @@ final class ShaderPackState implements AutoCloseable {
     }
     static void fullscreen(){for(int flag:FLAGS)glDisable(flag);glDepthMask(false);glDepthFunc(GL_LEQUAL);glFrontFace(GL_CCW);glColorMask(true,true,true,true);glBlendFuncSeparate(GL_ONE,GL_ZERO,GL_ONE,GL_ZERO);glBlendEquationSeparate(GL_FUNC_ADD,GL_FUNC_ADD);}
     @Override public void close(){
-        glUseProgram(program);glBindVertexArray(vao);glBindBuffer(GL_ARRAY_BUFFER,array);
-        glBindFramebuffer(GL_READ_FRAMEBUFFER,read);glBindFramebuffer(GL_DRAW_FRAMEBUFFER,draw);glViewport(viewport[0],viewport[1],viewport[2],viewport[3]);
-        for(int i=0;i<textures.length;i++){glActiveTexture(GL_TEXTURE0+i);glBindTexture(GL_TEXTURE_2D,textures[i]);}glActiveTexture(active);glBindTexture(GL_TEXTURE_2D,originalTexture);
+        glUseProgram(retiring&&program!=0&&!glIsProgram(program)?0:program);glBindVertexArray(retiring&&vao!=0&&!glIsVertexArray(vao)?0:vao);glBindBuffer(GL_ARRAY_BUFFER,retiring&&array!=0&&!glIsBuffer(array)?0:array);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER,retiring&&read!=0&&!glIsFramebuffer(read)?0:read);glBindFramebuffer(GL_DRAW_FRAMEBUFFER,retiring&&draw!=0&&!glIsFramebuffer(draw)?0:draw);glViewport(viewport[0],viewport[1],viewport[2],viewport[3]);
+        for(int i=0;i<textures.length;i++){glActiveTexture(GL_TEXTURE0+i);restoreTexture(textures[i]);}glActiveTexture(active);restoreTexture(originalTexture);
         for(int i=0;i<FLAGS.length;i++)if(enabled[i])glEnable(FLAGS[i]);else glDisable(FLAGS[i]);glDepthMask(depthMask);glDepthFunc(depthFunc);glFrontFace(frontFace);glColorMask(mask[0],mask[1],mask[2],mask[3]);glBlendFuncSeparate(src,dst,srcAlpha,dstAlpha);glBlendEquationSeparate(equation,equationAlpha);glClearColor(clear[0],clear[1],clear[2],clear[3]);
     }
+    private void restoreTexture(int value){glBindTexture(GL_TEXTURE_2D,retiring&&value!=0&&!glIsTexture(value)?0:value);}
 }

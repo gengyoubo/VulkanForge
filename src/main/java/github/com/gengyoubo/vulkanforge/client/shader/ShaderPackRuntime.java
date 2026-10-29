@@ -40,7 +40,7 @@ public final class ShaderPackRuntime {
             // Chunk terrain drawn by a third-party chunk renderer bypasses the game's core shaders, so terrain programs would silently not run.
             if(graph.terrain()&&net.minecraftforge.fml.ModList.get().isLoaded("embeddium")){graph.close();throw new ShaderPackException(net.minecraft.network.chat.Component.translatable("vulkanforge.shaders.embeddium_terrain",pack.name()).getString());}
             return graph;
-        },graph->{try(ShaderPackState state=new ShaderPackState(16)){graph.close();}});
+        },graph->{try(ShaderPackState state=new ShaderPackState(16).retiring()){graph.close();}});
         String selected=preferences.getProperty("selected","");if(!selected.isBlank())request(selected,storedOptions(selected));
     }
     private static void writeDiagnostic(String text){

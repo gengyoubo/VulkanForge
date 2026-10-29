@@ -6,6 +6,12 @@ VulkanForge 自己负责光影包解析、条件预处理、选项、uniform 表
 
 2026-10-29 修复：补齐 1.20.1 的 `endFlashIntensity=0`，并让新版包引用的不存在生物群系键返回未匹配；VK uniform 反射根据优化后的 SPIR-V 活动成员计算，未使用的源代码声明不会被误报为缺失输入。不是给任意未知变量统一填零。
 
+MakeUp-UltraFast 9.6 使用的 `random()`、`random(min,max)`、`fmod` 与 `gbufferProjection.1.1` 矩阵分量表达式已实现。随机值每帧更新，同一变量的多次引用在帧内保持一致，范围为左闭右开。加载预览使用有效尺寸和单位矩阵，避免预览时的除零。旧版 `gl_FogFragCoord` 作为顶点到片元的 varying 传递。
+
+世界程序的 JSON 现在声明实际顶点格式的属性列表，使 `ShaderInstance` 在链接前绑定与 Minecraft 顶点缓冲一致的位置；此前缺失此列表会出现天空可见、地形/手持物不可见。关闭包或重建尺寸相关附件时，状态恢复不再绑定已删除的对象。
+
+2026-10-29 场景回归使用自有加载器和未修改的原始 ZIP，固定相机拍摄石砖平台、石柱、水池与手持物：MakeUp 9.6 的 GL 和纯 VK、Complementary r5.9.3 的纯 VK 均通过加载与地形细节检查；纯 VK 的校验错误为 0。该结果只覆盖默认配置的基础场景，不表示与 Iris 效果完全一致；材质 ID 等替代值、阴影范围和部分画面瑕疵仍需处理。
+
 输入测试直接使用原始 `ComplementaryReimagined_r5.9.3.zip` 和生产加载器的输入表：
 
 ```powershell
@@ -25,7 +31,7 @@ VulkanForge 自己负责光影包解析、条件预处理、选项、uniform 表
 - `prepare → deferred → composite → final` 全屏链，按 Iris 语义执行 colortex 主/备图像翻转：写入的缓冲默认翻转，`flip.<程序>.<缓冲>` 可覆盖；帧末仍在备图像上的持久（`Clear=false`）缓冲复制回主图像。
 - MRT（`DRAWBUFFERS`/`RENDERTARGETS`，最多 8 个）、全部声明的颜色格式（含 HDR、SNORM、整型）、`ClearColor`、`size.buffer.*` 相对尺寸、`MipmapEnabled`、`blend.<程序>`（整程序因子或逐缓冲 `off`）、`scale.<程序>` 视口缩放。
 - `noisetex`（`noiseTextureResolution`，固定种子）与 `texture.noise`、`texture.<阶段>.<采样器>` 和 `customTexture.<名称>` 的 PNG（包内路径或 `命名空间:路径`，读取 `.mcmeta` 的 blur/clamp）。
-- `uniform.*`/`variable.*` 表达式（含 `smooth`），输入包括相机矩阵、时间天气、`eyeBrightness(Smooth)`、失明/黑暗/夜视、生物群系与 `BIOME_*`/`PPT_*` 常量、手持光源等；加载时用零值试算，未知输入在提交前报错。旧版 `gl_Fog` 映射为当前雾参数。
+- `uniform.*`/`variable.*` 表达式（含 `smooth`、`random`、`fmod`、矩阵分量），输入包括相机矩阵、时间天气、`eyeBrightness(Smooth)`、失明/黑暗/夜视、生物群系与 `BIOME_*`/`PPT_*` 常量、手持光源等；加载时用有效预览输入试算，未知输入在提交前报错。旧版 `gl_Fog` 映射为当前雾参数。
 
 - `gbuffers_*` 世界通道：每个程序编译为游戏的 core `ShaderInstance`，由 `GameRenderer` 的 core shader getter（descriptor 匹配的 coremod）在世界帧内替换，按渲染阶段（天空、地形、实体、方块实体、半透明、粒子、天气、手）和标准回退层级选择程序，游戏照常逐次绘制设置矩阵、区块偏移、颜色调制、反照率和光照贴图。旧版内建（`ftransform`、`gl_MultiTexCoord*`、`gl_TextureMatrix`、`gl_NormalMatrix` 等）与 Iris core 名称（`vaPosition`、`modelViewMatrix`、`normalMatrix` 等）映射到实际顶点格式；`texture`/`gtexture`/`tex`、`lightmap` 采样器映射到游戏纹理；`alphaTest.*`、世界程序的 `blend.*` 与逐缓冲 `off`、`clouds=off` 已实现。
 - 世界通道写入与场景共享深度的 MRT gbuffer：不透明几何写入 prepare 后的图像，`deferred` 在方块实体之后、半透明地形之前执行，之后的几何写入 deferred 后的图像。`depthtex1/2` 是半透明前的深度快照，`depthtex0` 在 composite 中是完整深度。无 PBR 资源包时 `normals`/`specular` 为平面法线/零。
@@ -35,7 +41,7 @@ VulkanForge 自己负责光影包解析、条件预处理、选项、uniform 表
 
 以下运行但使用固定替代值，并以 `APPROXIMATED_*` 写入兼容报告：`mc_Entity`/`at_midBlock` 等方块元数据为“未映射”（需要扩展区块顶点格式），`entityId`/`blockEntityId`/`currentRenderedItemId`/`entityColor` 为未映射（需要按实体拆分批次）；阴影投射体只来自为玩家视锥剔除后的区块，且阴影贴图不绘制实体；手部绘制前不清除深度（手与世界做深度测试）；`oldLighting`、`separateAo`、`vignette`、`underwaterOverlay` 等原版渲染设置不生效。`heldItemId` 来自 `item.properties`。
 
-Complementary 的默认配置（含阴影，shadowcomp 在默认 `COLORED_LIGHTING=0` 下关闭）可通过预检。安装 Embeddium 时仍会因地形程序被拒绝；开发环境用 `-PwithoutEmbeddium` 启动。该组合尚未完成游戏内回归。
+Complementary 的默认配置（含阴影，shadowcomp 在默认 `COLORED_LIGHTING=0` 下关闭）已通过不带 Embeddium 的纯 VK 基础场景回归。安装 Embeddium 时仍会因地形程序被拒绝；开发环境用 `-PwithoutEmbeddium` 启动。
 
 ```powershell
 .\gradlew.bat --offline smokeShaderPack smokeOwnLoader

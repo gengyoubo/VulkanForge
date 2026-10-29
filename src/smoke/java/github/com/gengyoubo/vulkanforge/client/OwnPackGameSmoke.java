@@ -27,10 +27,13 @@ public final class OwnPackGameSmoke {
         if(MODE.isEmpty()||stage==99||event.phase!=TickEvent.Phase.END)return;var mc=Minecraft.getInstance();
         try{
             if(output==null){output=Path.of(System.getProperty("ownPack.output"));Files.createDirectories(output);}
+            if((stage>=11||stage==3||stage==4)&&mc.player!=null){
+                // Shader compilation stalls can queue real mouse motion. Keep the isolated fixture's camera fixed.
+                mc.mouseHandler.releaseMouse();mc.player.setYRot(180);mc.player.yRotO=180;mc.player.setXRot(18);mc.player.xRotO=18;
+            }
             require((System.nanoTime()-started)/1e9<600,"Own pack test timed out at stage "+stage);
             require(!net.minecraftforge.fml.ModList.get().isLoaded("oculus")&&!net.minecraftforge.fml.ModList.get().isLoaded("iris"),"External shader loader present");
-            if(stage==0&&mc.screen instanceof TitleScreen&&mc.getOverlay()==null&&++ticks>15){mc.options.pauseOnLostFocus=false;mc.options.tutorialStep=net.minecraft.client.tutorial.TutorialSteps.NONE;ShaderPackRuntime.select(PACK);next(1);}
-            else if(stage==1){require(ShaderPackRuntime.status().error().isEmpty(),ShaderPackRuntime.status().error());if(ShaderPackRuntime.status().active().equals(PACK)){ShaderPackRuntime.select("");next(10);}}
+            if(stage==0&&mc.screen instanceof TitleScreen&&mc.getOverlay()==null&&++ticks>15){mc.options.pauseOnLostFocus=false;mc.options.tutorialStep=net.minecraft.client.tutorial.TutorialSteps.NONE;ShaderPackRuntime.select("");next(10);}
             else if(stage==10&&ShaderPackRuntime.status().active().isEmpty()){
                 String name="Own Shader Scene "+System.currentTimeMillis();next(2);mc.createWorldOpenFlows().createFreshLevel(name,new LevelSettings(name,GameType.CREATIVE,false,Difficulty.PEACEFUL,true,new GameRules(),WorldDataConfiguration.DEFAULT),new WorldOptions(1234,false,false),r->r.registryOrThrow(Registries.WORLD_PRESET).getHolderOrThrow(WorldPresets.FLAT).value().createWorldDimensions());
             }else if(stage==2&&mc.level!=null&&mc.player!=null&&mc.screen==null){scene(mc);next(11);}
