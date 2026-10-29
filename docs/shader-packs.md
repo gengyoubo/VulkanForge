@@ -52,6 +52,13 @@ Complementary 的默认配置（含阴影，shadowcomp 在默认 `COLORED_LIGHTI
 
 `smokeOwnLoader` 对真实 Complementary 检查翻转调度、预检边界与 `POTATO` 档位；`smokeOwnShaderCompiler` 用离屏 Vulkan 把该包启用的全屏程序编译为 SPIR-V，`-PshaderPack.world` 时也按完整实体顶点格式编译全部世界程序与阴影程序（2026-10-29：30 个程序，校验错误 0）。游戏内测试新增天空世界通道（检查像素与世界绘制计数），并在有 Embeddium 时检查地形程序被拒绝、无 Embeddium 时检查地形像素。较早的 `build/reports/shader-packs` 记录不代表当前实现。
 
+## 性能：缓存与逐 Pass 计时
+
+- 缓存：纯 VK 的 SPIR-V 缓存（`cache/vulkanforge/spirv`）与持久 `VkPipelineCache`（`cache/vulkanforge/pipeline-cache.bin`，按 vendor/device/pipelineCacheUUID 校验，设备关闭时保存）；GL 模式下全屏通道使用程序二进制缓存（`cache/vulkanforge/gl-programs`，按驱动标识与最终 GLSL 键控，驱动拒绝时回退编译）。`-Dvulkanforge.disablePipelineCache=true` / `-Dvulkanforge.disableProgramCache=true` 关闭。
+- 复用：Clear=true 的 colortex（主/备两侧）按清除色、尺寸、数值类型合并为 MRT 一次清除；重新分配时同尺寸同格式的图像（维度切换、固定尺寸缓冲、阴影颜色）被复用；采样器单元只设置一次，未变化的 uniform 不再上传。纯 VK 后端的描述符集跨帧复用，仅在视图销毁、uniform 环重分配或池将满时重置。
+- 同步：纯 VK 的图像屏障按每张图像记录的上次阶段/访问精确设置源范围，同一步骤的屏障合并为一次 `vkCmdPipelineBarrier2`；帧末只把呈现图像转为附件布局；整目标 `glClear` 折叠为下一次渲染的 `loadOp=CLEAR`。
+- 计时：`-Dvulkanforge.shaderPackProfile=true` 时，`logs/vulkanforge/shader-pack-performance.txt` 包含逐通道 CPU（`PASS_<程序>_*`）与 GPU（`GPU_PASS_<程序>_*`、`GPU_SHADOW_*`、`GPU_GAME_*` 等，区间从标记到下一个标记）耗时，前 120 帧为预热。GL 使用不阻塞的时间戳查询，纯 VK 在后端命令缓冲中写入时间戳。
+
 ## 参考与许可证
 
 - [Oculus 官方发布与许可](https://modrinth.com/mod/oculus)、[源码](https://github.com/Asek3/Oculus)：仅作行为与效果参考，不是自有加载器的运行时依赖。

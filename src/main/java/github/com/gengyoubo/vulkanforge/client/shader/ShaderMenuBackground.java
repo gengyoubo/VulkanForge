@@ -10,7 +10,7 @@ import net.minecraft.resources.ResourceLocation;
 
 /** The game's blur program is also compiled by the native Vulkan shader backend. */
 final class ShaderMenuBackground implements AutoCloseable {
-    private final PanoramaRenderer panorama=new PanoramaRenderer(new CubeMap(new ResourceLocation("textures/gui/title/background/panorama")));
+    private final PanoramaRenderer panorama=new PanoramaRenderer(new CubeMap(ResourceLocation.parse("textures/gui/title/background/panorama")));
     private PostChain blur;
     private int width,height;
     private boolean failed;
@@ -19,7 +19,7 @@ final class ShaderMenuBackground implements AutoCloseable {
         if(failed)return;
         try{
             var target=mc.getMainRenderTarget();
-            if(blur==null)blur=new PostChain(mc.getTextureManager(),mc.getResourceManager(),target,new ResourceLocation("vulkanforge","shaders/post/menu_blur.json"));
+            if(blur==null)blur=new PostChain(mc.getTextureManager(),mc.getResourceManager(),target,ResourceLocation.fromNamespaceAndPath("vulkanforge","shaders/post/menu_blur.json"));
             if(width!=target.viewWidth||height!=target.viewHeight){width=target.viewWidth;height=target.viewHeight;blur.resize(width,height);}
             RenderSystem.disableBlend();RenderSystem.disableDepthTest();blur.process(partialTick);
         }catch(Exception error){failed=true;close();VulkanForge.LOGGER.warn("Could not render shader menu blur",error);}

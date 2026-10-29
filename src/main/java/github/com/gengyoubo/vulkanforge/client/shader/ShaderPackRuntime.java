@@ -18,6 +18,8 @@ public final class ShaderPackRuntime {
     private static Path directory,settings;
     private static final Properties preferences=new Properties();
     private static volatile Map<String,String> requestedValues=Map.of();
+    private record PreparedSelection(String name,Map<String,String> requested,ShaderPackPrepared data){ }
+    private static volatile PreparedSelection preparedSelection;
     private static String runtimeError="";
     private static String loggedError="";
     private static boolean initialized;
@@ -29,7 +31,7 @@ public final class ShaderPackRuntime {
     private static void initialize(){
         if(initialized)return;initialized=true;Minecraft mc=Minecraft.getInstance();directory=mc.gameDirectory.toPath().resolve("shaderpacks");settings=mc.gameDirectory.toPath().resolve("config/vulkanforge-shaders.properties");
         try{Files.createDirectories(directory);if(Files.isRegularFile(settings))try(Reader reader=Files.newBufferedReader(settings,StandardCharsets.UTF_8)){preferences.load(reader);}}catch(IOException error){runtimeError=error.getMessage();}
-        controller=new ShaderPackController<>(IO,mc::execute,pack->new ShaderPackPrepared(pack,requestedValues),prepared->{
+        controller=new ShaderPackController<>(IO,mc::execute,pack->{var selected=requestedValues;var prepared=new ShaderPackPrepared(pack,selected);preparedSelection=new PreparedSelection(pack.name(),selected,prepared);return prepared;},prepared->{
             ShaderPack pack=prepared.pack;
             if(VulkanForgeConfig.startup().mode()==dev.vulkanforge.bridge.RenderMode.GL_VK)throw new ShaderPackException("Shader pack execution currently requires GL or native VK mode");
             var missing=prepared.missing;StringBuilder report=new StringBuilder("PACK=").append(pack.name()).append("\nBACKEND=").append(VulkanForgeConfig.startup().mode()).append("\nPREFLIGHT=").append(missing.isEmpty()?"PASSED":"UNSUPPORTED_FEATURES").append('\n');
@@ -46,6 +48,7 @@ public final class ShaderPackRuntime {
             if(graph.terrain()&&net.minecraftforge.fml.ModList.get().isLoaded("embeddium")){graph.close();throw new ShaderPackException(net.minecraft.network.chat.Component.translatable("vulkanforge.shaders.embeddium_terrain",pack.name()).getString());}
             return graph;
         },graph->{try(ShaderPackState state=new ShaderPackState(16).retiring()){graph.close();}});
+        controller.gpuAllowed(()->mc.level!=null);
         String selected=preferences.getProperty("selected","");if(!selected.isBlank())request(selected,storedOptions(selected));
     }
     private static void writeDiagnostic(String text){
@@ -55,28 +58,35 @@ public final class ShaderPackRuntime {
     private static String key(String name){return Base64.getUrlEncoder().withoutPadding().encodeToString(name.getBytes(StandardCharsets.UTF_8));}
     private static Map<String,String> storedOptions(String name){Map<String,String> values=new HashMap<>();String prefix="pack."+key(name)+".";preferences.forEach((k,v)->{if(k.toString().startsWith(prefix))values.put(k.toString().substring(prefix.length()),v.toString());});return Map.copyOf(values);}
     public static void select(String name){initialize();request(name,storedOptions(name));}
-    public static String selectedPack(){initialize();String active=controller.status().active();return active.isEmpty()?preferences.getProperty("lastSelected",preferences.getProperty("selected","")):active;}
+    public static String selectedPack(){initialize();var state=controller.status();if(Minecraft.getInstance().level==null&&!state.requested().isEmpty())return state.requested();String active=state.active();return active.isEmpty()?preferences.getProperty("lastSelected",preferences.getProperty("selected","")):active;}
+    public static boolean deferred(){initialize();return Minecraft.getInstance().level==null&&!controller.status().requested().isEmpty();}
+    public static boolean configuredEnabled(){initialize();return Minecraft.getInstance().level==null?!preferences.getProperty("selected","").isEmpty():active();}
+    public static String displayedPack(){initialize();return Minecraft.getInstance().level==null?preferences.getProperty("selected",""):controller.status().active();}
     public static CompletableFuture<List<String>> importPacks(List<Path> files){
         initialize();List<Path> paths=List.copyOf(files);return CompletableFuture.supplyAsync(()->{List<String> names=new ArrayList<>();try{for(Path path:paths)names.add(ShaderPackImporter.copy(path,directory));return List.copyOf(names);}catch(IOException error){throw new CompletionException(error);}},IO);
     }
     public static void request(String name,Map<String,String> values){
         initialize();runtimeError="";requestedValues=Map.copyOf(values);
-        if(name.isEmpty()){controller.request(null);return;}
+        if(name.isEmpty()){if(Minecraft.getInstance().level==null)persistSelection(name,values);controller.request(null);return;}
         Path selected=directory.resolve(name).normalize();if(!Objects.equals(selected.getParent(),directory.normalize())){runtimeError="Invalid shader pack name";return;}
+        if(Minecraft.getInstance().level==null)persistSelection(name,values);
         controller.request(selected);
     }
     public static void reload(){initialize();var graph=controller.active();if(graph!=null)request(graph.pack.name(),graph.values);}
     public static ShaderPackController.Status status(){initialize();var state=controller.status();return runtimeError.isEmpty()?state:new ShaderPackController.Status(state.active(),state.requested(),state.loading(),runtimeError);}
-    public static ShaderPackOptions options(){initialize();var graph=controller.active();return graph==null?null:graph.options;}
-    public static Map<String,String> values(){initialize();var graph=controller.active();return graph==null?Map.of():graph.values;}
-    public static boolean active(){return !ShaderPackFrontend.irisAvailable()&&initialized&&controller.active()!=null;}
+    private static ShaderPackPrepared selectedMetadata(){var prepared=preparedSelection;return prepared!=null&&prepared.name().equals(selectedPack())&&prepared.requested().equals(requestedValues)?prepared.data():null;}
+    public static ShaderPackOptions options(){initialize();if(Minecraft.getInstance().level==null){var metadata=selectedMetadata();return metadata==null?null:metadata.configuration.options();}var graph=controller.active();return graph==null?null:graph.options;}
+    public static Map<String,String> values(){initialize();if(Minecraft.getInstance().level==null){var metadata=selectedMetadata();return metadata==null?requestedValues:metadata.configuration.values();}var graph=controller.active();return graph==null?Map.of():graph.values;}
+    public static boolean active(){return !ShaderPackFrontend.irisAvailable()&&initialized&&Minecraft.getInstance().level!=null&&controller.active()!=null;}
+    private static void persistSelection(String name,Map<String,String> values){
+        preferences.setProperty("selected",name);if(!name.isEmpty()){preferences.setProperty("lastSelected",name);String prefix="pack."+key(name)+".";preferences.keySet().removeIf(k->k.toString().startsWith(prefix));values.forEach((option,value)->preferences.setProperty(prefix+option,value));}
+        try{Files.createDirectories(settings.getParent());Path temp=Files.createTempFile(settings.getParent(),"vulkanforge-shaders-",".tmp");try(Writer writer=Files.newBufferedWriter(temp,StandardCharsets.UTF_8)){preferences.store(writer,"Shader selection; GPU activation waits for a client world");}try{Files.move(temp,settings,StandardCopyOption.ATOMIC_MOVE,StandardCopyOption.REPLACE_EXISTING);}catch(AtomicMoveNotSupportedException error){Files.move(temp,settings,StandardCopyOption.REPLACE_EXISTING);}}catch(IOException error){runtimeError="Could not save shader selection: "+error.getMessage();}
+    }
     public static void beginFrame(){
         if(ShaderPackFrontend.irisAvailable())return;
         ShaderPackFrontend.beginFrame();
         initialize();String preparationError=controller.status().error();if(!preparationError.equals(loggedError)){loggedError=preparationError;if(!preparationError.isEmpty())VulkanForge.LOGGER.error("Shader pack preparation failed; keeping the active pack: {}",preparationError);}if(controller.beginFrame()){
-            var graph=controller.active();String name=graph==null?"":graph.pack.name();preferences.setProperty("selected",name);if(!name.isEmpty())preferences.setProperty("lastSelected",name);
-            if(graph!=null){String prefix="pack."+key(name)+".";preferences.keySet().removeIf(k->k.toString().startsWith(prefix));graph.values.forEach((option,value)->preferences.setProperty(prefix+option,value));}
-            try{Files.createDirectories(settings.getParent());Path temp=Files.createTempFile(settings.getParent(),"vulkanforge-shaders-",".tmp");try(Writer writer=Files.newBufferedWriter(temp,StandardCharsets.UTF_8)){preferences.store(writer,"Live shader pack selection");}try{Files.move(temp,settings,StandardCopyOption.ATOMIC_MOVE,StandardCopyOption.REPLACE_EXISTING);}catch(AtomicMoveNotSupportedException error){Files.move(temp,settings,StandardCopyOption.REPLACE_EXISTING);}}catch(IOException error){runtimeError="Could not save shader selection: "+error.getMessage();}
+            var graph=controller.active();String name=graph==null?"":graph.pack.name();persistSelection(name,graph==null?Map.of():graph.values);
             VulkanForge.LOGGER.info("Shader pack committed at frame boundary: {}",name.isEmpty()?"OFF":name);
         }
     }

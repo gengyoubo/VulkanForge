@@ -10,6 +10,7 @@ import static org.lwjgl.opengl.GL30.*;
 
 /** Test-only attachment readback: a colorful sky must not hide missing world geometry. */
 public final class OwnPackDiagnostics {
+    public static boolean hasPackGpuResources()throws Exception{var controller=(ShaderPackController<?>)field(ShaderPackRuntime.class,null,"controller");return controller!=null&&(controller.active()!=null||field(ShaderPackController.class,controller,"ready")!=null);}
     @SuppressWarnings("unchecked") public static void capture(Path folder)throws Exception{
         capture(folder,null);
     }

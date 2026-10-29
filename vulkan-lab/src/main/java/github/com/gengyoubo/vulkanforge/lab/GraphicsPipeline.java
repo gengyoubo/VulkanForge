@@ -76,7 +76,7 @@ final class GraphicsPipeline {
             if (world) info.pDepthStencilState(VkPipelineDepthStencilStateCreateInfo.calloc(stack).sType$Default()
                     .depthTestEnable(true).depthWriteEnable(true).depthCompareOp(VK_COMPARE_OP_LESS_OR_EQUAL));
             LongBuffer handle = stack.mallocLong(1);
-            check(vkCreateGraphicsPipelines(context.device, NULL, info, null, handle), "vkCreateGraphicsPipelines");
+            check(vkCreateGraphicsPipelines(context.device, context.pipelineCache, info, null, handle), "vkCreateGraphicsPipelines");
             return handle.get(0);
         } finally {
             if (frag != 0) vkDestroyShaderModule(context.device, frag, null);

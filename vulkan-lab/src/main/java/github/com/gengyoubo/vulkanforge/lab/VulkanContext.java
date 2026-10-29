@@ -46,6 +46,9 @@ final class VulkanContext implements AutoCloseable {
     private byte[] deviceUUID;
     private long nativeHwnd, nativeHinstance;
     boolean nativePresentFences;
+    /** Shared by every pipeline build; persisted by {@link PipelineCache}. 0 when disabled. */
+    long pipelineCache;
+    long pipelinesCreated;
 
     VulkanContext() { this(requestedApiVersion()); }
 
@@ -249,6 +252,7 @@ final class VulkanContext implements AutoCloseable {
             System.out.println("MESH_SHADER_NV_ENABLED=" + meshShaderNV);
             memory = new GpuMemory(this);
             uploads = new AsyncUploads(this, capabilities.timeline() && !Boolean.getBoolean("vulkanforge.disableUploadTimeline"));
+            pipelineCache = PipelineCache.create(this);
             System.out.println("DEVICE_CREATED=true");
         }
     }
@@ -379,6 +383,7 @@ final class VulkanContext implements AutoCloseable {
             vkDeviceWaitIdle(device);
             if (uploads != null) { uploads.close(); uploads = null; }
             if (memory != null) { memory.close(); memory = null; }
+            if (pipelineCache != NULL) { PipelineCache.save(this, pipelineCache, pipelinesCreated); vkDestroyPipelineCache(device, pipelineCache, null); pipelineCache = NULL; }
             vkDestroyDevice(device, null);
             device = null;
         }

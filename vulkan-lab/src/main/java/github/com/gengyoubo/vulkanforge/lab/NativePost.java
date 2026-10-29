@@ -64,7 +64,7 @@ final class NativePost implements AutoCloseable {
                     .pDepthStencilState(VkPipelineDepthStencilStateCreateInfo.calloc(stack).sType$Default())
                     .pColorBlendState(VkPipelineColorBlendStateCreateInfo.calloc(stack).sType$Default().pAttachments(attachment))
                     .pDynamicState(VkPipelineDynamicStateCreateInfo.calloc(stack).sType$Default().pDynamicStates(stack.ints(VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR))).layout(layout);
-            var out=stack.mallocLong(1);check(vkCreateGraphicsPipelines(context.device,0,info,null,out),"native post pipeline");return out.get(0);
+            var out=stack.mallocLong(1);check(vkCreateGraphicsPipelines(context.device,context.pipelineCache,info,null,out),"native post pipeline");return out.get(0);
         }finally{if(vert!=0)vkDestroyShaderModule(context.device,vert,null);if(frag!=0)vkDestroyShaderModule(context.device,frag,null);}
     }
     private static int factor(int gl){return switch(gl){case 0->VK_BLEND_FACTOR_ZERO;case 1->VK_BLEND_FACTOR_ONE;case 768->VK_BLEND_FACTOR_SRC_COLOR;case 769->VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;

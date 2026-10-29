@@ -217,7 +217,7 @@ final class NativeShaderProgram implements AutoCloseable {
                     .pDepthStencilState(VkPipelineDepthStencilStateCreateInfo.calloc(stack).sType$Default().depthTestEnable(state[7]!=0).depthWriteEnable(state[8]!=0).depthCompareOp(compare(state[9])))
                     .pColorBlendState(VkPipelineColorBlendStateCreateInfo.calloc(stack).sType$Default().pAttachments(blend))
                     .pDynamicState(VkPipelineDynamicStateCreateInfo.calloc(stack).sType$Default().pDynamicStates(context.legacyVertexAttributes?stack.ints(VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR,VK_DYNAMIC_STATE_DEPTH_BIAS,EXTVertexInputDynamicState.VK_DYNAMIC_STATE_VERTEX_INPUT_EXT):stack.ints(VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR,VK_DYNAMIC_STATE_DEPTH_BIAS)));
-            var out=stack.mallocLong(1);check(vkCreateGraphicsPipelines(context.device,0,info,null,out),"native game graphics pipeline");pipelines.put(new PipelineKey(state.clone(),layoutAttributes,stride,formats.clone(),depthFormat),out.get(0));return out.get(0);
+            var out=stack.mallocLong(1);check(vkCreateGraphicsPipelines(context.device,context.pipelineCache,info,null,out),"native game graphics pipeline");context.pipelinesCreated++;pipelines.put(new PipelineKey(state.clone(),layoutAttributes,stride,formats.clone(),depthFormat),out.get(0));return out.get(0);
         }
     }
     private static int format(int size,int type,boolean normalized,boolean integer) {

@@ -29,7 +29,7 @@ public final class ShaderPackScreen extends Screen {
     private int refreshTicks;
     public ShaderPackScreen(Screen parent){super(Component.translatable("vulkanforge.shaders.title"));this.parent=parent;}
     @Override protected void init(){
-        if(!initialized){selected=ShaderPackRuntime.selectedPack();enabled=ShaderPackRuntime.active();initialized=true;}
+        if(!initialized){selected=ShaderPackRuntime.selectedPack();enabled=ShaderPackRuntime.configuredEnabled();initialized=true;}
         packs=ShaderPackRuntime.available();
         list=addRenderableWidget(new PackList(minecraft,width,height,34,height-58));refreshEntries();
         int span=Math.min(308,width-24),left=(width-span)/2,gap=4,half=(span-gap)/2,third=(span-2*gap)/3;
@@ -47,12 +47,12 @@ public final class ShaderPackScreen extends Screen {
         list.add(Kind.HINT,"");list.setScrollAmount(scroll);
     }
     private void applyChanges(boolean close,boolean settings){
-        if(importing||waiting||ShaderPackRuntime.status().loading())return;
+        if(importing||waiting||ShaderPackRuntime.status().loading()&&!ShaderPackRuntime.deferred())return;
         if(enabled&&!packs.contains(selected)){notice=Component.translatable("vulkanforge.shaders.choose").getString();return;}
         String desired=enabled?selected:"";
         closeAfterApply=close;settingsAfterApply=settings;
         var status=ShaderPackRuntime.status();
-        if(desired.equals(status.active())&&status.error().isEmpty()){finishApply();return;}
+        if(desired.equals(ShaderPackRuntime.displayedPack())&&status.error().isEmpty()&&(!settings||ShaderPackRuntime.options()!=null)){finishApply();return;}
         pending=desired;waiting=true;notice="";ShaderPackRuntime.select(desired);updateButtons();
     }
     private void finishApply(){
@@ -61,14 +61,14 @@ public final class ShaderPackScreen extends Screen {
         else if(closeAfterApply){closeAfterApply=false;minecraft.setScreen(parent);}
     }
     private void updateButtons(){
-        boolean busy=waiting||importing||ShaderPackRuntime.status().loading();
+        boolean busy=waiting||importing||ShaderPackRuntime.status().loading()&&!ShaderPackRuntime.deferred();
         if(options!=null)options.active=!busy&&enabled&&packs.contains(selected);
         if(apply!=null)apply.active=!busy;if(done!=null)done.active=!busy;
     }
     @Override public void tick(){
         var status=ShaderPackRuntime.status();
-        if(waiting&&!status.loading()){
-            if(status.error().isEmpty()&&status.active().equals(pending))finishApply();
+        if(waiting&&(ShaderPackRuntime.deferred()||!status.loading())){
+            if(status.error().isEmpty()&&(status.active().equals(pending)||ShaderPackRuntime.deferred()&&status.requested().equals(pending))){if(!settingsAfterApply||ShaderPackRuntime.options()!=null)finishApply();}
             else{waiting=false;closeAfterApply=settingsAfterApply=false;}
         }
         if(!importing&&++refreshTicks>=20){refreshTicks=0;List<String> current=ShaderPackRuntime.available();if(!current.equals(packs)){packs=current;refreshEntries();}}
@@ -83,7 +83,8 @@ public final class ShaderPackScreen extends Screen {
         graphics.drawCenteredString(font,title,width/2,8,0xffffff);
         var status=ShaderPackRuntime.status();
         Component subtitle=Component.translatable("vulkanforge.shaders.select").withStyle(ChatFormatting.GRAY,ChatFormatting.ITALIC);
-        if(status.loading())subtitle=Component.translatable("vulkanforge.shaders.loading",status.requested()).withStyle(ChatFormatting.YELLOW);
+        if(ShaderPackRuntime.deferred())subtitle=Component.translatable("vulkanforge.shaders.deferred",status.requested()).withStyle(ChatFormatting.GRAY);
+        else if(status.loading())subtitle=Component.translatable("vulkanforge.shaders.loading",status.requested()).withStyle(ChatFormatting.YELLOW);
         else if(importing)subtitle=Component.translatable("vulkanforge.shaders.importing");
         else if(!notice.isEmpty())subtitle=Component.literal(notice).withStyle(ChatFormatting.GRAY);
         graphics.drawCenteredString(font,shorten(subtitle,width-20),width/2,21,0xffffff);
@@ -133,7 +134,7 @@ public final class ShaderPackScreen extends Screen {
             boolean button=kind==Kind.TOGGLE||kind==Kind.DOWNLOAD;
             boolean chosen=kind==Kind.PACK&&name.equals(selected);
             if(button||hovered&&kind==Kind.PACK||chosen)ShaderMenuButton.panel(graphics,left-2,top-2,width,height+2,hovered||chosen,kind!=Kind.TOGGLE||!packs.isEmpty());
-            int color=kind==Kind.TOGGLE&&packs.isEmpty()?0x999999:kind==Kind.PACK&&!enabled?0xaaaaaa:kind==Kind.PACK&&name.equals(ShaderPackRuntime.status().active())?0xffef75:0xffffff;
+            int color=kind==Kind.TOGGLE&&packs.isEmpty()?0x999999:kind==Kind.PACK&&!enabled?0xaaaaaa:kind==Kind.PACK&&name.equals(ShaderPackRuntime.displayedPack())?0xffef75:0xffffff;
             graphics.drawCenteredString(font,shorten(label(),width-8),left-2+width/2,top+(height-9)/2,color);
         }
         private boolean activate(){

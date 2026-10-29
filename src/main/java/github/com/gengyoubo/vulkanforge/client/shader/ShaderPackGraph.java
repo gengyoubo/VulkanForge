@@ -30,7 +30,10 @@ final class ShaderPackGraph implements AutoCloseable,ShaderPackController.Increm
     @FunctionalInterface private interface Preparation {void run()throws IOException;}
     private final Deque<Preparation> pending=new ArrayDeque<>();
     private boolean preparedLogged;
-    private record Pass(ShaderPackRenderPlan.Pass plan,ShaderPackPass shader,List<ToIntFunction<RenderTarget>> bindings,boolean last){ }
+    /** {@code outputs}/{@code viewport} are the plan's arrays copied once, not per frame; {@code label} names its timing section. */
+    private record Pass(ShaderPackRenderPlan.Pass plan,ShaderPackPass shader,List<ToIntFunction<RenderTarget>> bindings,boolean last,String label,int[] outputs,float[] viewport){ }
+    /** Clear=true colortex images cleared by one MRT glClear: same clear color source, size and numeric class, at most eight. */
+    private record ClearGroup(int framebuffer,ShaderPackRenderPlan.Color color,int width,int height){ }
     private record Chain(ShaderPackRenderPlan.Dimension plan,List<Pass> prepare,List<Pass> deferred,List<Pass> post,Set<Integer> mipmapped,Map<String,ShaderPackRenderPlan.Pass> shadow){
         List<Pass> all(){List<Pass> result=new ArrayList<>(prepare);result.addAll(deferred);result.addAll(post);return result;}
     }
@@ -51,6 +54,7 @@ final class ShaderPackGraph implements AutoCloseable,ShaderPackController.Increm
     private final Set<String> available;
     private final Map<Integer,ShaderPackTarget[]> targets=new HashMap<>();
     private final Map<Pass,int[]> framebuffers=new HashMap<>();
+    private final List<ClearGroup> clearGroups=new ArrayList<>();
     private final Map<WorldTarget,Integer> worldFramebuffers=new HashMap<>();
     private final Map<String,ShaderInstance> worldShaders=new HashMap<>();
     private final Map<ShaderInstance,String> formatKeys=new IdentityHashMap<>();
@@ -95,7 +99,7 @@ final class ShaderPackGraph implements AutoCloseable,ShaderPackController.Increm
                         pending.add(()->{
                         ShaderPackPass shader=new ShaderPackPass(step.source(),prepared.graphics(step.source()),available);compiled.add(shader);List<ToIntFunction<RenderTarget>> bindings=new ArrayList<>();
                         for(String sampler:shader.samplers)bindings.add(binding(null,dimension,step,sampler));
-                        Pass pass=new Pass(step,shader,List.copyOf(bindings),step==dimension.last());mipmapped.addAll(step.mipmaps());
+                        Pass pass=new Pass(step,shader,List.copyOf(bindings),step==dimension.last(),"PASS_"+step.source().name(),step.outputs(),step.viewport());mipmapped.addAll(step.mipmaps());
                         (step.source().phase()==ShaderPack.Phase.PREPARE?prepare:step.source().phase()==ShaderPack.Phase.DEFERRED?deferred:post).add(pass);
                         });
                     }
@@ -186,14 +190,27 @@ final class ShaderPackGraph implements AutoCloseable,ShaderPackController.Increm
     private void allocate(String key,Chain chain,RenderTarget scene){
         int width=scene.viewWidth,height=scene.viewHeight,depth=scene.getDepthTextureId();
         if(allocationMatches(key,scene))return;
-        release();allocated=key;allocatedWidth=width;allocatedHeight=height;allocatedDepth=depth;
+        // Images of the previous allocation with the same size and format are reused (dimension change, fixed-size
+        // buffers and shadow colors across a resize) instead of being deleted and recreated.
+        List<ShaderPackTarget> spare=new ArrayList<>();release(spare);
+        try{allocate(key,chain,width,height,depth,spare);}finally{for(var target:spare)target.close();}
+    }
+    private void allocate(String key,Chain chain,int width,int height,int depth,List<ShaderPackTarget> spare){
+        allocated=key;allocatedWidth=width;allocatedHeight=height;allocatedDepth=depth;
         for(var color:chain.plan().colors().values()){
             ShaderPackTarget[] pair=new ShaderPackTarget[2];targets.put(color.index(),pair);boolean mipmapped=chain.mipmapped().contains(color.index())&&!color.integer();
             for(int side=0;side<2;side++){
-                pair[side]=new ShaderPackTarget(color.width(width),color.height(height),color.format(),mipmapped);pair[side].clear(clearColor(color));
+                pair[side]=reuse(spare,color.width(width),color.height(height),color.format(),mipmapped);pair[side].clear(clearColor(color));
                 // Allocates the level chain so a mipmapped image is complete before its first regeneration.
                 if(mipmapped){glBindTexture(GL_TEXTURE_2D,pair[side].texture);glGenerateMipmap(GL_TEXTURE_2D);}
             }
+        }
+        Map<String,List<ShaderPackRenderPlan.Color>> groups=new LinkedHashMap<>();
+        for(var color:chain.plan().colors().values())if(color.clear())groups.computeIfAbsent((color.fogClear()?"fog":Arrays.toString(color.clearColor()))+"|"+color.width(width)+"x"+color.height(height)+"|"+color.integer(),unused->new ArrayList<>()).add(color);
+        for(var group:groups.values()){
+            List<Integer> textures=new ArrayList<>();for(var color:group)for(var target:targets.get(color.index()))textures.add(target.texture);
+            ShaderPackTarget first=targets.get(group.get(0).index())[0];
+            for(int from=0;from<textures.size();from+=8)clearGroups.add(new ClearGroup(clearFramebuffer(textures.subList(from,Math.min(textures.size(),from+8))),group.get(0),first.width,first.height));
         }
         for(Pass pass:chain.all()){
             if(!pass.last())framebuffers.put(pass,new int[]{passFramebuffer(pass),0});
@@ -203,14 +220,27 @@ final class ShaderPackGraph implements AutoCloseable,ShaderPackController.Increm
             if(!chain.shadow().isEmpty()){
                 var dimension=chain.plan();boolean[] filtering=dimension.shadowFiltering();shadowSize=dimension.shadowResolution();
                 shadowDepth0=depthTexture(shadowSize,shadowSize,filtering[0]);shadowDepth1=depthTexture(shadowSize,shadowSize,filtering[1]);
-                for(var color:dimension.shadowColors().values())shadowColors.put(color.index(),new ShaderPackTarget(shadowSize,shadowSize,color.format(),false));
+                for(var color:dimension.shadowColors().values())shadowColors.put(color.index(),reuse(spare,shadowSize,shadowSize,color.format(),false));
                 shadowDepthFramebuffer=glGenFramebuffers();glBindFramebuffer(GL_FRAMEBUFFER,shadowDepthFramebuffer);glFramebufferTexture2D(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_TEXTURE_2D,shadowDepth0,0);glDrawBuffer(GL_NONE);glReadBuffer(GL_NONE);
                 if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE)throw new ShaderPackException("Incomplete shadow depth framebuffer");
             }
         }
     }
+    private static ShaderPackTarget reuse(List<ShaderPackTarget> spare,int width,int height,String format,boolean mipmapped){
+        for(var iterator=spare.iterator();iterator.hasNext();){var target=iterator.next();if(target.matches(width,height,format,mipmapped)){iterator.remove();return target;}}
+        return new ShaderPackTarget(width,height,format,mipmapped);
+    }
+    private static int clearFramebuffer(List<Integer> textures){
+        int framebuffer=glGenFramebuffers();glBindFramebuffer(GL_FRAMEBUFFER,framebuffer);
+        for(int i=0;i<textures.size();i++)glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0+i,GL_TEXTURE_2D,textures.get(i),0);
+        drawBuffers(textures.size());if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){glDeleteFramebuffers(framebuffer);throw new ShaderPackException("Incomplete clear framebuffer");}return framebuffer;
+    }
+    /** Per-frame Clear=true buffers, both sides: one glClear per group rather than per image. */
+    private void clearTargets(){
+        for(var group:clearGroups){float[] color=clearColor(group.color());glBindFramebuffer(GL_FRAMEBUFFER,group.framebuffer());glViewport(0,0,group.width(),group.height());glClearColor(color[0],color[1],color[2],color[3]);glClear(GL_COLOR_BUFFER_BIT);}
+    }
     private int passFramebuffer(Pass pass){
-        int[] outputs=pass.plan().outputs();int framebuffer=glGenFramebuffers();glBindFramebuffer(GL_FRAMEBUFFER,framebuffer);
+        int[] outputs=pass.outputs();int framebuffer=glGenFramebuffers();glBindFramebuffer(GL_FRAMEBUFFER,framebuffer);
         for(int i=0;i<outputs.length;i++)glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0+i,GL_TEXTURE_2D,side(outputs[i],!pass.plan().alternate().contains(outputs[i])).texture,0);
         drawBuffers(outputs.length);if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){glDeleteFramebuffers(framebuffer);throw new ShaderPackException(pass.shader().name+": incomplete output framebuffer "+Arrays.toString(outputs));}return framebuffer;
     }
@@ -234,7 +264,7 @@ final class ShaderPackGraph implements AutoCloseable,ShaderPackController.Increm
      */
     void shadow(net.minecraft.client.renderer.LevelRenderer renderer){
         if(!worldFrame||frameChain.shadow().isEmpty())return;
-        long started=timings.start();
+        long started=timings.start();timings.mark("SHADOW");
         var previous=phase;
         var camera=Minecraft.getInstance().gameRenderer.getMainCamera().getPosition();
         try(var state=new ShaderPackState(16).engineChanged();var selection=shadowSections.select(renderer,globals.shadowView,globals.shadowProjection,camera)){
@@ -249,7 +279,7 @@ final class ShaderPackGraph implements AutoCloseable,ShaderPackController.Increm
             glBindFramebuffer(GL_READ_FRAMEBUFFER,shadowDepthFramebuffer);glBindTexture(GL_TEXTURE_2D,shadowDepth1);glCopyTexSubImage2D(GL_TEXTURE_2D,0,0,0,0,0,shadowSize,shadowSize);
             layer(renderer,net.minecraft.client.renderer.RenderType.translucent(),"rendertype_translucent",pose,camera,projection);
         }catch(Throwable error){fail(error);}
-        finally{phase=previous;timings.end("SHADOW",started);}
+        finally{phase=previous;timings.mark("GAME");timings.end("SHADOW",started);}
     }
     private void layer(net.minecraft.client.renderer.LevelRenderer renderer,net.minecraft.client.renderer.RenderType layer,String shader,com.mojang.blaze3d.vertex.PoseStack pose,net.minecraft.world.phys.Vec3 camera,Matrix4f projection)throws ReflectiveOperationException{
         // A layer no shadow program covers is not drawn into the shadow map.
@@ -258,15 +288,20 @@ final class ShaderPackGraph implements AutoCloseable,ShaderPackController.Increm
         renderChunkLayer.invoke(renderer,layer,pose,camera.x,camera.y,camera.z,projection);
     }
     private static void drawBuffers(int count){int[] buffers=new int[count];for(int i=0;i<count;i++)buffers[i]=GL_COLOR_ATTACHMENT0+i;glDrawBuffers(buffers);}
-    private void release(){
+    private void release(){release(null);}
+    /** With {@code spare}, color images are handed over for reuse instead of being deleted. */
+    private void release(List<ShaderPackTarget> spare){
         for(int[] pair:framebuffers.values())for(int framebuffer:pair)if(framebuffer!=0)glDeleteFramebuffers(framebuffer);framebuffers.clear();historySide=false;
+        for(var group:clearGroups)glDeleteFramebuffers(group.framebuffer());clearGroups.clear();
         for(int framebuffer:worldFramebuffers.values())glDeleteFramebuffers(framebuffer);worldFramebuffers.clear();
         if(depthCopy!=0){glDeleteTextures(depthCopy);depthCopy=0;}
         for(int framebuffer:shadowFramebuffers.values())glDeleteFramebuffers(framebuffer);shadowFramebuffers.clear();
         if(shadowDepthFramebuffer!=0){glDeleteFramebuffers(shadowDepthFramebuffer);shadowDepthFramebuffer=0;}
         for(int texture:new int[]{shadowDepth0,shadowDepth1})if(texture!=0)glDeleteTextures(texture);shadowDepth0=shadowDepth1=0;
-        for(var target:shadowColors.values())target.close();shadowColors.clear();
-        for(var pair:targets.values())for(var target:pair)if(target!=null)target.close();targets.clear();allocated=null;
+        for(var target:shadowColors.values())retire(target,spare);shadowColors.clear();
+        for(var pair:targets.values())for(var target:pair)if(target!=null)retire(target,spare);targets.clear();allocated=null;
+    }
+    private static void retire(ShaderPackTarget target,List<ShaderPackTarget> spare){if(spare!=null)spare.add(target);else target.close();
     }
     private Map<String,float[]> uniforms(float partialTick,int width,int height){Map<String,float[]> uniforms=globals.next(partialTick,width,height);uniforms.putAll(plan.expressions().evaluate(uniforms,uniforms.get("frameTime")[0]));return uniforms;}
     /** Start of LevelRenderer.renderLevel: matrices for every pack; for world programs also clears, prepare passes and routing. */
@@ -275,14 +310,15 @@ final class ShaderPackGraph implements AutoCloseable,ShaderPackController.Increm
         String key=dimensions.containsKey(dimension)?dimension:"";Chain chain=dimensions.get(key);
         if(chain==null||chain.plan().world().isEmpty()||failure!=null||scene.viewWidth<1||scene.viewHeight<1)return false;
         if(Minecraft.useShaderTransparency())throw new ShaderPackException("Fabulous graphics cannot be combined with shader pack world programs; select Fancy or Fast graphics");
-        timings.beginFrame();worldStarted=timings.start();long started=worldStarted;
+        timings.beginFrame();worldStarted=timings.start();long started=worldStarted;timings.mark("CLEAR");
         try(ShaderPackState state=new ShaderPackState(16)){
             if(allocated!=null&&!allocationMatches(key,scene))state.retiring();
             allocate(key,chain,scene);ShaderPackState.fullscreen();
-            for(var color:chain.plan().colors().values())if(color.clear())for(var target:targets.get(color.index()))target.clear(clearColor(color));
+            clearTargets();
             globals.celestial(chain.plan().sunRotation(),chain.plan().shadowInterval(),chain.plan().shadowDistance());frameUniforms=uniforms(partialTick,scene.viewWidth,scene.viewHeight);run(chain,chain.prepare(),scene,frameUniforms);
         }
         frameChain=chain;frameKey=key;frameScene=scene;frameSerial++;deferredDone=false;phase=ShaderPackWorldPrograms.Phase.SKY;worldFrame=true;
+        timings.mark("SKY");
         if(Minecraft.getInstance().level.effects().skyType()==net.minecraft.client.renderer.DimensionSpecialEffects.SkyType.NORMAL){
             String fluid=Minecraft.getInstance().gameRenderer.getMainCamera().getFluidInCamera().name();
             if(!fluid.equals("LAVA")&&!fluid.equals("POWDER_SNOW"))try(var state=new ShaderPackState(16).engineChanged()){
@@ -290,18 +326,18 @@ final class ShaderPackGraph implements AutoCloseable,ShaderPackController.Increm
                 if(shader instanceof ShaderPackWorldShader){if(sky==null)sky=new ShaderPackSky();sky.draw(shader,view,projection,frameUniforms.get("skyColor"));}
             }
         }
-        timings.end("BEGIN",started);ShaderPackRuntime.diagnosticStage("sky");return true;
+        timings.mark("GAME");timings.end("BEGIN",started);ShaderPackRuntime.diagnosticStage("sky");return true;
     }
     void phase(ShaderPackWorldPrograms.Phase next){if(worldFrame)phase=next;}
     /** After opaque geometry: snapshot depth for depthtex1/2, run deferred passes, and route translucent geometry to the post-deferred images. */
     void deferred(){
         if(!worldFrame||deferredDone)return;deferredDone=true;
-        long started=timings.start();
+        long started=timings.start();timings.mark("DEPTH_COPY");
         try(ShaderPackState state=new ShaderPackState(16)){
             ShaderPackRuntime.diagnosticStage("opaque");
             glBindFramebuffer(GL_READ_FRAMEBUFFER,frameScene.frameBufferId);glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,depthCopy);glCopyTexSubImage2D(GL_TEXTURE_2D,0,0,0,0,0,frameScene.viewWidth,frameScene.viewHeight);
             ShaderPackState.fullscreen();run(frameChain,frameChain.deferred(),frameScene,frameUniforms);
-        }finally{timings.end("DEFERRED",started);}
+        }finally{timings.mark("GAME");timings.end("DEFERRED",started);}
     }
     /** Game core shader → pack world program for the current phase; anything unmapped keeps the vanilla shader. */
     ShaderInstance shader(ShaderInstance vanilla){
@@ -418,23 +454,25 @@ final class ShaderPackGraph implements AutoCloseable,ShaderPackController.Increm
         return framebuffer;
     }
     private void run(Chain chain,List<Pass> list,RenderTarget scene,Map<String,float[]> uniforms){
-        int width=scene.viewWidth,height=scene.viewHeight;
+        int width=scene.viewWidth,height=scene.viewHeight;boolean profiling=timings.enabled();
         for(Pass pass:list){
-            var step=pass.plan();
+            var step=pass.plan();long started=timings.start();if(profiling)timings.mark(pass.label());
             for(int index:step.mipmaps())if(!chain.plan().colors().get(index).integer()){glBindTexture(GL_TEXTURE_2D,side(index,step.alternate().contains(index)).texture);glGenerateMipmap(GL_TEXTURE_2D);}
             int targetWidth=width,targetHeight=height;
             if(pass.last()){glBindFramebuffer(GL_FRAMEBUFFER,scene.frameBufferId);glDrawBuffers(GL_COLOR_ATTACHMENT0);}
-            else{int[] pair=framebuffers.get(pass);int index=historySide?1:0;if(pair[index]==0)pair[index]=passFramebuffer(pass);glBindFramebuffer(GL_FRAMEBUFFER,pair[index]);drawBuffers(step.outputs().length);ShaderPackTarget first=side(step.outputs()[0],false);targetWidth=first.width;targetHeight=first.height;}
-            float[] viewport=step.viewport();glViewport(Math.round(viewport[1]*targetWidth),Math.round(viewport[2]*targetHeight),Math.max(1,Math.round(viewport[0]*targetWidth)),Math.max(1,Math.round(viewport[0]*targetHeight)));
+            // Draw buffers are framebuffer state, set once when the framebuffer is built.
+            else{int[] pair=framebuffers.get(pass);int index=historySide?1:0;if(pair[index]==0)pair[index]=passFramebuffer(pass);glBindFramebuffer(GL_FRAMEBUFFER,pair[index]);ShaderPackTarget first=side(pass.outputs()[0],false);targetWidth=first.width;targetHeight=first.height;}
+            float[] viewport=pass.viewport();glViewport(Math.round(viewport[1]*targetWidth),Math.round(viewport[2]*targetHeight),Math.max(1,Math.round(viewport[0]*targetWidth)),Math.max(1,Math.round(viewport[0]*targetHeight)));
             if(step.blend()!=null){
                 if(step.blend().enabled()){glEnable(GL_BLEND);glBlendFuncSeparate(factor(step.blend().source()),factor(step.blend().destination()),factor(step.blend().sourceAlpha()),factor(step.blend().destinationAlpha()));}else glDisable(GL_BLEND);
-                int[] outputs=step.outputs();for(int i=0;i<outputs.length;i++)if(step.blendOff().contains(outputs[i]))glDisablei(GL_BLEND,i);
+                int[] outputs=pass.outputs();for(int i=0;i<outputs.length;i++)if(step.blendOff().contains(outputs[i]))glDisablei(GL_BLEND,i);
             }
-            glUseProgram(pass.shader().program);
-            for(int unit=0;unit<pass.bindings().size();unit++){glActiveTexture(GL_TEXTURE0+unit);glBindTexture(GL_TEXTURE_2D,pass.bindings().get(unit).applyAsInt(scene));glUniform1i(pass.shader().uniforms.get(pass.shader().samplers.get(unit)).location(),unit);}
+            glUseProgram(pass.shader().program);pass.shader().bindSamplers();
+            for(int unit=0;unit<pass.bindings().size();unit++){glActiveTexture(GL_TEXTURE0+unit);glBindTexture(GL_TEXTURE_2D,pass.bindings().get(unit).applyAsInt(scene));}
             glActiveTexture(GL_TEXTURE0);pass.shader().values(uniforms);quad.draw();passes++;
             ShaderPackRuntime.diagnosticStage(step.source().name());
             if(step.blend()!=null)glDisable(GL_BLEND);
+            timings.end(pass.label(),started);
         }
     }
     private void finish(Chain chain,RenderTarget scene){
@@ -452,20 +490,21 @@ final class ShaderPackGraph implements AutoCloseable,ShaderPackController.Increm
         if(worldFrame){
             long started=timings.start();
             try{deferred();try(ShaderPackState state=new ShaderPackState(16)){ShaderPackState.fullscreen();run(frameChain,frameChain.post(),scene,frameUniforms);finish(frameChain,scene);}}
-            finally{worldFrame=false;timings.end("POST",started);timings.end("WORLD_TOTAL",worldStarted);}
+            finally{worldFrame=false;timings.mark("END");timings.endFrame();timings.end("POST",started);timings.end("WORLD_TOTAL",worldStarted);}
             return;
         }
         int width=scene.viewWidth,height=scene.viewHeight;if(width<1||height<1)return;
         String key=dimensions.containsKey(dimension)?dimension:"";Chain chain=dimensions.get(key);
         // World-program packs only render inside a level frame; their scene color is never the input.
         if(chain==null||!chain.plan().world().isEmpty())return;
+        timings.beginFrame();long started=timings.start();timings.mark("CLEAR");
         try(ShaderPackState state=new ShaderPackState(16)){
             if(allocated!=null&&!allocationMatches(key,scene))state.retiring();
             allocate(key,chain,scene);ShaderPackState.fullscreen();
-            for(var color:chain.plan().colors().values())if(color.clear())for(var target:targets.get(color.index()))target.clear(clearColor(color));
+            clearTargets();
             if(targets.containsKey(0))blit(scene.frameBufferId,width,height,side(0,false));
             globals.celestial(chain.plan().sunRotation(),chain.plan().shadowInterval(),chain.plan().shadowDistance());run(chain,chain.all(),scene,uniforms(partialTick,width,height));finish(chain,scene);
-        }
+        }finally{timings.mark("END");timings.endFrame();timings.end("FULLSCREEN_TOTAL",started);}
     }
     private static void blit(int source,int width,int height,ShaderPackTarget target){blit(source,width,height,target.framebuffer,target.width,target.height);}
     private static void blit(int source,int sourceWidth,int sourceHeight,int target,int targetWidth,int targetHeight){
@@ -480,7 +519,8 @@ final class ShaderPackGraph implements AutoCloseable,ShaderPackController.Increm
     @Override public void close(){
         if(closed)return;closed=true;worldFrame=false;
         pending.clear();
-        try{var folder=Minecraft.getInstance().gameDirectory.toPath().resolve("logs/vulkanforge");Files.createDirectories(folder);Files.writeString(folder.resolve("shader-pack-performance.txt"),"PACK="+pack.name()+"\nCPU_PREPARATION_MS="+prepared.milliseconds+"\nGPU_CREATE_MS="+gpuCreateNanos/1e6+"\nWORLD_PROGRAM_COMPILES="+worldCompiles+"\nWORLD_PROGRAM_COMPILE_MS="+worldCompileNanos/1e6+"\nPERSISTENT_FRAME_COPIES=0\nSHADOW_SECTIONS="+shadowSections.sections+"\nPLAYER_VISIBLE_SECTIONS="+shadowSections.normalSections+"\n"+timings.report());}catch(IOException error){github.com.gengyoubo.vulkanforge.VulkanForge.LOGGER.warn("Cannot write shader pack timings",error);}
+        try{var folder=Minecraft.getInstance().gameDirectory.toPath().resolve("logs/vulkanforge");Files.createDirectories(folder);Files.writeString(folder.resolve("shader-pack-performance.txt"),"PACK="+pack.name()+"\nCPU_PREPARATION_MS="+prepared.milliseconds+"\nGPU_CREATE_MS="+gpuCreateNanos/1e6+"\nWORLD_PROGRAM_COMPILES="+worldCompiles+"\nWORLD_PROGRAM_COMPILE_MS="+worldCompileNanos/1e6+"\nGL_PROGRAM_CACHE_HITS="+ShaderPackProgramCache.hits+"\nGL_PROGRAM_CACHE_MISSES="+ShaderPackProgramCache.misses+"\nPERSISTENT_FRAME_COPIES=0\nSHADOW_SECTIONS="+shadowSections.sections+"\nPLAYER_VISIBLE_SECTIONS="+shadowSections.normalSections+"\n"+timings.report());}catch(IOException error){github.com.gengyoubo.vulkanforge.VulkanForge.LOGGER.warn("Cannot write shader pack timings",error);}
+        timings.close();
         for(var shader:worldShaders.values())shader.close();worldShaders.clear();
         for(var shader:compiled)shader.close();compiled.clear();dimensions.clear();
         for(var image:images.values())image.close();images.clear();

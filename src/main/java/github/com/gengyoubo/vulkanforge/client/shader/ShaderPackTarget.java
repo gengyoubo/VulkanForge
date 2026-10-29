@@ -8,10 +8,12 @@ import static org.lwjgl.opengl.GL31.*;
 /** Private colortex image with its own framebuffer; the native adapter gives the same logical handles private Vulkan storage. */
 final class ShaderPackTarget implements AutoCloseable {
     final int framebuffer,texture,width,height;
+    final String format;
+    final boolean mipmapped;
     private boolean closed;
     ShaderPackTarget(int width,int height){this(width,height,"RGBA8",false);}
     ShaderPackTarget(int width,int height,String format,boolean mipmapped){
-        this.width=width;this.height=height;int image=0,target=0;boolean integer=format.matches(".*\\dU?I");
+        this.width=width;this.height=height;this.format=format;this.mipmapped=mipmapped;int image=0,target=0;boolean integer=format.matches(".*\\dU?I");
         try{
             image=glGenTextures();glBindTexture(GL_TEXTURE_2D,image);glTexImage2D(GL_TEXTURE_2D,0,internal(format),width,height,0,pixels(format,integer),integer?(format.endsWith("UI")?GL_UNSIGNED_BYTE:GL_BYTE):GL_UNSIGNED_BYTE,(ByteBuffer)null);
             glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,integer?GL_NEAREST:mipmapped?GL_LINEAR_MIPMAP_LINEAR:GL_LINEAR);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,integer?GL_NEAREST:GL_LINEAR);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
@@ -19,6 +21,8 @@ final class ShaderPackTarget implements AutoCloseable {
             if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE)throw new IllegalStateException("Incomplete shader pack framebuffer for "+format);framebuffer=target;texture=image;
         }catch(Throwable error){if(image!=0)glDeleteTextures(image);if(target!=0)glDeleteFramebuffers(target);throw error;}
     }
+    /** Whether this image can stand in for a newly requested one: identical size, format and mip chain. */
+    boolean matches(int width,int height,String format,boolean mipmapped){return !closed&&this.width==width&&this.height==height&&this.format.equals(format)&&this.mipmapped==mipmapped;}
     void clear(float[] color){glBindFramebuffer(GL_FRAMEBUFFER,framebuffer);glDrawBuffers(GL_COLOR_ATTACHMENT0);glViewport(0,0,width,height);glClearColor(color[0],color[1],color[2],color[3]);glClear(GL_COLOR_BUFFER_BIT);}
     /** Pack format names, as declared by {@code const int colortexNFormat}. */
     static int internal(String format){return switch(format){

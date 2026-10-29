@@ -18,7 +18,8 @@ final class ShaderPackPass implements AutoCloseable {
     final int program;
     final Map<String,Uniform> uniforms=new LinkedHashMap<>();
     final List<String> samplers=new ArrayList<>();
-    private boolean closed;
+    private boolean closed,samplersBound;
+    private float[][] uploaded;
     /** {@code available} names every frame or expression uniform the graph can supply; anything else is a load error. */
     ShaderPackPass(ShaderPack.Program source,ShaderPackOptions options,Map<String,String> values,Set<String> available){
         this(source,ShaderPackGlsl.fullscreen(source,options,values),available);
@@ -28,9 +29,13 @@ final class ShaderPackPass implements AutoCloseable {
         try {
             String all=graphics.vertex()+"\n"+graphics.fragment();
             if(Pattern.compile("\\buniform\\s+\\w+\\s+\\w+\\s*\\[").matcher(all).find()||Pattern.compile("\\buniform\\s+\\w+\\s*\\{").matcher(all).find())throw new ShaderPackException(name+": uniform arrays/blocks require an extended pack uniform layout");
-            vertex=compile(GL_VERTEX_SHADER,graphics.vertex());fragment=compile(GL_FRAGMENT_SHADER,graphics.fragment());linked=glCreateProgram();
-            glAttachShader(linked,vertex);glAttachShader(linked,fragment);for(var attribute:graphics.attributes().entrySet())glBindAttribLocation(linked,attribute.getValue(),attribute.getKey());
-            glLinkProgram(linked);if(glGetProgrami(linked,GL_LINK_STATUS)==GL_FALSE)throw new ShaderPackException(name+": "+glGetProgramInfoLog(linked));
+            String cacheKey=ShaderPackProgramCache.key(graphics.vertex(),graphics.fragment(),graphics.attributes());linked=ShaderPackProgramCache.load(cacheKey);
+            if(linked==0){
+                vertex=compile(GL_VERTEX_SHADER,graphics.vertex());fragment=compile(GL_FRAGMENT_SHADER,graphics.fragment());linked=glCreateProgram();
+                glAttachShader(linked,vertex);glAttachShader(linked,fragment);for(var attribute:graphics.attributes().entrySet())glBindAttribLocation(linked,attribute.getValue(),attribute.getKey());
+                ShaderPackProgramCache.retrievable(cacheKey,linked);glLinkProgram(linked);if(glGetProgrami(linked,GL_LINK_STATUS)==GL_FALSE)throw new ShaderPackException(name+": "+glGetProgramInfoLog(linked));
+                ShaderPackProgramCache.store(cacheKey,linked);
+            }
             Matcher declarations=UNIFORM.matcher(all.replaceAll("(?s)/\\*.*?\\*/|//[^\\r\\n]*"," "));
             while(declarations.find())for(String part:declarations.group(2).split(",")){
                 String type=declarations.group(1),field=part.strip();if(uniforms.containsKey(field))continue;
@@ -46,11 +51,20 @@ final class ShaderPackPass implements AutoCloseable {
         finally{if(vertex!=0)glDeleteShader(vertex);if(fragment!=0)glDeleteShader(fragment);if(linked!=0)glDeleteProgram(linked);}
     }
     private int compile(int stage,String source){int shader=glCreateShader(stage);try{glShaderSource(shader,source);glCompileShader(shader);if(glGetShaderi(shader,GL_COMPILE_STATUS)==GL_FALSE)throw new ShaderPackException(name+": "+glGetShaderInfoLog(shader));return shader;}catch(Throwable error){glDeleteShader(shader);throw error;}}
+    /** Sampler units are program state: assigned on first use, not per frame. */
+    void bindSamplers(){
+        if(samplersBound)return;samplersBound=true;
+        for(int unit=0;unit<samplers.size();unit++)glUniform1i(uniforms.get(samplers.get(unit)).location(),unit);
+    }
+    /** Uploads only values that differ from the program's current ones; the program must be bound. */
     void values(Map<String,float[]> values){
         try(MemoryStack stack=MemoryStack.stackPush()){
+            int slot=0;
             for(var entry:uniforms.entrySet()){
                 Uniform uniform=entry.getValue();if(SAMPLERS.contains(uniform.type()))continue;float[] data=values.get(entry.getKey());if(data==null)throw new ShaderPackException(name+": no value for uniform "+entry.getKey());
-                upload(uniform,data,stack);
+                if(uploaded==null)uploaded=new float[uniforms.size()][];
+                if(!Arrays.equals(uploaded[slot],data)){upload(uniform,data,stack);uploaded[slot]=data.clone();}
+                slot++;
             }
         }
     }

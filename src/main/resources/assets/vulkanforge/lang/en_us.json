@@ -25,6 +25,7 @@
   "vulkanforge.shaders.imported": "Added %s shader packs",
   "vulkanforge.shaders.active": "Active: %s",
   "vulkanforge.shaders.loading": "Loading: %s",
+  "vulkanforge.shaders.deferred": "Enable on world entry: %s",
   "vulkanforge.shaders.profile": "Profile",
   "key.vulkanforge.preview": "Toggle Vulkan terrain / menu preview",
   "key.vulkanforge.inset": "Switch Vulkan terrain between full view and inset",

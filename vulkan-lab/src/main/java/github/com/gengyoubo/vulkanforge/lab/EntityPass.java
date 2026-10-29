@@ -465,7 +465,7 @@ final class EntityPass implements AutoCloseable {
                     .pDynamicState(VkPipelineDynamicStateCreateInfo.calloc(stack).sType$Default().pDynamicStates(stack.ints(VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,VK_DYNAMIC_STATE_DEPTH_BIAS)))
                     .layout(layout).basePipelineIndex(-1);
             var handle = stack.mallocLong(1);
-            check(vkCreateGraphicsPipelines(context.device, 0, info, null, handle), "entity pipeline");
+            check(vkCreateGraphicsPipelines(context.device, context.pipelineCache, info, null, handle), "entity pipeline");
             pipelines.put(key, handle.get(0));
             return handle.get(0);
         } finally {

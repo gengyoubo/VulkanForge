@@ -25,6 +25,7 @@
   "vulkanforge.shaders.imported": "已添加 %s 个光影包",
   "vulkanforge.shaders.active": "当前：%s",
   "vulkanforge.shaders.loading": "正在加载：%s",
+  "vulkanforge.shaders.deferred": "将在进入世界时启用：%s",
   "vulkanforge.shaders.profile": "预设",
   "key.vulkanforge.preview": "开关 Vulkan 地形 / 主菜单预览",
   "key.vulkanforge.inset": "切换 Vulkan 地形全屏 / 小窗对照",

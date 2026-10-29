@@ -64,7 +64,7 @@ final class DepthComposite implements AutoCloseable {
                     .pDepthStencilState(VkPipelineDepthStencilStateCreateInfo.calloc(stack).sType$Default().depthTestEnable(true).depthWriteEnable(true).depthCompareOp(VK_COMPARE_OP_LESS_OR_EQUAL))
                     .pColorBlendState(VkPipelineColorBlendStateCreateInfo.calloc(stack).sType$Default().pAttachments(blend))
                     .pDynamicState(VkPipelineDynamicStateCreateInfo.calloc(stack).sType$Default().pDynamicStates(stack.ints(VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR))).layout(layout);
-            var result=stack.mallocLong(1);check(vkCreateGraphicsPipelines(context.device,0,info,null,result),"depth composite pipeline");return result.get(0);
+            var result=stack.mallocLong(1);check(vkCreateGraphicsPipelines(context.device,context.pipelineCache,info,null,result),"depth composite pipeline");return result.get(0);
         } finally { if(vert!=0)vkDestroyShaderModule(context.device,vert,null);if(frag!=0)vkDestroyShaderModule(context.device,frag,null); }
     }
     public void close(){for(long p:pipelines)if(p!=0)vkDestroyPipeline(context.device,p,null);if(pool!=0)vkDestroyDescriptorPool(context.device,pool,null);if(sampler!=0)vkDestroySampler(context.device,sampler,null);if(layout!=0)vkDestroyPipelineLayout(context.device,layout,null);if(setLayout!=0)vkDestroyDescriptorSetLayout(context.device,setLayout,null);}
