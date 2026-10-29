@@ -105,7 +105,9 @@ public final class EntityDraws {
     private EntityDraws() { }
 
     /** RenderType.end() (entities, block entities, item pickups inside the particle window). */
-    public static void draw(RenderType type, BufferBuilder.RenderedBuffer rendered) { drawImmediate(rendered); }
+    public static void draw(RenderType type, BufferBuilder.RenderedBuffer rendered) {
+        if(!NativeHotbarCache.capture(type,rendered))drawImmediate(rendered);
+    }
     /** Tesselator.end() and LevelRenderer's direct uploads - and every such draw outside a capture window. */
     public static void drawImmediate(BufferBuilder.RenderedBuffer rendered) {
         if (GuiDraws.active() && RenderSystem.isOnRenderThread()) { GuiDraws.draw(rendered); return; }

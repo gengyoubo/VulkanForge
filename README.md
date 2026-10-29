@@ -42,6 +42,10 @@ IntelliJ IDEA：导入根目录的 `build.gradle`，将 **Gradle JVM** 和 **Pro
 
 ### 原生 VK 游戏
 
+HUD 独立消融与可选 GUI 图标快速路径的实测、回退范围和启用方法见 [HUD 优化说明](docs/native-hud-optimization.md)。
+
+快捷栏静态物品可选用按槽 GPU 几何缓存，数量与耐久装饰照常更新，动态或未知模型回退。支持集合、缓存失效规则与开关对照见 [快捷栏缓存](docs/native-hotbar-cache.md)。
+
 普通 `runClient` 按 `run/config/vulkanforge-client.toml` 中的 `renderer.mode = "VK"` 启用原生模式；配置页修改模式后重启生效。默认模式仍为 `GL_VK`。也可在隔离的 `run-native` 目录直接启动，不修改普通游戏配置：
 
 ```powershell

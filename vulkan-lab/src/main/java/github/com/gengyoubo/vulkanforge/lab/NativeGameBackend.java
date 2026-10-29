@@ -96,6 +96,7 @@ public final class NativeGameBackend implements AutoCloseable {
     private static final boolean GUI_BATCHING=Boolean.getBoolean("vulkanforge.nativeGuiFastPath");
     private static final boolean DYNAMIC_BATCHING=(Boolean.getBoolean("vulkanforge.nativeModSubmission")||Boolean.getBoolean("vulkanforge.nativeDynamicBatching"))&&!Boolean.getBoolean("vulkanforge.nativeLegacyModSubmission");
     private long residentUnreclaimable,splitResidentBudget,splitDrawLimit,splitVertexLimit,splitWaitNs;
+    private long hotbarResidentDraws,hotbarResidentBytes;
     /** Labelled GPU timestamps; a section runs from its marker to the next one in the same frame. */
     private static final boolean MARKERS=PROFILE||Boolean.getBoolean("vulkanforge.shaderPackProfile");
     private static final int MAX_MARKERS=256,MARKER_WARMUP=120;
@@ -294,19 +295,21 @@ public final class NativeGameBackend implements AutoCloseable {
         beginFrame();NativeShaderProgram program=programs.get((Integer)packet[0]);if(program==null)throw new IllegalStateException("Missing native shader program "+packet[0]);
         int[] ids=(int[])packet[11],overrides=packet.length>13?(int[])packet[13]:null;Texture[] inputs=new Texture[ids.length];for(int i=0;i<ids.length;i++){inputs[i]=textures.get(ids[i]);if(inputs[i]==null)throw new IllegalStateException("Missing native texture "+ids[i]);if(overrides!=null&&overrides[i]>=0)inputs[i]=new Texture(inputs[i].image(),samplers[overrides[i]&255],inputs[i].view());}
         NativeGeometryCache.Buffer vertex=null,index=null;
-        if(program.terrain&&packet.length>12){
+        boolean hotbarResident=packet.length>20&&Boolean.TRUE.equals(packet[20]);
+        if((program.terrain||hotbarResident)&&packet.length>12){
             long[] resource=(long[])packet[12];int[][] ranges=packet.length>18?(int[][])packet[18]:null;
             vertex=resident((int)resource[0],resource[1],(byte[])packet[1],resource.length>6?resource[6]:-1,ranges==null?null:ranges[0]);
             index=resident((int)resource[2],resource[3],(byte[])packet[2],resource.length>7?resource[7]:-1,ranges==null?null:ranges[1]);
         }
+        if(hotbarResident){hotbarResidentDraws++;hotbarResidentBytes+=(vertex==null?0:((byte[])packet[1]).length)+(index==null?0:indexCopyLength(packet));}
         long vertexCopy=vertex==null?((byte[])packet[1]).length:0,indexCopy=index==null?(indexCopyLength(packet)+3)&~3:0;
         if(vertexCopy>MAX_SUBMIT_VERTEX_BYTES)throw new UnsupportedOperationException("Native draw copies "+vertexCopy+" vertex bytes, above the "+MAX_SUBMIT_VERTEX_BYTES+" byte submission limit");
         if(queuedDraws>0&&(queuedDraws+1>MAX_DRAWS||queuedVertexBytes+vertexCopy>MAX_SUBMIT_VERTEX_BYTES)){if(queuedDraws+1>MAX_DRAWS)splitDrawLimit++;else splitVertexLimit++;splitFrame();}
         Target output=target(framebuffer);
         boolean gui=GUI_BATCHING&&guiPacket(packet)&&program.batchableGui;
-        if((gui||DYNAMIC_BATCHING&&program.batchableDynamic)&&multi(packet)==null&&((int[])packet[7])[15]==4&&(Integer)packet[5]>0&&((byte[])packet[1]).length%(Integer)packet[5]==0&&!commands.isEmpty()){
+        if(vertex==null&&index==null&&(gui||DYNAMIC_BATCHING&&program.batchableDynamic)&&multi(packet)==null&&((int[])packet[7])[15]==4&&(Integer)packet[5]>0&&((byte[])packet[1]).length%(Integer)packet[5]==0&&!commands.isEmpty()){
             Object[] previous=commands.get(commands.size()-1);
-            if((Integer)previous[0]==0&&previous[1]==output&&previous[2]==program&&guiPacket((Object[])previous[3])==guiPacket(packet)&&compatibleDynamic((Object[])previous[3],packet)&&Arrays.equals((Texture[])previous[4],inputs)){
+            if((Integer)previous[0]==0&&previous[5]==null&&previous[6]==null&&previous[1]==output&&previous[2]==program&&guiPacket((Object[])previous[3])==guiPacket(packet)&&compatibleDynamic((Object[])previous[3],packet)&&Arrays.equals((Texture[])previous[4],inputs)){
                 @SuppressWarnings("unchecked") List<Object[]> group=(List<Object[]>)previous[7];if(group==null){group=new ArrayList<>();group.add((Object[])previous[3]);previous[7]=group;}group.add(packet);if(gui)guiMergedDraws++;else dynamicMergedDraws++;
                 queuedDraws++;queuedVertexBytes+=vertexCopy;queuedIndexBytes+=indexCopy;return;
             }
@@ -591,6 +594,7 @@ public final class NativeGameBackend implements AutoCloseable {
         result.put("dynamicMergedDraws",dynamicMergedDraws);result.put("dynamicGpuDraws",dynamicGpuDraws);
         result.put("guiMergedDraws",guiMergedDraws);result.put("guiGpuDraws",guiGpuDraws);
         result.put("residentUnreclaimable",residentUnreclaimable);result.put("splitResidentBudget",splitResidentBudget);result.put("splitDrawLimit",splitDrawLimit);result.put("splitVertexLimit",splitVertexLimit);result.put("splitInclusiveNs",splitWaitNs);
+        result.put("hotbarResidentDraws",hotbarResidentDraws);result.put("hotbarResidentBytes",hotbarResidentBytes);
         String[] names={"frames","draws","terrainDraws","entityDraws","vertexBytes","indexBytes","uniformBytes","terrainVertexBytes","terrainIndexBytes","descriptorSets","sceneSubmits","textureBytes","sceneFenceWaitNs","uploadDrainNs","flushInclusiveNs","hostCopyNs","descriptorCpuNs","sceneSubmitNs","descriptorResets","foldedClears","cachedDescriptorSets","framesInFlight","multiDrawPackets","indirectDraws","hoistedInputs","frameSplits","residentReclaims"};
         long[] values={frames,draws,terrainDraws,entityDraws,vertexBytes,indexBytes,uniformBytes,terrainVertexBytes,terrainIndexBytes,descriptorSets,sceneSubmits,textureBytes,sceneFenceWaitNs,uploadDrainNs,flushCpuNs,hostCopyNs,descriptorCpuNs,sceneSubmitNs,descriptorResets,foldedClears,Arrays.stream(slots).mapToLong(frame->frame.persistentDescriptors.size()).sum(),FRAMES,multiDrawPackets,indirectDraws,hoistedInputs,frameSplits,residentReclaims};
         for(int i=0;i<names.length;i++)result.put(names[i],values[i]);long[] upload=context.uploads.stats();result.put("uploadSubmits",upload[0]);result.put("uploadBytes",upload[2]);

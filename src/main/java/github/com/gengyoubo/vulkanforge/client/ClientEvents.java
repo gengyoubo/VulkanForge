@@ -107,7 +107,7 @@ public final class ClientEvents {
 
         @SubscribeEvent
         public static void reload(RegisterClientReloadListenersEvent event) {
-            event.registerReloadListener((ResourceManagerReloadListener) resources -> { VulkanPreview.invalidateWorld(); PostEffects.reset(); });
+            event.registerReloadListener((ResourceManagerReloadListener) resources -> { VulkanPreview.invalidateWorld(); PostEffects.reset(); NativeHotbarCache.resourcesReloaded(); });
         }
 
         @SubscribeEvent

@@ -68,6 +68,7 @@ public final class NativeBootstrap {
         boolean profileChunks=Boolean.getBoolean("vulkanforge.nativeProfile")&&(name.equals("me/jellysquid/mods/sodium/client/render/chunk/RenderSectionManager")||name.equals("me/jellysquid/mods/sodium/client/render/chunk/region/RenderRegionManager"));
         boolean hudHooks=Boolean.getBoolean("vulkanforge.hudDiagnostics")&&(name.equals("net/minecraft/client/gui/Gui")||name.equals("net/minecraftforge/client/gui/overlay/ForgeGui")||name.equals("net/minecraft/client/renderer/ItemInHandRenderer"));
         boolean guiBlitHooks=Boolean.getBoolean("vulkanforge.nativeGuiFastPath")&&name.equals("net/minecraft/client/gui/GuiGraphics");
+        boolean hotbarCache=Boolean.getBoolean("vulkanforge.nativeHotbarCache");
         boolean game = name.startsWith("com/mojang/blaze3d/") || name.startsWith("net/minecraft/client/")
                 || name.startsWith("net/minecraftforge/client/") || name.startsWith("github/com/gengyoubo/vulkanforge/client/")
                 || name.startsWith("net/irisshaders/") || name.startsWith("net/coderbot/iris/") || name.startsWith("net/coderbot/batchedentityrendering/") || embeddium;
@@ -128,6 +129,14 @@ public final class NativeBootstrap {
                 method.instructions.insert(noApi);changed=true;
             }
             for (AbstractInsnNode instruction : method.instructions.toArray()) {
+                if(hotbarCache&&instruction instanceof MethodInsnNode cachedCall){
+                    String hook="github/com/gengyoubo/vulkanforge/client/NativeHotbarCache";
+                    if(name.equals("net/minecraft/client/gui/Gui")&&method.desc.equals("(Lnet/minecraft/client/gui/GuiGraphics;IIFLnet/minecraft/world/entity/player/Player;Lnet/minecraft/world/item/ItemStack;I)V")
+                            &&cachedCall.owner.equals("net/minecraft/client/gui/GuiGraphics")&&cachedCall.desc.equals("(Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/item/ItemStack;III)V")){
+                        cachedCall.setOpcode(Opcodes.INVOKESTATIC);cachedCall.owner=hook;cachedCall.name="renderItem";cachedCall.desc="(Lnet/minecraft/client/gui/GuiGraphics;Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/item/ItemStack;III)V";cachedCall.itf=false;changed=true;continue;
+                    }
+
+                }
                 if(topK&&chlorideSort&&instruction instanceof MethodInsnNode sort&&sort.name.equals("sort")&&sort.owner.equals("java/util/List")&&sort.desc.equals("(Ljava/util/Comparator;)V")){
                     sort.setOpcode(Opcodes.INVOKESTATIC);sort.owner="github/com/gengyoubo/vulkanforge/client/NativeModOptimizations";sort.name="sortLimitedEntities";sort.desc="(Ljava/util/List;Ljava/util/Comparator;)V";sort.itf=false;changed=true;continue;
                 }

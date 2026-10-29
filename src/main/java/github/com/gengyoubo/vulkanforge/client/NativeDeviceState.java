@@ -341,7 +341,7 @@ public final class NativeDeviceState {
         long[] resources={vertexBuffer,vertexVersion,indexBuffer,indexVersion,offset,baseVertex,-1,-1};
         int[][] ranges={take(vertexBuffer,vertexVersion,resources,6),take(indexBuffer,indexVersion,resources,7)};
         Object[] constants=constantSnapshot;if(constants==null){constants=constantAttributes.entrySet().stream().map(entry->new Object[]{entry.getKey(),entry.getValue()}).toArray();constantSnapshot=constants;}
-        NativeGameWindow.draw(drawTarget,new Object[]{currentProgram,vertexBytes,allIndices,type,count,stride,attributes,state,area,raster,values,program.textures,resources,program.overrides,constants,counts,offsets,bases,ranges});
+        NativeGameWindow.draw(drawTarget,new Object[]{currentProgram,vertexBytes,allIndices,type,count,stride,attributes,state,area,raster,values,program.textures,resources,program.overrides,constants,counts,offsets,bases,ranges,false,NativeHotbarCache.drawingResident()});
         if(HUD_DIAGNOSTICS)hudPacketSerial++;
     }
     static boolean guiBlitSupported(int id){

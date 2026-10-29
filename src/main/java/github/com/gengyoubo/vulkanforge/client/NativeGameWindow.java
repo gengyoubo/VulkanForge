@@ -68,7 +68,7 @@ public final class NativeGameWindow {
         else if(name!=GLFW.GLFW_CONTEXT_VERSION_MAJOR&&name!=GLFW.GLFW_CONTEXT_VERSION_MINOR&&name!=GLFW.GLFW_OPENGL_PROFILE&&name!=GLFW.GLFW_OPENGL_FORWARD_COMPAT&&name!=GLFW.GLFW_OPENGL_DEBUG_CONTEXT&&name!=GLFW.GLFW_CONTEXT_CREATION_API)GLFW.glfwWindowHint(name,value);
     }
     public static void swapInterval(int interval){if(backend!=null)call("setVsync",interval!=0);}
-    static void beginFrame(){if(backend!=null){frameSerial++;NativeModDiagnostics.beginFrame();call("beginFrame");}}
+    static void beginFrame(){if(backend!=null){frameSerial++;NativeModDiagnostics.beginFrame();call("beginFrame");NativeHotbarCache.beginFrame();}}
     static long frameSerial(){return frameSerial;}
     static void present() {
         var target=Minecraft.getInstance().getMainRenderTarget();if(target==null)return;
@@ -79,11 +79,11 @@ public final class NativeGameWindow {
     public static long[] stats(){return backend==null?new long[8]:(long[])call("stats");}
     @SuppressWarnings("unchecked") public static Map<String,Long> diagnostics(){
         Map<String,Long> result=new LinkedHashMap<>((Map<String,Long>)call("diagnostics"));
-        result.putAll(NativeDeviceState.diagnostics());result.putAll(NativeEmbeddiumBridge.diagnostics());result.putAll(NativeModOptimizations.diagnostics());result.putAll(NativeModDiagnostics.diagnostics());result.putAll(NativeHudDiagnostics.diagnostics());result.putAll(NativeGuiBlitter.diagnostics());return result;
+        result.putAll(NativeDeviceState.diagnostics());result.putAll(NativeEmbeddiumBridge.diagnostics());result.putAll(NativeModOptimizations.diagnostics());result.putAll(NativeModDiagnostics.diagnostics());result.putAll(NativeHudDiagnostics.diagnostics());result.putAll(NativeGuiBlitter.diagnostics());result.putAll(NativeHotbarCache.diagnostics());return result;
     }
     public static void captureNext(Path path){call("captureNext",path.toAbsolutePath().toString());}
     static void close() {
-        try{if(backend!=null)call("close");}
+        try{if(backend!=null){NativeHotbarCache.clear();call("close");}}
         finally{backend=null;drawHandle=null;methods.clear();try{if(loader!=null)loader.close();}catch(java.io.IOException error){throw new IllegalStateException(error);}finally{loader=null;window=0;}}
     }
 }

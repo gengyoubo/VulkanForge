@@ -148,6 +148,15 @@ tasks.register('smokeNativeGeometry', JavaExec) {
     }
 }
 
+tasks.register('smokeNativeHotbarResident', JavaExec) {
+    dependsOn 'testClasses'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.lab.VkOnlyLauncher'
+    args 'github.com.gengyoubo.vulkanforge.lab.NativeHotbarResidentSmoke'
+    systemProperty 'vulkanforge.nativeDynamicBatching', 'true'
+    if(rootProject.hasProperty('validationSmoke')) systemProperty 'vulkanforge.requireValidation', 'true'
+}
+
 tasks.register('smokeResources', JavaExec) {
     dependsOn 'testClasses'
     classpath = sourceSets.test.runtimeClasspath
