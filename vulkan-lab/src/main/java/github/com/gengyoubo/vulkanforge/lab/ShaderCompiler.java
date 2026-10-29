@@ -45,6 +45,13 @@ final class ShaderCompiler {
         return moduleSource(context,source,resource,kind,false,null);
     }
     static long moduleSource(VulkanContext context,String source,String resource,int kind,boolean optimized,java.util.function.Consumer<ByteBuffer> inspect){
+        java.nio.file.Path cached=null;
+        try{
+            String key="native-glsl-v3/"+context.apiVersion+"/"+kind+"/"+optimized+"/"+source;
+            String hash=java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(key.getBytes(StandardCharsets.UTF_8)));
+            cached=java.nio.file.Path.of(System.getProperty("vulkanforge.shaderCacheDirectory","cache/vulkanforge/spirv")).resolve(hash+".spv");
+            if(java.nio.file.Files.isRegularFile(cached)&&java.nio.file.Files.size(cached)<=32*1024*1024){byte[] raw=java.nio.file.Files.readAllBytes(cached);if(raw.length>=20&&raw.length%4==0){ByteBuffer bytes=org.lwjgl.system.MemoryUtil.memAlloc(raw.length);try{bytes.put(raw).flip();if(bytes.order(java.nio.ByteOrder.LITTLE_ENDIAN).getInt(0)==0x07230203)return createModule(context,bytes,inspect);}finally{org.lwjgl.system.MemoryUtil.memFree(bytes);}}}
+        }catch(IOException|java.security.NoSuchAlgorithmException ignored){}
         long compiler = shaderc_compiler_initialize();
         if (compiler == 0) throw new IllegalStateException("shaderc compiler initialization failed");
         long options = 0, result = 0;
@@ -58,21 +65,24 @@ final class ShaderCompiler {
             result = shaderc_compile_into_spv(compiler, source, kind, resource, "main", options);
             if (result == 0) throw new IllegalStateException("shaderc returned a null compilation result");
             if (shaderc_result_get_compilation_status(result) != shaderc_compilation_status_success) {
+                String diagnostic=System.getProperty("vulkanforge.shaderFailureDirectory");if(diagnostic!=null)try{var folder=java.nio.file.Path.of(diagnostic);java.nio.file.Files.createDirectories(folder);java.nio.file.Files.writeString(folder.resolve(resource.replace('/','_')+".glsl"),source,StandardCharsets.UTF_8);}catch(IOException ignored){}
                 throw new IllegalStateException("Shader compilation failed: " + shaderc_result_get_error_message(result));
             }
             ByteBuffer bytes = shaderc_result_get_bytes(result);
             if (bytes == null) throw new IllegalStateException("shaderc returned no SPIR-V");
-            if (inspect != null) inspect.accept(bytes.asReadOnlyBuffer());
-            try (MemoryStack stack = MemoryStack.stackPush()) {
-                VkShaderModuleCreateInfo info = VkShaderModuleCreateInfo.calloc(stack).sType$Default().pCode(bytes);
-                LongBuffer handle = stack.mallocLong(1);
-                VulkanContext.check(vkCreateShaderModule(context.device, info, null, handle), "vkCreateShaderModule");
-                return handle.get(0);
-            }
+            if(cached!=null)try{java.nio.file.Files.createDirectories(cached.getParent());byte[] raw=new byte[bytes.remaining()];bytes.duplicate().get(raw);var temporary=java.nio.file.Files.createTempFile(cached.getParent(),"shader-",".tmp");try{java.nio.file.Files.write(temporary,raw);java.nio.file.Files.move(temporary,cached,java.nio.file.StandardCopyOption.REPLACE_EXISTING);}finally{java.nio.file.Files.deleteIfExists(temporary);}}catch(IOException ignored){}
+            return createModule(context,bytes,inspect);
         } finally {
             if (result != 0) shaderc_result_release(result);
             if (options != 0) shaderc_compile_options_release(options);
             shaderc_compiler_release(compiler);
+        }
+    }
+    private static long createModule(VulkanContext context,ByteBuffer bytes,java.util.function.Consumer<ByteBuffer> inspect){
+        if(inspect!=null)inspect.accept(bytes.asReadOnlyBuffer());
+        try(MemoryStack stack=MemoryStack.stackPush()){
+            var info=VkShaderModuleCreateInfo.calloc(stack).sType$Default().pCode(bytes);var handle=stack.mallocLong(1);
+            VulkanContext.check(vkCreateShaderModule(context.device,info,null,handle),"vkCreateShaderModule");return handle.get(0);
         }
     }
 }

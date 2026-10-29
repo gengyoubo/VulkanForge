@@ -13,7 +13,10 @@ public final class GameRestart {
 
     /** Called off the render thread. Returns only after the helper has accepted the launch command. */
     static void prepare(Path log) throws Exception {
-        List<String> command = restartCommand();
+        prepare(log, restartCommand());
+    }
+
+    static void prepare(Path log, List<String> command) throws Exception {
         Path directory = Files.createTempDirectory("vulkanforge-restart-");
         Path helper = directory.resolve(GameRestart.class.getName().replace('.', '/') + ".class");
         Process process = null;
@@ -57,6 +60,10 @@ public final class GameRestart {
     }
 
     static List<String> restartCommand() throws IOException {
+        return restartCommand(List.of());
+    }
+
+    static List<String> restartCommand(List<String> bootstrapOptions) throws IOException {
         ProcessHandle.Info info = ProcessHandle.current().info();
         String executable = info.command().orElseThrow(() -> new IOException("Java executable is unavailable"));
         List<String> arguments;
@@ -85,9 +92,12 @@ public final class GameRestart {
         command.add(executable);
         // Expanded JVM arguments and classpath also work when the launcher used a temporary @argfile.
         for (String argument : ManagementFactory.getRuntimeMXBean().getInputArguments()) {
+            if (!bootstrapOptions.isEmpty() && (argument.startsWith("-Dvulkanforge.nativeBootstrapRelaunched=")
+                    || argument.matches("^-javaagent:.*[/\\\\]vulkanforge-native-bootstrap\\.jar(?:=.*)?$"))) continue;
             if (!argument.startsWith("-agentlib:jdwp") && !argument.startsWith("-Xrunjdwp")
                     && !argument.startsWith("-Dvulkanforge.startup=")) command.add(argument);
         }
+        command.addAll(bootstrapOptions);
         if (entry > 0 && arguments.get(entry - 1).equals("-jar")) command.add("-jar");
         else if (entry > 0 && Set.of("-m", "--module").contains(arguments.get(entry - 1))) command.add("--module");
         else {

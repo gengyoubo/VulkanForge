@@ -21,7 +21,7 @@ import org.lwjgl.glfw.GLFW;
 
 @Mod.EventBusSubscriber(modid = VulkanForge.MOD_ID, value = Dist.CLIENT)
 public final class ClientEvents {
-    @SubscribeEvent public static void shaderPackScreen(ScreenEvent.Init.Post event){String name=event.getScreen().getClass().getName();if(event.getScreen() instanceof net.minecraft.client.gui.screens.VideoSettingsScreen||name.endsWith(".SodiumOptionsGUI"))event.addListener(net.minecraft.client.gui.components.Button.builder(Component.translatable("vulkanforge.shaders.title"),button->Minecraft.getInstance().setScreen(new github.com.gengyoubo.vulkanforge.client.shader.ShaderPackScreen(event.getScreen()))).bounds(event.getScreen().width-100,3,96,20).build());}
+    @SubscribeEvent public static void shaderPackScreen(ScreenEvent.Init.Post event){if(github.com.gengyoubo.vulkanforge.client.shader.ShaderPackFrontend.irisAvailable())return;String name=event.getScreen().getClass().getName();if(event.getScreen() instanceof net.minecraft.client.gui.screens.VideoSettingsScreen||name.endsWith(".SodiumOptionsGUI"))event.addListener(net.minecraft.client.gui.components.Button.builder(Component.translatable("vulkanforge.shaders.title"),button->Minecraft.getInstance().setScreen(github.com.gengyoubo.vulkanforge.client.shader.ShaderPackFrontend.screen(event.getScreen()))).bounds(event.getScreen().width-100,3,96,20).build());}
     @SubscribeEvent public static void shaderPackFrame(TickEvent.RenderTickEvent event){if(event.phase==TickEvent.Phase.START)github.com.gengyoubo.vulkanforge.client.shader.ShaderPackRuntime.beginFrame();}
     private static final KeyMapping PREVIEW = new KeyMapping("key.vulkanforge.preview",
             InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_F8, "key.categories.vulkanforge");
@@ -46,7 +46,8 @@ public final class ClientEvents {
     @SubscribeEvent
     public static void terrain(RenderLevelStageEvent event) {
         // This stage carries the view pose; AFTER_LEVEL in 1.20.1 carries a different pose stack.
-        if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_SKY) {VulkanPreview.skyEnd(event);if(github.com.gengyoubo.vulkanforge.client.shader.ShaderPackRuntime.active())github.com.gengyoubo.vulkanforge.client.shader.ShaderPackRuntime.matrices(new org.joml.Matrix4f(com.mojang.blaze3d.systems.RenderSystem.getProjectionMatrix()),new org.joml.Matrix4f(event.getPoseStack().last().pose()));}
+        github.com.gengyoubo.vulkanforge.client.shader.ShaderPackRuntime.stage(event.getStage());
+        if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_SKY) VulkanPreview.skyEnd(event);
         else if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_LEVEL) VulkanPreview.handBegin();
         else if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_CUTOUT_BLOCKS) VulkanPreview.terrain(event);
         else if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_BLOCK_ENTITIES) VulkanPreview.entities();

@@ -7,12 +7,15 @@ import static github.com.gengyoubo.vulkanforge.lab.VulkanContext.check;
 
 final class GpuImage implements VulkanRenderImage {
     private final VulkanContext context;
-    final int width, height;
-    long image, memory, view;
+    final int width, height,format,levels;
+    long image, memory, view,sampledView;
     private GpuMemory.Allocation allocation;
     GpuImage(VulkanContext context, int width, int height, int format, int usage, int aspect) {
+        this(context,width,height,format,usage,aspect,1);
+    }
+    GpuImage(VulkanContext context, int width, int height, int format, int usage, int aspect,int levels) {
         this.context = context;
-        this.width = width; this.height = height;
+        this.width = width; this.height = height;this.format=format;this.levels=levels;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             var imageProps = VkImageFormatProperties.calloc(stack);
             check(vkGetPhysicalDeviceImageFormatProperties(context.physical, format, VK_IMAGE_TYPE_2D,
@@ -25,7 +28,7 @@ final class GpuImage implements VulkanRenderImage {
             if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT && (props.optimalTilingFeatures() & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) == 0) throw new IllegalStateException("D32 depth attachment is unsupported");
             var handle = stack.mallocLong(1);
             var info = VkImageCreateInfo.calloc(stack).sType$Default().imageType(VK_IMAGE_TYPE_2D).format(format)
-                    .extent(e -> e.set(width, height, 1)).mipLevels(1).arrayLayers(1).samples(VK_SAMPLE_COUNT_1_BIT)
+                    .extent(e -> e.set(width, height, 1)).mipLevels(levels).arrayLayers(1).samples(VK_SAMPLE_COUNT_1_BIT)
                     .tiling(VK_IMAGE_TILING_OPTIMAL).usage(usage).sharingMode(VK_SHARING_MODE_EXCLUSIVE);
             check(vkCreateImage(context.device, info, null, handle), "vkCreateImage(world)"); image = handle.get(0);
             var dedicated = VkMemoryDedicatedRequirements.calloc(stack).sType$Default();
@@ -40,6 +43,8 @@ final class GpuImage implements VulkanRenderImage {
                 var viewInfo = VkImageViewCreateInfo.calloc(stack).sType$Default().image(image).viewType(VK_IMAGE_VIEW_TYPE_2D).format(format)
                         .subresourceRange(r -> r.aspectMask(aspect).levelCount(1).layerCount(1));
                 check(vkCreateImageView(context.device, viewInfo, null, handle), "vkCreateImageView(world)"); view = handle.get(0);
+                sampledView=view;
+                if(levels>1){viewInfo.subresourceRange().levelCount(levels);check(vkCreateImageView(context.device,viewInfo,null,handle),"vkCreateImageView(mips)");sampledView=handle.get(0);}
             }
         } catch (Throwable error) { close(); throw error; }
     }
@@ -47,6 +52,7 @@ final class GpuImage implements VulkanRenderImage {
     @Override public long view(){return view;}
     @Override public long image(){return image;}
     @Override public void close() {
+        if(sampledView!=0&&sampledView!=view)vkDestroyImageView(context.device,sampledView,null);sampledView=0;
         if (view != 0) { vkDestroyImageView(context.device, view, null); view = 0; }
         if (image != 0) { vkDestroyImage(context.device, image, null); image = 0; }
         if (allocation != null) { allocation.close(); allocation = null; memory = 0; }

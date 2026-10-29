@@ -7,8 +7,14 @@ run-native/
 run-gl46/
 run-fps/
 run-shaders/
+run-oculus/
+run-own-pack/
+**/cache/vulkanforge/
 run-data/
 .bootstrap/
 hs_err_pid*
 replay_pid*
 __pycache__/
+/bin/
+/vulkan-lab/bin/
+/study/

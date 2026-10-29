@@ -43,7 +43,8 @@ minecraft {
             property 'mixin.env.remapRefMap', 'true'
             property 'mixin.env.refMapRemappingFile', project.file('build/createSrgToMcp/output.srg').absolutePath
             // The agent reads the saved mode before Forge; it stays inert for GL/GL_VK.
-            jvmArg '-javaagent:' + project.file('build/libs/vulkanforge-native-bootstrap.jar').absolutePath
+            if (!project.hasProperty('nativeBootstrapRelaunch'))
+                jvmArg '-javaagent:' + project.file('build/libs/vulkanforge-native-bootstrap.jar').absolutePath
             if (!project.hasProperty('nativeGame') && System.getProperty('vulkanforge.startup') != null)
                 property 'vulkanforge.startup', System.getProperty('vulkanforge.startup')
             if (project.hasProperty('nativeGame')) {
@@ -63,6 +64,27 @@ minecraft {
                 property 'vulkanforge.shaderPackSmoke', shaderMode
                 property 'shaderPack.output', project.file(project.findProperty('shaderPack.output') ?: 'build/reports/shader-packs/' + shaderMode).absolutePath
                 if(project.hasProperty('shaderPack.reference'))property 'shaderPack.reference',project.file(project.property('shaderPack.reference')).absolutePath
+                if(project.hasProperty('shaderPack.unsupported'))property 'shaderPack.unsupported',project.file(project.property('shaderPack.unsupported')).absolutePath
+                mods { vulkanforge { source sourceSets.smoke } }
+            }
+            if(project.hasProperty('ownPackSmoke')){
+                def mode=project.findProperty('ownPackMode') ?: 'VK'
+                workingDirectory project.file('run-own-pack/'+mode)
+                property 'vulkanforge.startup',mode=='VK'?'VK:V1_4':'GL:DEFAULT'
+                property 'vulkanforge.ownPackSmoke',mode
+                property 'ownPack.pack',project.findProperty('ownPackFile') ?: 'ComplementaryReimagined_r5.9.3.zip'
+                property 'ownPack.output',project.file(project.findProperty('ownPack.output') ?: 'build/reports/own-pack/'+mode).absolutePath
+                property 'vulkanforge.shaderFailureDirectory',project.file('build/reports/own-pack/'+mode+'/failed-shaders').absolutePath
+                mods {vulkanforge {source sourceSets.smoke}}
+            }
+            if(project.hasProperty('oculusSmoke')){
+                def mode=project.findProperty('oculusMode') ?: 'VK'
+                workingDirectory project.file('run-oculus/'+mode)
+                property 'vulkanforge.startup',mode=='VK'?'VK:V1_4':'GL:DEFAULT'
+                property 'vulkanforge.oculusSmoke',mode
+                property 'oculusSmoke.output',project.file('build/reports/oculus/'+mode).absolutePath
+                property 'vulkanforge.shaderFailureDirectory',project.file('build/reports/oculus/'+mode+'/failed-shaders').absolutePath
+                property 'vulkanforge.shaderCacheDirectory',project.file('build/cache/native-shaders').absolutePath
                 mods { vulkanforge { source sourceSets.smoke } }
             }
             if (project.hasProperty('gameFps')) {
@@ -149,14 +171,31 @@ minecraft {
     }
 }
 repositories {
+    // Optional local download cache; clean checkouts resolve the same unmodified artifact from Modrinth.
+    maven { url layout.buildDirectory.dir('dependency-cache/maven'); content { includeGroup 'maven.modrinth' } }
+    maven { url 'https://api.modrinth.com/maven'; content { includeGroup 'maven.modrinth' } }
     maven {
         url "https://cursemaven.com"
     }
 }
+configurations { shaderRuntimeMods { transitive=false } }
 dependencies {
     minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
-    if (!project.hasProperty('withoutEmbeddium')) implementation fg.deobf("curse.maven:embeddium-908741:5681725")
+    //if (!project.hasProperty('withoutEmbeddium')) implementation fg.deobf("curse.maven:embeddium-908741:5681725")
+    // Reference implementation is never part of the production loader/runtime bundle.
+    if(project.hasProperty('irisReference')||project.hasProperty('oculusSmoke'))implementation fg.deobf('maven.modrinth:oculus:1.20.1-1.8.0')
     nativeBootstrapImplementation 'org.ow2.asm:asm-tree:9.5'
+    //shaderRuntimeMods 'curse.maven:embeddium-908741:5681725'
+}
+
+tasks.register('shaderRuntimeBundle',Zip){
+    dependsOn 'build','nativeBootstrapJar'
+    archiveFileName='vulkanforge-shader-runtime.zip'
+    destinationDirectory=layout.buildDirectory.dir('distributions')
+    from(tasks.named('jar')){into 'mods'}
+    from(configurations.shaderRuntimeMods){into 'mods'}
+    from(tasks.named('nativeBootstrapJar')){into 'bootstrap'}
+    from('docs/shader-runtime-install.md'){rename { 'README.md' }}
 }
 
 tasks.register('nativeBootstrapJar', Jar) {
@@ -174,6 +213,12 @@ tasks.register('smokeNativeBootstrap', JavaExec) {
     mainClass = 'dev.vulkanforge.bootstrap.NativeBootstrapSmoke'
     javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
 }
+tasks.register('auditIrisGl',JavaExec){
+    dependsOn 'nativeBootstrapTestClasses'
+    classpath=sourceSets.nativeBootstrapTest.runtimeClasspath
+    mainClass='dev.vulkanforge.bootstrap.IrisGlAudit'
+    args file('build/reference-mods/maven/dev/vulkanforge/test/oculus/1.8.0/oculus-1.8.0.jar').absolutePath,file('src/main/java/github/com/gengyoubo/vulkanforge/client/NativeDeviceState.java').absolutePath,file('build/iris-gl-audit.txt').absolutePath
+}
 
 tasks.register('smokeNativeBuffers', JavaExec) {
     dependsOn 'smokeClasses'
@@ -187,8 +232,44 @@ tasks.register('smokeShaderPack', JavaExec) {
     classpath = sourceSets.shaderPackTest.runtimeClasspath
     mainClass = 'github.com.gengyoubo.vulkanforge.shaderpack.ShaderPackSmoke'
 }
+tasks.register('smokeShaderPackUniformInputs',JavaExec){
+    dependsOn 'smokeClasses'
+    classpath=sourceSets.smoke.runtimeClasspath
+    mainClass='github.com.gengyoubo.vulkanforge.client.shader.ShaderPackUniformInputSmoke'
+    args file('run/shaderpacks/ComplementaryReimagined_r5.9.3.zip').absolutePath
+    if(file('run/shaderpacks/MakeUp-UltraFast-9.6.zip').isFile())args file('run/shaderpacks/MakeUp-UltraFast-9.6.zip').absolutePath
+    javaLauncher=javaToolchains.launcherFor {languageVersion=JavaLanguageVersion.of(17)}
+}
+tasks.register('smokeOwnLoader', JavaExec) {
+    dependsOn 'shaderPackTestClasses'
+    classpath = sourceSets.shaderPackTest.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.shaderpack.OwnLoaderSmoke'
+    // Optional real pack; without one only the bundled expression fixtures run.
+    def input=project.file(project.findProperty('shaderPack.input') ?: 'run/shaderpacks/ComplementaryReimagined_r5.9.3.zip')
+    if(input.exists())args input.absolutePath
+}
+tasks.register('inspectShaderPack', JavaExec) {
+    dependsOn 'shaderPackTestClasses'
+    classpath = sourceSets.shaderPackTest.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.shaderpack.ShaderPackInspect'
+    doFirst {if(!project.hasProperty('shaderPack.inspect'))throw new GradleException('Set -PshaderPack.inspect=<ZIP or folder>');args project.file(project.property('shaderPack.inspect')).absolutePath}
+}
 tasks.named('assemble') { dependsOn 'nativeBootstrapJar' }
 tasks.matching { it.name == 'runClient' }.configureEach { dependsOn 'nativeBootstrapJar' }
+if(project.hasProperty('ownPackSmoke'))tasks.matching{it.name=='runClient'}.configureEach{
+    def mode=project.findProperty('ownPackMode') ?: 'VK'
+    def output=file(project.findProperty('ownPack.output') ?: 'build/reports/own-pack/'+mode)
+    doFirst{
+        def directory=file('run-own-pack/'+mode);new File(directory,'shaderpacks').mkdirs();new File(directory,'config').mkdirs();output.mkdirs()
+        new File(directory,'config/vulkanforge-shaders.properties').text='selected=\n'
+        def pack=file('run/shaderpacks/'+(project.findProperty('ownPackFile') ?: 'ComplementaryReimagined_r5.9.3.zip'));new File(directory,'shaderpacks/'+pack.name).bytes=pack.bytes
+        new File(directory,'options.txt').text='renderDistance:3\nsimulationDistance:5\nguiScale:2\nmaxFps:60\nenableVsync:false\nonboardAccessibility:false\nlang:en_us\n'
+        new File(output,'result.txt').text='STATUS=RUNNING\n'
+    }
+    doLast{
+        if(!new File(output,'result.txt').text.contains('STATUS=OK'))throw new GradleException('VulkanForge own pack test failed: '+output)
+    }
+}
 if (project.hasProperty('gameFps')) tasks.matching { it.name == 'runClient' }.configureEach {
     def fpsMode = project.findProperty('fpsMode') ?: 'VK'
     def output = project.file(project.findProperty('fps.output') ?: 'build/reports/game-fps/' + fpsMode)
@@ -219,6 +300,26 @@ if(project.hasProperty('shaderPackSmoke')) tasks.matching { it.name=='runClient'
         }
     }
 }
+if(project.hasProperty('oculusSmoke'))tasks.matching {it.name=='runClient'}.configureEach{
+    def mode=project.findProperty('oculusMode') ?: 'VK'
+    def output=project.file('build/reports/oculus/'+mode)
+    doFirst{
+        if(project.hasProperty('withoutOculus'))throw new GradleException('oculusSmoke requires the Oculus frontend')
+        def directory=project.file('run-oculus/'+mode);directory.mkdirs();new File(directory,'config').mkdirs();new File(directory,'shaderpacks').mkdirs()
+        def pack=project.file('run/shaderpacks/ComplementaryReimagined_r5.9.3.zip');if(!pack.isFile())throw new GradleException('Missing original Complementary ZIP')
+        new File(directory,'shaderpacks/'+pack.name).bytes=pack.bytes
+        new File(directory,'config/oculus.properties').text='enableShaders=true\nshaderPack='+pack.name+'\ncolorSpace=SRGB\nenableDebugOptions=false\ndisableUpdateMessage=true\n'
+        new File(directory,'options.txt').text='renderDistance:4\nsimulationDistance:5\nguiScale:2\nmaxFps:60\nenableVsync:false\nfullscreen:false\nonboardAccessibility:false\nlang:en_us\ntutorialStep:none\n'
+        output.mkdirs();new File(output,'result.txt').text='STATUS=RUNNING\n'
+    }
+    doLast{
+        if(!new File(output,'result.txt').text.contains('STATUS=OK'))throw new GradleException('Full shader pack game smoke failed: '+output)
+        if(mode=='VK'){
+            def backend=new File(project.file('run-oculus/VK'),'logs/vulkanforge/native-game-report.txt');new File(output,'backend.txt').bytes=backend.bytes
+            if(!backend.text.contains('CLOSED=true')||!backend.text.contains('VALIDATION_ERRORS=0'))throw new GradleException('Full pack Vulkan backend did not close cleanly')
+        }
+    }
+}
 if (project.hasProperty('nativeGame') || project.hasProperty('nativeGameSmoke')) tasks.matching { it.name == 'runClient' }.configureEach {
     dependsOn 'nativeBootstrapJar'
     doFirst {
@@ -232,6 +333,14 @@ if (project.hasProperty('nativeGame') || project.hasProperty('nativeGameSmoke'))
         if (project.hasProperty('nativeGameSmoke')) {
             def directory=file(project.hasProperty('nativeGame') ? 'run-native' : 'run')
             def result=new File(directory,'logs/vulkanforge/native-game-smoke/result.txt')
+            if (project.hasProperty('nativeBootstrapRelaunch')) {
+                // The launcher JVM exits before the native child finishes the smoke.
+                def deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(120)
+                def backendReport = new File(directory,'logs/vulkanforge/native-game-report.txt')
+                while (System.nanoTime() < deadline && result.exists() && result.text.contains('STATUS=RUNNING')) Thread.sleep(100)
+                while (System.nanoTime() < deadline && result.text.contains('STATUS=OK')
+                        && (!backendReport.exists() || !backendReport.text.contains('CLOSED=true'))) Thread.sleep(100)
+            }
             if (!result.exists() || !result.text.contains('STATUS=OK')) throw new GradleException('Native game smoke failed; see ' + directory)
             def backend=new File(directory,'logs/vulkanforge/native-game-report.txt')
             if(!backend.exists() || !backend.text.contains('CLOSED=true') || !backend.text.contains('VALIDATION_ERRORS=0')) throw new GradleException('Native backend did not finish cleanly; see ' + backend)
@@ -244,10 +353,11 @@ if (project.hasProperty('nativeGame') || project.hasProperty('nativeGameSmoke'))
 evaluationDependsOn(':vulkan-lab')
 def labJar = project(':vulkan-lab').tasks.named('fatJar')
 tasks.named('processResources', ProcessResources) {
-    dependsOn labJar
+    dependsOn labJar, 'nativeBootstrapJar'
     inputs.property 'version', project.version
     filesMatching('META-INF/mods.toml') { expand version: project.version }
     from(labJar) { into 'vulkanforge'; rename { 'vulkan-lab.jar' } }
+    from(tasks.named('nativeBootstrapJar')) { into 'vulkanforge' }
     from(project(':vulkan-lab').tasks.named('glSpirv')) { into 'assets/vulkanforge/shaders/gl46' }
 }
 tasks.named('jar', Jar) {
@@ -263,6 +373,13 @@ tasks.register('restartSmoke', JavaExec) {
     classpath = files(sourceSets.main.output.classesDirs, sourceSets.smoke.output.classesDirs,
             configurations.runtimeClasspath.filter { it.name.startsWith('jna-') })
     mainClass = 'github.com.gengyoubo.vulkanforge.client.GameRestartSmoke'
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+}
+tasks.register('smokeNativeBootstrapRelaunch', JavaExec) {
+    dependsOn 'compileSmokeJava', 'jar', 'reobfJar'
+    classpath = files(tasks.named('jar'), sourceSets.smoke.output.classesDirs,
+            configurations.runtimeClasspath.filter { it.name.startsWith('jna-') })
+    mainClass = 'github.com.gengyoubo.vulkanforge.client.NativeBootstrapRelaunchSmoke'
     javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
 }
 tasks.register('smokeRenderModeConfig', JavaExec) {

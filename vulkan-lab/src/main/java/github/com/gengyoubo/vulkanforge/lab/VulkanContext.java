@@ -31,6 +31,7 @@ final class VulkanContext implements AutoCloseable {
     /** Opt-in VK_NV_* extensions that were requested; {@link #nvidia} holds what the device actually enabled. */
     final java.util.Set<String> requestedNvidia;
     NvidiaExtensions nvidia = new NvidiaExtensions();
+    boolean legacyVertexAttributes;
     /** Terrain draws through NV task/mesh shaders instead of compute culling + indirect count. */
     boolean meshShaderNV;
     boolean pushDescriptors, pushDescriptorCore;
@@ -190,6 +191,8 @@ final class VulkanContext implements AutoCloseable {
                     .timelineSemaphore(capabilities.timeline()).drawIndirectCount(driven);
             var enabled11 = VkPhysicalDeviceVulkan11Features.calloc(stack).sType$Default().pNext(enabled12.address()).shaderDrawParameters(driven);
             var core = VkPhysicalDeviceFeatures.calloc(stack).multiDrawIndirect(driven).drawIndirectFirstInstance(driven);
+            var graphicsFeatures=VkPhysicalDeviceFeatures.calloc(stack);vkGetPhysicalDeviceFeatures(physical,graphicsFeatures);
+            core.independentBlend(graphicsFeatures.independentBlend()).shaderClipDistance(graphicsFeatures.shaderClipDistance()).shaderCullDistance(graphicsFeatures.shaderCullDistance());
             if(requestPipelineStatistics) {
                 var supported=VkPhysicalDeviceFeatures.calloc(stack);vkGetPhysicalDeviceFeatures(physical,supported);
                 pipelineStatisticsEnabled=supported.pipelineStatisticsQuery();core.pipelineStatisticsQuery(pipelineStatisticsEnabled);
@@ -201,9 +204,15 @@ final class VulkanContext implements AutoCloseable {
                         .swapchainMaintenance1(true).pNext(featureChain).address();
                 nativePresentFences = true;
             }
+            if(hasDeviceExtension(physical,stack,EXTLegacyVertexAttributes.VK_EXT_LEGACY_VERTEX_ATTRIBUTES_EXTENSION_NAME)&&hasDeviceExtension(physical,stack,EXTVertexInputDynamicState.VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME)){
+                var dynamic=VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT.calloc(stack).sType$Default();var legacy=VkPhysicalDeviceLegacyVertexAttributesFeaturesEXT.calloc(stack).sType$Default().pNext(dynamic.address());vkGetPhysicalDeviceFeatures2(physical,VkPhysicalDeviceFeatures2.calloc(stack).sType$Default().pNext(legacy.address()));
+                legacyVertexAttributes=legacy.legacyVertexAttributes()&&dynamic.vertexInputDynamicState();if(legacyVertexAttributes)featureChain=legacy.pNext(dynamic.pNext(featureChain).address()).address();
+            }
+            System.out.println("LEGACY_VERTEX_ATTRIBUTES="+legacyVertexAttributes);
             VkDeviceCreateInfo deviceInfo = VkDeviceCreateInfo.calloc(stack).sType$Default().pQueueCreateInfos(queueInfo)
                     .pNext(featureChain).pEnabledFeatures(core);
             java.util.List<String> deviceExtensions = new java.util.ArrayList<>();
+            if(legacyVertexAttributes){deviceExtensions.add(EXTLegacyVertexAttributes.VK_EXT_LEGACY_VERTEX_ATTRIBUTES_EXTENSION_NAME);deviceExtensions.add(EXTVertexInputDynamicState.VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);}
             if (apiVersion < VK_API_VERSION_1_3) {
                 deviceExtensions.add(KHRDynamicRendering.VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
                 deviceExtensions.add(KHRSynchronization2.VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);

@@ -9,9 +9,10 @@ public final class NativeShaderSmoke {
         org.lwjgl.system.Configuration.STACK_SIZE.set(4096);
         try(VulkanContext context=new VulkanContext()) {
             context.initialize(0,VK.getInstanceVersionSupported(),Boolean.getBoolean("vulkanforge.requireValidation"));
-            String vertex="#version 150\nin vec3 Position;\nin vec4 Color;\nin vec2 UV1;\nuniform mat3 NormalMat;\nuniform vec4 ColorModulator;\nout vec4 vertexColor;\nvoid main(){gl_Position=vec4(NormalMat*Position,1);vertexColor=Color*ColorModulator;}";
-            String fragment="#version 150\nin vec4 vertexColor;\nout vec4 fragColor;\nvoid main(){fragColor=vertexColor;}";
+            String vertex="#version 150\nin vec3 Position;\nin vec4 Color;\nin vec2 UV1;\nuniform mat3 NormalMat;\nuniform vec4 ColorModulator;\nuniform float velocity;\nout vec4 vertexColor;\nvoid main(){gl_Position=vec4(NormalMat*Position,1);vertexColor=Color*ColorModulator;}";
+            String fragment="#version 150\nin vec4 vertexColor;\nuniform float FrameStrength;\nout vec4 fragColor;\nvoid main(){fragColor=vertexColor*FrameStrength;}";
             try(NativeShaderProgram program=new NativeShaderProgram(context,vertex,fragment,Map.of("Position",0,"Color",1,"UV1",2))) {
+                require(program.activeUniforms.containsAll(java.util.Set.of("NormalMat","ColorModulator","FrameStrength"))&&!program.activeUniforms.contains("velocity"),"Optimized uniform reflection lost live fields or retained unused velocity");
                 int[] state={0,1,0,1,0,32774,32774,1,1,515,0,2305,15,6914,0,4,0};
                 int[][] attributes={{0,3,5126,0,0,0,20,41},{1,4,5121,1,0,12,20,41},{2,2,5122,0,1,16,20,41}};
                 long first=program.pipeline(state,attributes,20);

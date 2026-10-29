@@ -1,5 +1,14 @@
 {
+  "vulkanforge.shaders.missing_frontend": "未加载 Oculus 1.8.0，无法运行完整 Iris / OptiFine 光影包。请使用 Gradle runClient，或安装完整光影运行包。详见 docs/shader-runtime-install.md",
+  "vulkanforge.shaders.embeddium_terrain": "已安装 Embeddium：它的区块渲染器会绕过 %s 的世界通道，地形不会使用该光影。在实现 Embeddium 地形接入前，请移除 Embeddium（开发环境：-PwithoutEmbeddium）。",
   "vulkanforge.shaders.title": "光影包",
+  "vulkanforge.shaders.unsupported": "当前加载器尚不能运行 %s。未实现：%s。详见 logs/vulkanforge/shader-pack-compatibility.txt",
+  "vulkanforge.shaders.feature.shadow_composite": "阴影合成通道（shadowcomp）",
+  "vulkanforge.shaders.feature.compute_stages": "计算着色器",
+  "vulkanforge.shaders.feature.geometry_stages": "几何着色器",
+  "vulkanforge.shaders.feature.tessellation_stages": "细分着色器",
+  "vulkanforge.shaders.feature.custom_textures": "自定义纹理",
+  "vulkanforge.shaders.feature.required_features": "必需的 Iris 功能标记",
   "vulkanforge.shaders.off": "关闭光影",
   "vulkanforge.shaders.apply": "应用",
   "vulkanforge.shaders.reload": "重新加载",
@@ -78,5 +87,5 @@
   "vulkanforge.config.mode.vk": "VK（实验）",
   "vulkanforge.config.mode.gl.tooltip": "OpenGL 渲染；支持 GL 4.3～4.6，侧重模组兼容和性能。",
   "vulkanforge.config.mode.gl_vk.tooltip": "Vulkan 绘制已支持的内容，OpenGL 回退；允许共享资源和跨 API 同步。",
-  "vulkanforge.config.mode.vk.tooltip": "原生 Vulkan 游戏渲染：不创建 OpenGL 上下文，地形、实体和 GUI 经 Vulkan 绘制并由 Swapchain 呈现。需要启动时加载 native-bootstrap JVM 引导；Gradle runClient 自动挂载，外部启动器需添加 -javaagent 参数。实验模式，不允许 GL 回退。"
+  "vulkanforge.config.mode.vk.tooltip": "原生 Vulkan 游戏渲染：不创建 OpenGL 上下文，地形、实体和 GUI 经 Vulkan 绘制并由 Swapchain 呈现。引导已内置；普通启动器启动时自动重启一次以启用 VK，无需额外参数。实验模式，不允许 GL 回退。"
 }

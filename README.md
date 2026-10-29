@@ -18,6 +18,13 @@ Minecraft **1.20.1 / Forge 47.4.28 / Java 17** 客户端 Vulkan 渲染实验。
 
 **在原 `INTERLEAVED` 计划中，主窗口最终呈现交给 Vulkan；Windows 主窗口路径中的 WorldScene 已接入同一个 Vulkan 后端，solid、cutout、cutoutMipped 地形通过共享 GPU 纹理合成，正常地形帧不经过 CPU 像素读回或 FrameProtocol。** Vulkan 覆盖范围内的半透明方块与水也由 Vulkan 绘制（含 Fabulous 的独立透明目标），常见实体、方块实体和告示牌文字（P7/P8）、粒子和雨雪（P9）以及云（P10）由 Vulkan 通道回放，天空在地形提交中由 Vulkan 先行绘制（P10）。主颜色/深度及透明后处理目标使用 Vulkan 分配、GL 导入的共享图像；受支持的世界通道直接在这些目标上绘制，不再逐通道复制 GL framebuffer。最终 Vulkan 通道直接采样共享主目标，再将受支持的手持物与 GUI/HUD 依次画进 Swapchain（P11），正常路径没有额外呈现图像、GL framebuffer 复制或 Vulkan blit。范围外地形、不支持的着色器和状态仍在隐藏的 OpenGL 上下文中绘制，但不再向隐藏窗口绘制最终屏幕。关闭主窗口 Vulkan 路径时保留旧的子进程读回预览作为兼容路径。
 
+根据多个模式测试的FPS结果如下
+
+|   | 原生GL | GL46 | GL-VK | VK |
+|---| --- |------|-------| --- |
+| A |     | 827  |       | 760 |
+| B |     |      | 120   ||
+
 ## 构建和启动
 
 使用 JDK 17。若系统默认 `java` 为 Java 8 或较新 JDK，先在当前 PowerShell 会话中设置 `JAVA_HOME`，不要修改全局环境：
@@ -31,7 +38,7 @@ $env:Path = "$env:JAVA_HOME\bin;$env:Path"
 
 IntelliJ IDEA：导入根目录的 `build.gradle`，将 **Gradle JVM** 和 **Project SDK** 设为 Java 17。运行 `.\gradlew.bat genIntellijRuns` 更新已有运行配置，确保 `runClient` 包含 JVM 引导参数。
 
-产物：`build/libs/vulkanforge-0.1.0.jar` 和 `build/libs/vulkanforge-native-bootstrap.jar`。模组 jar 放入 Forge 1.20.1 客户端的 `mods` 文件夹；原生 VK 模式还需将独立引导 jar 配置为启动器 JVM 参数 `-javaagent:<引导 jar 的绝对路径>`。Gradle `runClient` 自动添加该参数，引导在 GL/GL-VK 模式下保持停用。Vulkan 测试程序和运行库已打包，无需另放 LWJGL jar。当前随包提供 Windows/Linux x86_64 原生库；原生游戏模式目前仅实现 Windows。
+正式端只需将 `build/libs/vulkanforge-0.1.0.jar` 放入 Forge 1.20.1 客户端的 `mods` 文件夹。主模组已内置启动引导：选择纯 VK 后，从启动器启动时会自动释放引导并重启一次，在新 JVM 中于 Forge 启动前启用；无需手动安装第二个 JAR 或修改启动器参数。GL/GL-VK 不触发此自动重启。构建仍输出独立的 `build/libs/vulkanforge-native-bootstrap.jar`，供开发与手动启动使用；预先配置 `-javaagent` 可省去自动重启。Gradle `runClient` 自动添加该参数。Vulkan 测试程序和运行库已打包，无需另放 LWJGL jar。当前随包提供 Windows/Linux x86_64 原生库；原生游戏模式目前仅实现 Windows。
 
 ### 原生 VK 游戏
 

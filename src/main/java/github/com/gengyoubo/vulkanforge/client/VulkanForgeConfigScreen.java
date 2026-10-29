@@ -44,7 +44,7 @@ public final class VulkanForgeConfigScreen extends Screen {
     }
 
     @Override protected void init() {
-        addRenderableWidget(Button.builder(Component.translatable("vulkanforge.shaders.title"),button->minecraft.setScreen(new github.com.gengyoubo.vulkanforge.client.shader.ShaderPackScreen(this))).bounds(width-100,3,96,20).build());
+        addRenderableWidget(Button.builder(Component.translatable("vulkanforge.shaders.title"),button->minecraft.setScreen(github.com.gengyoubo.vulkanforge.client.shader.ShaderPackFrontend.screen(this))).bounds(width-100,3,96,20).build());
         int column = 150, gap = 10, left = width / 2 - column - gap / 2, right = width / 2 + gap / 2, y = 36;
         addRenderableWidget(CycleButton.<RenderMode>builder(value -> Component.translatable("vulkanforge.config.mode." + value.name().toLowerCase(Locale.ROOT)))
                 .withValues(RenderMode.values()).withInitialValue(mode)
@@ -95,7 +95,7 @@ public final class VulkanForgeConfigScreen extends Screen {
         vulkanButton.active = vulkan; openGLButton.active = mode==RenderMode.GL;
         planButton.active = mode == RenderMode.GL_VK;
         for (var button : extensionButtons) button.active = vulkan;
-        boolean missingBootstrap=mode==RenderMode.VK&&!Boolean.getBoolean("vulkanforge.nativeBootstrapAvailable");
+        boolean missingBootstrap=mode==RenderMode.VK&&!Boolean.getBoolean("vulkanforge.nativeBootstrapAvailable")&&!NativeBootstrapLauncher.available();
         if(restartButton!=null){restartButton.active=minecraft.level==null&&!missingBootstrap;restartButton.setTooltip(Tooltip.create(Component.translatable(missingBootstrap?"vulkanforge.config.mode.vk.tooltip":minecraft.level!=null?"vulkanforge.config.restart.in_world":"vulkanforge.config.restart.tooltip")));}
     }
 
@@ -109,14 +109,15 @@ public final class VulkanForgeConfigScreen extends Screen {
     }
 
     private void restart() {
-        if (restarting || minecraft.level != null || mode==RenderMode.VK&&!Boolean.getBoolean("vulkanforge.nativeBootstrapAvailable")) return;
+        if (restarting || minecraft.level != null) return;
         try { save(); }
         catch (RuntimeException error) { restartFailed(error, false); return; }
         restarting = true;
         minecraft.setScreen(new GenericDirtMessageScreen(Component.translatable("vulkanforge.config.restarting")));
         java.util.concurrent.CompletableFuture.runAsync(() -> {
             try {
-                GameRestart.prepare(minecraft.gameDirectory.toPath().resolve("logs/vulkanforge/restart.log"));
+                if (mode == RenderMode.VK) NativeBootstrapLauncher.prepareRestart(minecraft.gameDirectory.toPath(), "VK:" + vulkanVersion.name());
+                else GameRestart.prepare(minecraft.gameDirectory.toPath().resolve("logs/vulkanforge/restart.log"));
                 minecraft.execute(minecraft::stop);
             } catch (Exception | LinkageError error) {
                 minecraft.execute(() -> restartFailed(error, true));

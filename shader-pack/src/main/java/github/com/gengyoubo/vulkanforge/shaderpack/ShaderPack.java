@@ -49,16 +49,30 @@ public final class ShaderPack {
     public Map<String,Program> programs(String dimension){return dimensions.getOrDefault(dimension,dimensions.get(""));}
     public List<Program> passes(String dimension,Phase phase){return programs(dimension).values().stream().filter(program->program.phase()==phase).sorted(Comparator.comparingInt(Program::order).thenComparing(Program::name)).toList();}
     public Optional<Program> resolve(String dimension,String requested){Map<String,Program> programs=programs(dimension);for(String name=requested;name!=null;name=FALLBACKS.get(name)){Program program=programs.get(name);if(program!=null&&program.graphics())return Optional.of(program);}return Optional.empty();}
+    /** Next program in the standard fallback hierarchy, e.g. gbuffers_water → gbuffers_terrain. */
+    public static Optional<String> fallback(String name){return Optional.ofNullable(FALLBACKS.get(name));}
     private static Phase phase(String name){if(name.startsWith("gbuffers_"))return Phase.GBUFFER;if(name.equals("shadow")||name.startsWith("shadow_"))return Phase.SHADOW;if(name.startsWith("shadowcomp"))return Phase.SHADOW_COMPOSITE;if(name.startsWith("prepare"))return Phase.PREPARE;if(name.startsWith("deferred"))return Phase.DEFERRED;if(name.startsWith("composite"))return Phase.COMPOSITE;if(name.startsWith("setup"))return Phase.SETUP;if(name.startsWith("begin"))return Phase.BEGIN;if(name.equals("final"))return Phase.FINAL;throw new ShaderPackException("Unknown shader program "+name);}
     private static int order(String name){Matcher suffix=Pattern.compile("(?:setup|begin|shadowcomp|prepare|deferred|composite)([0-9]*)(?:_([a-z]))?").matcher(name);if(!suffix.matches())return 0;int index=suffix.group(1).isEmpty()?0:Integer.parseInt(suffix.group(1));return index*32+(suffix.group(2)==null?31:suffix.group(2).charAt(0)-'a');}
     private static int[] drawBuffers(ShaderPackIncludes.Source fragment){
-        if(fragment==null)return new int[]{0};Matcher directives=OUTPUTS.matcher(fragment.text());int[] output={0};
-        while(directives.find()){
-            String declaration=directives.group(2).replaceAll("\\s+","");
-            if(directives.group(1).equals("DRAWBUFFERS")){output=new int[declaration.length()];for(int i=0;i<output.length;i++)output[i]=declaration.charAt(i)=='N'?-1:declaration.charAt(i)-'0';}
-            else output=declaration.isEmpty()?new int[0]:Arrays.stream(declaration.split(",")).mapToInt(Integer::parseInt).toArray();
-            Set<Integer> used=new HashSet<>();for(int value:output){if(value< -1||value>15)throw new ShaderPackException(fragment.path()+": color target outside 0..15");if(value>=0&&!used.add(value))throw new ShaderPackException(fragment.path()+": duplicate color target "+value);}
-        }return output;
+        if(fragment==null)return new int[]{0};
+        Matcher directives=OUTPUTS.matcher(ShaderPackPreprocessor.active(fragment.text()));
+        String kind=null,declaration=null;
+        while(directives.find()){kind=directives.group(1);declaration=directives.group(2).replaceAll("\\s+","");}
+        if(kind==null)return new int[]{0};
+        int[] output;
+        if(kind.equals("DRAWBUFFERS")){
+            output=new int[declaration.length()];for(int i=0;i<output.length;i++)output[i]=declaration.charAt(i)=='N'?-1:declaration.charAt(i)-'0';
+        }else output=declaration.isEmpty()?new int[0]:Arrays.stream(declaration.split(",")).mapToInt(Integer::parseInt).toArray();
+        Set<Integer> used=new HashSet<>();
+        for(int value:output){
+            if(value< -1||value>15)throw new ShaderPackException(fragment.path()+": active "+kind+" selects unsupported color target "+value+" (0..15)");
+            if(value>=0&&!used.add(value))throw new ShaderPackException(fragment.path()+": duplicate color target "+value);
+        }
+        return output;
+    }
+    public static int[] drawBuffers(Program program,ShaderPackOptions options,Map<String,String> values){
+        var fragment=program.stages().get(Stage.FRAGMENT);if(fragment==null)return new int[]{0};
+        return drawBuffers(new ShaderPackIncludes.Source(fragment.path(),options.apply(fragment.text(),values),fragment.sourceNames()));
     }
     private static Map<String,String> fallbacks(){
         Map<String,String> result=new HashMap<>();String[][] families={{"basic","line","textured","skybasic"},{"textured","textured_lit","skytextured","clouds","beaconbeam","armor_glint","spidereyes"},{"textured_lit","terrain","item","entities","particles","hand","weather"},{"terrain","terrain_solid","terrain_cutout","damagedblock","block","water"},{"entities","entities_translucent","entities_glowing","lightning"},{"particles","particles_translucent"},{"block","block_translucent"},{"hand","hand_water"}};

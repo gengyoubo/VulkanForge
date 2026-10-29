@@ -55,12 +55,15 @@ public final class NativeBootstrap {
     }
     static byte[] rewrite(String name, byte[] bytes) {
         if (name == null) return null;
+        // Capabilities is an immutable data carrier used by compatibility frontends. No GL function pointer is invoked.
+        if(name.equals("org/lwjgl/opengl/GLCapabilities"))return null;
         boolean gl = name.startsWith("org/lwjgl/opengl/");
         boolean early = name.equals("net/minecraftforge/fml/loading/ImmediateWindowHandler");
         boolean glfw = name.equals("org/lwjgl/glfw/GLFW");
         boolean embeddium = name.startsWith("me/jellysquid/mods/sodium/") || name.startsWith("org/embeddedt/embeddium/");
         boolean game = name.startsWith("com/mojang/blaze3d/") || name.startsWith("net/minecraft/client/")
-                || name.startsWith("net/minecraftforge/client/") || name.startsWith("github/com/gengyoubo/vulkanforge/client/") || embeddium;
+                || name.startsWith("net/minecraftforge/client/") || name.startsWith("github/com/gengyoubo/vulkanforge/client/")
+                || name.startsWith("net/irisshaders/") || name.startsWith("net/coderbot/iris/") || name.startsWith("net/coderbot/batchedentityrendering/") || embeddium;
         if (!gl && !early && !glfw && !game) return null;
         ClassNode node = new ClassNode(); new ClassReader(bytes).accept(node, 0);
         boolean changed = false;
@@ -86,6 +89,7 @@ public final class NativeBootstrap {
                 method.instructions.clear();method.instructions.add(new InsnNode(Opcodes.ICONST_0));method.instructions.add(new InsnNode(Opcodes.IRETURN));method.tryCatchBlocks.clear();if(method.localVariables!=null)method.localVariables.clear();changed=true;continue;
             }
             if (gl && (method.access & Opcodes.ACC_ABSTRACT) == 0) {
+                if(method.name.equals("<clinit>")){method.instructions.clear();method.tryCatchBlocks.clear();if(method.localVariables!=null)method.localVariables.clear();method.instructions.add(new InsnNode(Opcodes.RETURN));changed=true;continue;}
                 trap(method, name + "." + method.name); changed = true; continue;
             }
             if (glfw && method.name.equals("glfwMakeContextCurrent")) {

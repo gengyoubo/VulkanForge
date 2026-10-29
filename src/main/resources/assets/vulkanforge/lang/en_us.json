@@ -1,5 +1,14 @@
 {
+  "vulkanforge.shaders.missing_frontend": "Oculus 1.8.0 is missing. Full Iris / OptiFine packs require that frontend. Launch with Gradle runClient or install the shader runtime bundle. See docs/shader-runtime-install.md",
+  "vulkanforge.shaders.embeddium_terrain": "Embeddium is installed: its chunk renderer bypasses the world programs of %s, so terrain would not use the pack. Remove Embeddium (development: -PwithoutEmbeddium) until Embeddium terrain support is implemented.",
   "vulkanforge.shaders.title": "Shader Packs",
+  "vulkanforge.shaders.unsupported": "This loader cannot run %s yet. Missing: %s. See logs/vulkanforge/shader-pack-compatibility.txt",
+  "vulkanforge.shaders.feature.shadow_composite": "shadow composite passes (shadowcomp)",
+  "vulkanforge.shaders.feature.compute_stages": "compute shaders",
+  "vulkanforge.shaders.feature.geometry_stages": "geometry shaders",
+  "vulkanforge.shaders.feature.tessellation_stages": "tessellation shaders",
+  "vulkanforge.shaders.feature.custom_textures": "custom textures",
+  "vulkanforge.shaders.feature.required_features": "required Iris feature flags",
   "vulkanforge.shaders.off": "Shaders OFF",
   "vulkanforge.shaders.apply": "Apply",
   "vulkanforge.shaders.reload": "Reload",
@@ -78,5 +87,5 @@
   "vulkanforge.config.mode.vk": "VK (Experimental)",
   "vulkanforge.config.mode.gl.tooltip": "OpenGL rendering, GL 4.3–4.6 compatibility and performance.",
   "vulkanforge.config.mode.gl_vk.tooltip": "Vulkan draws supported content; OpenGL fallback and shared-resource interop remain available.",
-  "vulkanforge.config.mode.vk.tooltip": "Native Vulkan game rendering: no OpenGL context, Vulkan terrain/entities/GUI and Swapchain presentation. Requires the native-bootstrap JVM agent before Forge starts. Gradle runClient attaches it automatically; external launchers need -javaagent. Experimental, no GL fallback."
+  "vulkanforge.config.mode.vk.tooltip": "Native Vulkan game rendering: no OpenGL context, Vulkan terrain/entities/GUI and Swapchain presentation. Bootstrap is bundled; ordinary launchers automatically restart once to enable VK, with no extra JVM arguments. Experimental, no GL fallback."
 }

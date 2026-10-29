@@ -23,13 +23,15 @@
 
 默认原生 API 为 `V1_4`。普通游戏也支持 JVM 覆盖 `-Dvulkanforge.startup=VK:V1_3`；Gradle 会将该参数转交客户端。
 
-外部启动器需要两个构建产物：将 `build/libs/vulkanforge-0.1.0.jar` 放入 `mods`，将独立的 `build/libs/vulkanforge-native-bootstrap.jar` 放在固定位置，并加入启动器的 **JVM 参数**：
+外部启动器只需安装主模组 `build/libs/vulkanforge-0.1.0.jar`。主模组内置匹配的引导，纯 VK 启动时自动释放到实际游戏目录的 `.vulkanforge/bootstrap/<内容哈希>/`，随后退出当前 JVM，由独立助手等待进程退出并启动带引导的新 JVM。启动参数通过管道传递，保留游戏目录、版本、登录参数与原有 JVM 设置；不会修改启动器配置。引导显式使用实际游戏目录，支持版本隔离与不同工作目录。每次从未配置 agent 的启动器进入 VK 都会自动重启一次；GL/GL_VK 不触发此步骤。失败后会明确停止，不会循环重启或回退 GL。
+
+如需省去自动重启，也可将独立的 `build/libs/vulkanforge-native-bootstrap.jar` 放在固定位置，并加入启动器的 **JVM 参数**：
 
 ```text
 -javaagent:C:\absolute\path\vulkanforge-native-bootstrap.jar
 ```
 
-若路径含空格，应按启动器要求对完整参数加引号。引导默认读取进程工作目录；启动器的工作目录与游戏目录不同时，用 `-javaagent:<引导jar>=<游戏目录>` 指定配置目录。缺少引导时会报告 `REJECTED_MISSING_NATIVE_BOOTSTRAP`，不会尝试隐藏 GL 上下文或回退 GL。旧报错中“backend is not connected”的无条件拒绝已移除。
+若路径含空格，应按启动器要求对完整参数加引号。手动引导默认读取进程工作目录；启动器的工作目录与游戏目录不同时，用 `-javaagent:<引导jar>=<游戏目录>` 指定配置目录。自动重启失败、内置引导缺失或新进程未启用引导时会报告 `REJECTED_MISSING_NATIVE_BOOTSTRAP`，诊断见 `logs/vulkanforge/restart.log`。只将独立引导 JAR 放进 `mods` 不会执行 premain。
 
 ## 游戏渲染路径
 

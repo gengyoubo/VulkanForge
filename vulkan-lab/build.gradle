@@ -103,6 +103,29 @@ tasks.register('smokeNativeShader', JavaExec) {
     args 'github.com.gengyoubo.vulkanforge.lab.NativeShaderSmoke'
     if (rootProject.hasProperty('validationSmoke')) systemProperty 'vulkanforge.requireValidation', 'true'
 }
+tasks.register('smokeOwnShaderCompiler', JavaExec) {
+    dependsOn 'testClasses'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.lab.VkOnlyLauncher'
+    args 'github.com.gengyoubo.vulkanforge.lab.OwnShaderPackCompilerSmoke'
+    systemProperty 'shaderPack.input', rootProject.file(rootProject.findProperty('shaderPack.input') ?: 'run/shaderpacks/ComplementaryReimagined_r5.9.3.zip').absolutePath
+    systemProperty 'shaderPack.output', rootProject.file('build/reports/own-loader-compiler').absolutePath
+    if (rootProject.hasProperty('shaderPack.world')) systemProperty 'shaderPack.world', 'true'
+    // Embeddium's own chunk vertex decoder, read from the unmodified dependency JAR when it is in the Gradle cache.
+    def embeddium = fileTree("${gradle.gradleUserHomeDir}/caches/forge_gradle/deobf_dependencies/curse/maven/embeddium-908741") { include '5681725_mapped_official_*/*.jar'; exclude '**/*sources*' }
+    def decoder = layout.buildDirectory.file('embeddium/assets/sodium/shaders/include/chunk_vertex.glsl').get().asFile
+    doFirst { if (!embeddium.isEmpty()) copy { from(zipTree(embeddium.singleFile)) { include 'assets/sodium/shaders/include/chunk_vertex.glsl' }; into layout.buildDirectory.dir('embeddium') } }
+    systemProperty 'shaderPack.embeddiumInclude', decoder.absolutePath
+    if (rootProject.hasProperty('validationSmoke')) systemProperty 'vulkanforge.requireValidation', 'true'
+}
+tasks.register('smokeNativeMrt', JavaExec) {
+    dependsOn 'testClasses'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.lab.VkOnlyLauncher'
+    args 'github.com.gengyoubo.vulkanforge.lab.NativeMrtSmoke'
+    systemProperty 'vulkanforge.smokeReportDir', rootProject.file('build/reports/native-mrt').absolutePath
+    if (rootProject.hasProperty('validationSmoke')) systemProperty 'vulkanforge.requireValidation', 'true'
+}
 
 tasks.register('smokeNativeGeometry', JavaExec) {
     dependsOn 'testClasses'
