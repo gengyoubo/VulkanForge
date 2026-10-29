@@ -61,13 +61,40 @@ public final class NativeBootstrap {
         boolean early = name.equals("net/minecraftforge/fml/loading/ImmediateWindowHandler");
         boolean glfw = name.equals("org/lwjgl/glfw/GLFW");
         boolean embeddium = name.startsWith("me/jellysquid/mods/sodium/") || name.startsWith("org/embeddedt/embeddium/");
+        boolean modOptimizations=(Boolean.getBoolean("vulkanforge.nativeModSubmission")||Boolean.getBoolean("vulkanforge.nativeRegionBridge"))&&!Boolean.getBoolean("vulkanforge.nativeLegacyModSubmission");
+        boolean topK=(Boolean.getBoolean("vulkanforge.nativeModSubmission")||Boolean.getBoolean("vulkanforge.nativeChlorideTopK"))&&!Boolean.getBoolean("vulkanforge.nativeLegacyModSubmission");
+        boolean chlorideLimit=name.equals("me/srrapero720/chloride/mixins/impl/EntityDistanceCullingMixin$LevelRendererEntityMixin");
+        boolean profileCulling=name.equals("net/minecraft/client/renderer/entity/EntityRenderDispatcher")&&Boolean.getBoolean("vulkanforge.nativeProfile");
+        boolean profileChunks=Boolean.getBoolean("vulkanforge.nativeProfile")&&(name.equals("me/jellysquid/mods/sodium/client/render/chunk/RenderSectionManager")||name.equals("me/jellysquid/mods/sodium/client/render/chunk/region/RenderRegionManager"));
+        boolean hudHooks=Boolean.getBoolean("vulkanforge.hudDiagnostics")&&(name.equals("net/minecraft/client/gui/Gui")||name.equals("net/minecraftforge/client/gui/overlay/ForgeGui")||name.equals("net/minecraft/client/renderer/ItemInHandRenderer"));
+        boolean guiBlitHooks=Boolean.getBoolean("vulkanforge.nativeGuiFastPath")&&name.equals("net/minecraft/client/gui/GuiGraphics");
         boolean game = name.startsWith("com/mojang/blaze3d/") || name.startsWith("net/minecraft/client/")
                 || name.startsWith("net/minecraftforge/client/") || name.startsWith("github/com/gengyoubo/vulkanforge/client/")
                 || name.startsWith("net/irisshaders/") || name.startsWith("net/coderbot/iris/") || name.startsWith("net/coderbot/batchedentityrendering/") || embeddium;
-        if (!gl && !early && !glfw && !game) return null;
-        ClassNode node = new ClassNode(); new ClassReader(bytes).accept(node, 0);
+        if (!gl && !early && !glfw && !game && !(chlorideLimit&&topK) && !profileCulling) return null;
+        ClassNode node = new ClassNode(); new ClassReader(bytes).accept(node, profileCulling||profileChunks||hudHooks||guiBlitHooks?ClassReader.EXPAND_FRAMES:0);
         boolean changed = false;
         for (MethodNode method : node.methods) {
+            int hudScope=hudHooks?hudScope(name,method):-1;if(hudScope>=0){instrumentHud(node.name,method,hudScope);changed=true;}
+            if(guiBlitHooks&&method.desc.equals("(Lnet/minecraft/resources/ResourceLocation;IIIIIFFFF)V")){
+                InsnList code=new InsnList();code.add(new VarInsnNode(Opcodes.ALOAD,0));int at=1;for(Type type:Type.getArgumentTypes(method.desc)){code.add(new VarInsnNode(type.getOpcode(Opcodes.ILOAD),at));at+=type.getSize();}
+                code.add(new MethodInsnNode(Opcodes.INVOKESTATIC,"github/com/gengyoubo/vulkanforge/client/NativeGuiBlitter","tryBlit","(Lnet/minecraft/client/gui/GuiGraphics;Lnet/minecraft/resources/ResourceLocation;IIIIIFFFF)Z",false));LabelNode fallback=new LabelNode();code.add(new JumpInsnNode(Opcodes.IFEQ,fallback));code.add(new InsnNode(Opcodes.RETURN));code.add(fallback);
+                code.add(new FrameNode(Opcodes.F_NEW,11,new Object[]{node.name,"net/minecraft/resources/ResourceLocation",Opcodes.INTEGER,Opcodes.INTEGER,Opcodes.INTEGER,Opcodes.INTEGER,Opcodes.INTEGER,Opcodes.FLOAT,Opcodes.FLOAT,Opcodes.FLOAT,Opcodes.FLOAT},0,null));method.instructions.insert(code);changed=true;
+            }
+            // Mixin reads its classes as resources, outside ClassFileTransformer. Observe/replace the merged target methods.
+            boolean chlorideSort=chlorideLimit||name.equals("net/minecraft/client/renderer/LevelRenderer")&&method.desc.equals("(Lnet/minecraft/client/multiplayer/ClientLevel;)Ljava/lang/Iterable;")&&referencesFieldOwner(method,"me/srrapero720/chloride/ChlorideConfig");
+            int cullingAddon=referencesFieldOwner(method,"me/srrapero720/chloride/ChlorideConfig")?0:referencesFieldOwner(method,"toni/sodiumextras/EmbyConfig")?1:-1;
+            int chunkScope=profileChunks&&method.name.equals("createTerrainRenderList")?0:profileChunks&&method.name.equals("processChunkBuildResults")?1:profileChunks&&method.name.equals("uploadMeshes")&&method.desc.equals("(Lme/jellysquid/mods/sodium/client/gl/device/CommandList;Ljava/util/Collection;)V")?2:-1;
+            if(chunkScope>=0){int timer=addProfileTimer(method);for(AbstractInsnNode exit:method.instructions.toArray())if(exit.getOpcode()==Opcodes.RETURN){InsnList end=new InsnList();end.add(new LdcInsnNode(chunkScope));end.add(new VarInsnNode(Opcodes.LLOAD,timer));if(chunkScope==0)end.add(new InsnNode(Opcodes.ICONST_1));else{end.add(new VarInsnNode(Opcodes.ALOAD,chunkScope==1?1:2));end.add(new MethodInsnNode(Opcodes.INVOKEINTERFACE,"java/util/Collection","size","()I",true));}end.add(new MethodInsnNode(Opcodes.INVOKESTATIC,"github/com/gengyoubo/vulkanforge/client/NativeModDiagnostics","chunkScope","(IJI)V",false));method.instructions.insertBefore(exit,end);}changed=true;}
+            if(profileCulling&&cullingAddon>=0&&method.desc.equals("(Lnet/minecraft/world/entity/Entity;Lnet/minecraft/client/renderer/culling/Frustum;DDDLorg/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable;)V")){
+                int timer=addProfileTimer(method);
+                for(AbstractInsnNode exit:method.instructions.toArray())if(exit.getOpcode()==Opcodes.RETURN){InsnList end=new InsnList();end.add(new LdcInsnNode(cullingAddon));end.add(new VarInsnNode(Opcodes.LLOAD,timer));end.add(new VarInsnNode(Opcodes.ALOAD,1));end.add(new VarInsnNode(Opcodes.ALOAD,9));end.add(new MethodInsnNode(Opcodes.INVOKESTATIC,"github/com/gengyoubo/vulkanforge/client/NativeModDiagnostics","cullingResult","(IJLjava/lang/Object;Ljava/lang/Object;)V",false));method.instructions.insertBefore(exit,end);}changed=true;
+            }
+            if(modOptimizations&&name.equals("me/jellysquid/mods/sodium/client/render/chunk/DefaultChunkRenderer")&&method.name.equals("executeDrawBatch")&&method.desc.equals("(Lme/jellysquid/mods/sodium/client/gl/device/CommandList;Lme/jellysquid/mods/sodium/client/gl/tessellation/GlTessellation;Lme/jellysquid/mods/sodium/client/gl/device/MultiDrawBatch;)V")){
+                method.instructions.clear();method.tryCatchBlocks.clear();if(method.localVariables!=null)method.localVariables.clear();
+                for(int i=0;i<3;i++)method.instructions.add(new VarInsnNode(Opcodes.ALOAD,i));
+                method.instructions.add(new MethodInsnNode(Opcodes.INVOKESTATIC,"github/com/gengyoubo/vulkanforge/client/NativeEmbeddiumBridge","draw","(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V",false));method.instructions.add(new InsnNode(Opcodes.RETURN));changed=true;continue;
+            }
             if(name.equals("me/jellysquid/mods/sodium/mixin/SodiumMixinPlugin")&&method.name.equals("isMixinEnabled")&&method.desc.equals("(Ljava/lang/String;)Z")) {
                 // Plugin-supplied mixins bypass shouldApplyMixin in Mixin 0.8, so filter its list at the existing selector too.
                 InsnList filter=new InsnList();LabelNode original=new LabelNode();filter.add(new VarInsnNode(Opcodes.ALOAD,1));filter.add(new LdcInsnNode("workarounds."));
@@ -101,6 +128,9 @@ public final class NativeBootstrap {
                 method.instructions.insert(noApi);changed=true;
             }
             for (AbstractInsnNode instruction : method.instructions.toArray()) {
+                if(topK&&chlorideSort&&instruction instanceof MethodInsnNode sort&&sort.name.equals("sort")&&sort.owner.equals("java/util/List")&&sort.desc.equals("(Ljava/util/Comparator;)V")){
+                    sort.setOpcode(Opcodes.INVOKESTATIC);sort.owner="github/com/gengyoubo/vulkanforge/client/NativeModOptimizations";sort.name="sortLimitedEntities";sort.desc="(Ljava/util/List;Ljava/util/Comparator;)V";sort.itf=false;changed=true;continue;
+                }
                 if (!(instruction instanceof MethodInsnNode call) || call.getOpcode() != Opcodes.INVOKESTATIC) continue;
                 if (early && method.name.equals("load") && call.owner.endsWith("/FMLConfig") && call.name.equals("getBoolConfigValue")) {
                     InsnList noWindow = new InsnList(); noWindow.add(new InsnNode(Opcodes.POP)); noWindow.add(new InsnNode(Opcodes.ICONST_0));
@@ -121,6 +151,27 @@ public final class NativeBootstrap {
         }
         if (!changed) return null;
         ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_MAXS); node.accept(writer); return writer.toByteArray();
+    }
+    private static int hudScope(String owner,MethodNode method){
+        if(owner.endsWith("/ItemInHandRenderer")&&(method.name.equals("renderHandsWithItems")||method.name.equals("m_109314_"))&&method.desc.equals("(FLcom/mojang/blaze3d/vertex/PoseStack;Lnet/minecraft/client/renderer/MultiBufferSource$BufferSource;Lnet/minecraft/client/player/LocalPlayer;I)V"))return 0;
+        if(owner.endsWith("/Gui")){
+            if((method.name.equals("renderHotbar")||method.name.equals("m_280518_"))&&method.desc.equals("(FLnet/minecraft/client/gui/GuiGraphics;)V"))return 1;
+            if((method.name.equals("renderPlayerHealth")||method.name.equals("m_280173_"))&&method.desc.equals("(Lnet/minecraft/client/gui/GuiGraphics;)V"))return 2;
+        }
+        if((method.name.equals("render")||method.name.equals("m_280421_"))&&method.desc.equals("(Lnet/minecraft/client/gui/GuiGraphics;F)V"))return 3;
+        if(owner.endsWith("/ForgeGui"))return switch(method.name){case "renderHealth"->4;case "renderFood"->5;case "renderArmor"->6;case "renderAir"->7;default->-1;};return -1;
+    }
+    private static void instrumentHud(String owner,MethodNode method,int scope){
+        String hook="github/com/gengyoubo/vulkanforge/client/NativeHudDiagnostics";
+        for(AbstractInsnNode instruction:method.instructions.toArray())if(instruction.getOpcode()==Opcodes.RETURN){InsnList exit=new InsnList();exit.add(new LdcInsnNode(scope));exit.add(new MethodInsnNode(Opcodes.INVOKESTATIC,hook,"exit","(I)V",false));method.instructions.insertBefore(instruction,exit);}
+        List<Object> locals=new ArrayList<>();if((method.access&Opcodes.ACC_STATIC)==0)locals.add(owner);
+        for(Type type:Type.getArgumentTypes(method.desc))locals.add(switch(type.getSort()){case Type.LONG->Opcodes.LONG;case Type.DOUBLE->Opcodes.DOUBLE;case Type.FLOAT->Opcodes.FLOAT;case Type.OBJECT->type.getInternalName();case Type.ARRAY->type.getDescriptor();default->Opcodes.INTEGER;});
+        InsnList enter=new InsnList();LabelNode original=new LabelNode();enter.add(new LdcInsnNode(scope));enter.add(new MethodInsnNode(Opcodes.INVOKESTATIC,hook,"enter","(I)Z",false));enter.add(new JumpInsnNode(Opcodes.IFEQ,original));enter.add(new InsnNode(Opcodes.RETURN));enter.add(original);enter.add(new FrameNode(Opcodes.F_NEW,locals.size(),locals.toArray(),0,null));method.instructions.insert(enter);
+    }
+    private static boolean referencesFieldOwner(MethodNode method,String owner){for(AbstractInsnNode instruction:method.instructions.toArray())if(instruction instanceof FieldInsnNode field&&field.owner.equals(owner))return true;return false;}
+    private static int addProfileTimer(MethodNode method){
+        int timer=method.maxLocals;method.maxLocals+=2;InsnList begin=new InsnList();begin.add(new MethodInsnNode(Opcodes.INVOKESTATIC,"java/lang/System","nanoTime","()J",false));begin.add(new VarInsnNode(Opcodes.LSTORE,timer));method.instructions.insert(begin);
+        for(AbstractInsnNode instruction:method.instructions.toArray())if(instruction instanceof FrameNode frame){int slots=0;for(Object local:frame.local)slots+=local.equals(Opcodes.LONG)||local.equals(Opcodes.DOUBLE)?2:1;while(slots++<timer)frame.local.add(Opcodes.TOP);frame.local.add(Opcodes.LONG);}return timer;
     }
     private static void trap(MethodNode method, String operation) {
         method.access &= ~Opcodes.ACC_NATIVE;

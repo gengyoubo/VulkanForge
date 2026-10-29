@@ -136,6 +136,18 @@ tasks.register('smokeNativeGeometry', JavaExec) {
     if (rootProject.hasProperty('validationSmoke')) systemProperty 'vulkanforge.requireValidation', 'true'
 }
 
+['smokeNativeDynamicBatch','smokeNativeDynamicLegacy'].each { taskName ->
+    tasks.register(taskName, JavaExec) {
+        dependsOn 'testClasses'
+        classpath = sourceSets.test.runtimeClasspath
+        mainClass = 'github.com.gengyoubo.vulkanforge.lab.VkOnlyLauncher'
+        args 'github.com.gengyoubo.vulkanforge.lab.NativeDynamicBatchSmoke'
+        systemProperty 'vulkanforge.nativeModSubmission', 'true'
+        if(taskName.endsWith('Legacy')) systemProperty 'vulkanforge.nativeLegacyModSubmission', 'true'
+        if(rootProject.hasProperty('validationSmoke')) systemProperty 'vulkanforge.requireValidation', 'true'
+    }
+}
+
 tasks.register('smokeResources', JavaExec) {
     dependsOn 'testClasses'
     classpath = sourceSets.test.runtimeClasspath

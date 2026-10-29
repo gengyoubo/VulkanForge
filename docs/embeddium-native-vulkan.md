@@ -33,7 +33,7 @@ GL BufferStorage 与持久映射 staging 路径不适用于无 GL 上下文的�
 
 适配器支持区域缓冲复制、普通范围映射及显式刷新，正确保留源/目标绑定和子区间偏移。已经被绘制快照引用的 arena 在再次写入时进行写时复制，避免排队中的绘制读到后来更新的数据。CPU staging fence 表示同步 CPU 拷贝已完成；它不代替 Vulkan 队列与网格版本的 GPU fence。
 
-区域多重绘制完整保留各命令的索引字节偏移及 `baseVertex`。当前将批次成员依次记录为 Vulkan 索引绘制，还没有改成 Vulkan MDI。未变化的区域几何沿用常驻缓存；更新版本目前仍上传整个对应 arena 缓冲，尚未实现 GPU 子区间更新。
+区域多重绘制完整保留各命令的索引字节偏移及 `baseVertex`，支持 Vulkan MDI。未变化的区域几何沿用常驻缓存；更新版本可以使用设备内复制加脏区 staging 上传。实验性的 Region 桥可从 `DefaultChunkRenderer.executeDrawBatch` 直接进入原生入口，绕过每批 Tessellation 绑定及通用 GL 调用封装；shader、uniform、可见性、批次顺序和资源版本仍使用原流程。Tessellation 对象的建立与缓存尚保留。尚未确认 FPS 收益，默认继续使用兼容入口。
 
 着色器保留 Embeddium 原始压缩顶点、材质、镂空、纹理、光照与雾逻辑。Vulkan 输入类型严格匹配：压缩光照的 unsigned16 先作为 `uvec2` 取值，再转为原 shader 使用的 int32，避免有符号短整数重解释。转换放在原条件编译分支内，非压缩的 `uint` 分支保持独立。显式长度的 shader 源码和 float 数组/scalar vector uniform 也纳入转换。
 
@@ -45,6 +45,7 @@ GL BufferStorage 与持久映射 staging 路径不适用于无 GL 上下文的�
 - 常驻预算：常驻地形预算为最大 device-local 堆的 1/4（256 MiB–2 GiB，`-Dvulkanforge.residentGeometryMB` 覆盖），启动时写入 `RESIDENT_GEOMETRY_BUDGET_MB`。预算不足时先判断释放全部退役版本后能否容纳新缓冲；不能容纳则直接使用流式上传，避免每次绘制都无效拆帧。能容纳时先回收其他帧的退役版本，必要时拆分当前帧后回收。单次提交超过 16384 个绘制或 256 MiB 顶点复制仍拆分提交并等待。`frameSplits` 按 `splitResidentBudget`、`splitDrawLimit`、`splitVertexLimit` 区分原因；`residentUnreclaimable` 记录等待也无法解决的常驻预算回退。
 - 屏障：一次渲染开始时，会把该渲染内所有绘制采样的纹理一并转为只读布局（`hoistedInputs`），后续首次使用的输入不再打断渲染。
 - 调用开销：每次绘制通过绑定到后端的 `MethodHandle` 调用，不再按名称反射；常量顶点属性快照只在 `glVertexAttrib` 改变后重建。
+- 模组层实验：Region 桥缓存不可变顶点布局；动态实体/物品的相邻兼容包共用状态并使用 MDI；Chloride 的实体上限可使用保留原比较器与平局顺序的 Top-K。三项默认关闭，开发启动用 `-PnativeModSubmission` 一并启用，或用 `-PnativeRegionBridge`、`-PnativeDynamicBatching`、`-PnativeChlorideTopK` 单项启用。发布启动器使用同名 `-Dvulkanforge.<选项>=true`。`nativeLegacyModSubmission` 强制关闭三项，用于 A/B。诊断和范围见 [VK-12](vk12-mod-layer.md)。
 
 GPU-driven 剔除（P3）尚未接入 Embeddium 路径：可见性仍由 Embeddium 在 CPU 上计算。
 

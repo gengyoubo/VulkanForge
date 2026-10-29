@@ -9,6 +9,9 @@ public final class NativeDeviceState {
     private static final boolean DIAGNOSTICS=Boolean.getBoolean("vulkanforge.nativeDiagnostics"),PROFILE=Boolean.getBoolean("vulkanforge.nativeProfile");
     private static long adapterCalls,adapterNs,drawAdapterNs,bufferGeneration,terrainSubmissions,unchangedTerrainSubmissions,unchangedTerrainBytes,indexSliceBytes,embeddiumBatches;
     private static long textureGeneration;
+    private static final boolean HUD_DIAGNOSTICS=Boolean.getBoolean("vulkanforge.hudDiagnostics");
+    private static long hudPacketSerial;
+    static long hudPacketSerial(){return hudPacketSerial;}
     private static final int[] EMPTY_RANGES=new int[0],stateScratch=new int[81],areaScratch=new int[8];
     private static int[] stateSnapshot,areaSnapshot;
     private static float[] rasterSnapshot;
@@ -32,7 +35,7 @@ public final class NativeDeviceState {
     private static final Map<Integer,Framebuffer> framebuffers=new HashMap<>();
     private static final class Shader {int type;String source;}
     private static final Map<Integer,Shader> shaders=new HashMap<>();
-    private static final class Program {final List<Integer> shaders=new ArrayList<>();final Map<String,Integer> attributes=new LinkedHashMap<>(),outputs=new LinkedHashMap<>();final Map<String,float[]> values=new LinkedHashMap<>();final Map<String,Object[]> entries=new LinkedHashMap<>();Object[] snapshot;String[] samplers={};int[] textureScratch,overrideScratch,textures,overrides;List<NativeUniformInfo.Uniform> uniforms=List.of();boolean linked,terrain;}
+    private static final class Program {final List<Integer> shaders=new ArrayList<>();final Map<String,Integer> attributes=new LinkedHashMap<>(),outputs=new LinkedHashMap<>();final Map<String,float[]> values=new LinkedHashMap<>();final Map<String,Object[]> entries=new LinkedHashMap<>();Object[] snapshot;String[] samplers={};int[] textureScratch,overrideScratch,textures,overrides;List<NativeUniformInfo.Uniform> uniforms=List.of();Boolean guiBlit;boolean linked,terrain;}
     private static final Map<Integer,Program> programs=new HashMap<>();
     private static final class Sampler {int flags=56;boolean whiteBorder;final Map<Integer,Integer> parameters=new HashMap<>();}
     private static final Map<Integer,Sampler> samplerObjects=new HashMap<>();
@@ -160,7 +163,7 @@ public final class NativeDeviceState {
                 while(inputs.find()){String name=inputs.group(2);if(inputs.group(1)!=null)program.attributes.put(name,Integer.parseInt(inputs.group(1)));else if(!program.attributes.containsKey(name)){int slot=0;while(program.attributes.containsValue(slot))slot++;program.attributes.put(name,slot);}}
                 Object[] attributes=program.attributes.entrySet().stream().map(entry->new Object[]{entry.getKey(),entry.getValue()}).toArray();
                 Object[] outputs=program.outputs.entrySet().stream().map(entry->new Object[]{entry.getKey(),entry.getValue()}).toArray();
-                program.samplers=(String[])NativeGameWindow.call("programWithOutputs",value,vertex,fragment,attributes,outputs);Set<String> active=Set.of((String[])NativeGameWindow.call("programUniforms",value));program.uniforms=NativeUniformInfo.read(vertex+"\n"+fragment,Set.of(program.samplers)).stream().filter(uniform->active.contains(uniform.name())).toList();program.linked=true;return null;}
+                program.samplers=(String[])NativeGameWindow.call("programWithOutputs",value,vertex,fragment,attributes,outputs);Set<String> active=Set.of((String[])NativeGameWindow.call("programUniforms",value));program.uniforms=NativeUniformInfo.read(vertex+"\n"+fragment,Set.of(program.samplers)).stream().filter(uniform->active.contains(uniform.name())).toList();program.guiBlit=null;program.linked=true;return null;}
             case "glGetProgrami":return programParameter(number(a,0),number(a,1));
             case "glGetProgramiv":{int value=programParameter(number(a,0),number(a,1));if(a[2] instanceof int[] out)out[0]=value;else ((IntBuffer)a[2]).put(((IntBuffer)a[2]).position(),value);return null;}
             case "glGetActiveUniform":{var uniform=programs.get(number(a,0)).uniforms.get(number(a,1));((IntBuffer)a[3]).put(((IntBuffer)a[3]).position(),uniform.count());((IntBuffer)a[4]).put(((IntBuffer)a[4]).position(),NativeUniformInfo.type(uniform.type()));String name=uniform.activeName();return name.substring(0,Math.min(name.length(),Math.max(0,number(a,2)-1)));}
@@ -298,19 +301,28 @@ public final class NativeDeviceState {
         if(count==0)return;submit(mode,count,type,offset,baseVertex,null,null,null);
     }
     /** A whole glMultiDrawElementsBaseVertex as one packet: shared state is captured once and the ranges travel as arrays. */
-    private static void multiDraw(int mode,int type,long counts,long offsets,long bases,int draws){
+    private static void multiDraw(int mode,int type,long counts,long offsets,long bases,int draws){multiDraw(mode,type,counts,offsets,bases,draws,0,0,null);}
+    static void regionDraw(int vertex,int index,int[][] attributes,long counts,long offsets,long bases,int draws){
+        embeddiumBatches++;multiDraw(4,5125,counts,offsets,bases,draws,vertex,index,attributes);
+    }
+    private static void multiDraw(int mode,int type,long counts,long offsets,long bases,int draws,int vertex,int index,int[][] layout){
         int[] count=new int[draws],offset=new int[draws],base=new int[draws];int used=0,total=0;
         for(int i=0;i<draws;i++){int c=MemoryUtil.memGetInt(counts+i*4L);if(c==0)continue;count[used]=c;offset[used]=Math.toIntExact(MemoryUtil.memGetAddress(offsets+i*(long)org.lwjgl.system.Pointer.POINTER_SIZE));base[used]=bases==0?0:MemoryUtil.memGetInt(bases+i*4L);total=Math.addExact(total,c);used++;}
         if(used==0)return;
-        if(used==1){submit(mode,count[0],type,offset[0],base[0],null,null,null);return;}
-        submit(mode,total,type,0,0,Arrays.copyOf(count,used),Arrays.copyOf(offset,used),Arrays.copyOf(base,used));
+        if(used==1){submit(mode,count[0],type,offset[0],base[0],null,null,null,vertex,index,layout);return;}
+        submit(mode,total,type,0,0,used==draws?count:Arrays.copyOf(count,used),used==draws?offset:Arrays.copyOf(offset,used),used==draws?base:Arrays.copyOf(base,used),vertex,index,layout);
     }
     private static void submit(int mode,int count,int type,long offset,int baseVertex,int[] counts,int[] offsets,int[] bases) {
-        prepareTarget(drawTarget);if(on(3058)||on(2960))throw unsupported("logic-op/stencil draw");Program program=program();VertexArray array=array();
-        int[][] attributes=array.layout;if(attributes==null){attributes=array.enabled.stream().sorted().map(array.attributes::get).filter(Objects::nonNull).toArray(int[][]::new);array.layout=attributes;}if(attributes.length==0)throw new IllegalStateException("Native draw has no vertex attributes");int stride=attributes[0][6],vertexBuffer=attributes[0][7];
+        submit(mode,count,type,offset,baseVertex,counts,offsets,bases,0,0,null);
+    }
+    private static void submit(int mode,int count,int type,long offset,int baseVertex,int[] counts,int[] offsets,int[] bases,int regionVertex,int regionIndex,int[][] regionLayout) {
+        prepareTarget(drawTarget);if(on(3058)||on(2960))throw unsupported("logic-op/stencil draw");Program program=program();
+        int[][] attributes=regionLayout;int indexBuffer=regionIndex;
+        if(attributes==null){VertexArray array=array();indexBuffer=array.indices;attributes=array.layout;if(attributes==null){attributes=array.enabled.stream().sorted().map(array.attributes::get).filter(Objects::nonNull).toArray(int[][]::new);array.layout=attributes;}}
+        if(attributes.length==0)throw new IllegalStateException("Native draw has no vertex attributes");int stride=attributes[0][6],vertexBuffer=regionLayout==null?attributes[0][7]:regionVertex;
         for(int[] attr:attributes)if(attr[6]!=stride||attr[7]!=vertexBuffer)throw unsupported("multiple native vertex streams");
-        byte[] vertexBytes=Objects.requireNonNull(buffers.get(vertexBuffer),"Native vertex data"),allIndices=Objects.requireNonNull(buffers.get(array.indices),"Native index data");int indexBytes=type==5123?2:type==5125?4:0;if(indexBytes==0)throw unsupported("native index type "+type);
-        sharedBufferSnapshots.add(vertexBuffer);sharedBufferSnapshots.add(array.indices);
+        byte[] vertexBytes=Objects.requireNonNull(buffers.get(vertexBuffer),"Native vertex data"),allIndices=Objects.requireNonNull(buffers.get(indexBuffer),"Native index data");int indexBytes=type==5123?2:type==5125?4:0;if(indexBytes==0)throw unsupported("native index type "+type);
+        sharedBufferSnapshots.add(vertexBuffer);sharedBufferSnapshots.add(indexBuffer);
         if(counts==null)Objects.checkFromIndexSize(Math.toIntExact(offset),Math.multiplyExact(count,indexBytes),allIndices.length);
         else for(int i=0;i<counts.length;i++){if(offsets[i]%indexBytes!=0)throw unsupported("unaligned native multi-draw index offset");Objects.checkFromIndexSize(offsets[i],Math.multiplyExact(counts[i],indexBytes),allIndices.length);}
         if(DIAGNOSTICS){
@@ -323,17 +335,32 @@ public final class NativeDeviceState {
         int[] textures=program.textureScratch,samplerOverrides=program.overrideScratch;Arrays.fill(samplerOverrides,-1);for(int i=0;i<textures.length;i++){float[] value=program.values.get(program.samplers[i]);int unit=value==null?0:(int)value[0];textures[i]=boundTextures[unit];ensureTexture(textures[i]);if(boundSamplers[unit]!=0){Sampler sampler=Objects.requireNonNull(samplerObjects.get(boundSamplers[unit]));samplerOverrides[i]=sampler.flags|((sampler.flags&64)!=0&&!sampler.whiteBorder?128:0);}}
         if(!Arrays.equals(program.textures,textures))program.textures=textures.clone();if(!Arrays.equals(program.overrides,samplerOverrides))program.overrides=samplerOverrides.clone();
         int[] state=drawState(mode);
-        Framebuffer fb=framebuffers.get(drawTarget);boolean clipped=on(3089);int x=clipped?Math.max(0,scissor[0]):0,y=clipped?Math.max(0,scissor[1]):0;
-        System.arraycopy(viewport,0,areaScratch,0,4);areaScratch[4]=x;areaScratch[5]=y;areaScratch[6]=Math.max(0,(clipped?Math.min(fb.width,scissor[0]+scissor[2]):fb.width)-x);areaScratch[7]=Math.max(0,(clipped?Math.min(fb.height,scissor[1]+scissor[3]):fb.height)-y);
-        if(!Arrays.equals(areaSnapshot,areaScratch))areaSnapshot=areaScratch.clone();
-        if(rasterSnapshot==null||Float.compare(rasterSnapshot[0],offsetFactor)!=0||Float.compare(rasterSnapshot[1],offsetUnits)!=0)rasterSnapshot=new float[]{offsetFactor,offsetUnits};
+        int[] area=drawArea();float[] raster=drawRaster();
         Object[] values=program.snapshot;if(values==null){values=program.entries.values().toArray();program.snapshot=values;}
-        long vertexVersion=bufferVersions.getOrDefault(vertexBuffer,0L),indexVersion=bufferVersions.getOrDefault(array.indices,0L);
-        long[] resources={vertexBuffer,vertexVersion,array.indices,indexVersion,offset,baseVertex,-1,-1};
-        int[][] ranges={take(vertexBuffer,vertexVersion,resources,6),take(array.indices,indexVersion,resources,7)};
+        long vertexVersion=bufferVersions.getOrDefault(vertexBuffer,0L),indexVersion=bufferVersions.getOrDefault(indexBuffer,0L);
+        long[] resources={vertexBuffer,vertexVersion,indexBuffer,indexVersion,offset,baseVertex,-1,-1};
+        int[][] ranges={take(vertexBuffer,vertexVersion,resources,6),take(indexBuffer,indexVersion,resources,7)};
         Object[] constants=constantSnapshot;if(constants==null){constants=constantAttributes.entrySet().stream().map(entry->new Object[]{entry.getKey(),entry.getValue()}).toArray();constantSnapshot=constants;}
-        NativeGameWindow.draw(drawTarget,new Object[]{currentProgram,vertexBytes,allIndices,type,count,stride,attributes,state,areaSnapshot,rasterSnapshot,values,program.textures,resources,program.overrides,constants,counts,offsets,bases,ranges});
+        NativeGameWindow.draw(drawTarget,new Object[]{currentProgram,vertexBytes,allIndices,type,count,stride,attributes,state,area,raster,values,program.textures,resources,program.overrides,constants,counts,offsets,bases,ranges});
+        if(HUD_DIAGNOSTICS)hudPacketSerial++;
     }
+    static boolean guiBlitSupported(int id){
+        Program program=programs.get(id);if(program==null||!program.linked||currentProgram!=0||boundSamplers[0]!=0||on(3058)||on(2960))return false;
+        if(program.guiBlit==null){boolean supported=program.attributes.size()==2&&program.attributes.getOrDefault("Position",-1)==0&&program.attributes.getOrDefault("UV0",-1)==1&&program.samplers.length==1&&program.samplers[0].equals("Sampler0");
+            for(var uniform:program.uniforms)supported&=uniform.count()==1&&switch(uniform.name()){case "ModelViewMat","ProjMat"->uniform.type().equals("mat4");case "ColorModulator"->uniform.type().equals("vec4");case "Sampler0"->uniform.type().equals("sampler2D");default->false;};program.guiBlit=supported;
+        }return program.guiBlit;
+    }
+    private static final int[][] GUI_LAYOUT={{0,3,5126,0,0,0,20,0},{1,2,5126,0,0,12,20,0}};
+    private static final byte[] GUI_INDICES={0,0,1,0,2,0,2,0,3,0,0,0};
+    private static final Object[] NO_CONSTANTS=new Object[0];
+    private static final int[] GUI_SAMPLERS={-1};
+    static void guiBlit(int shader,int texture,byte[] vertices,Object[] uniforms){
+        prepareTarget(drawTarget);ensureTexture(texture);
+        NativeGameWindow.draw(drawTarget,new Object[]{shader,vertices,GUI_INDICES,5123,6,20,GUI_LAYOUT,drawState(4),drawArea(),drawRaster(),uniforms,new int[]{texture},new long[8],GUI_SAMPLERS,NO_CONSTANTS,null,null,null,null,Boolean.TRUE});
+        if(HUD_DIAGNOSTICS)hudPacketSerial++;
+    }
+    private static int[] drawArea(){Framebuffer fb=framebuffers.get(drawTarget);boolean clipped=on(3089);int x=clipped?Math.max(0,scissor[0]):0,y=clipped?Math.max(0,scissor[1]):0;System.arraycopy(viewport,0,areaScratch,0,4);areaScratch[4]=x;areaScratch[5]=y;areaScratch[6]=Math.max(0,(clipped?Math.min(fb.width,scissor[0]+scissor[2]):fb.width)-x);areaScratch[7]=Math.max(0,(clipped?Math.min(fb.height,scissor[1]+scissor[3]):fb.height)-y);if(!Arrays.equals(areaSnapshot,areaScratch))areaSnapshot=areaScratch.clone();return areaSnapshot;}
+    private static float[] drawRaster(){if(rasterSnapshot==null||Float.compare(rasterSnapshot[0],offsetFactor)!=0||Float.compare(rasterSnapshot[1],offsetUnits)!=0)rasterSnapshot=new float[]{offsetFactor,offsetUnits};return rasterSnapshot;}
     /** Scratch arrays never leave the adapter; queued packets retain immutable snapshots across later state changes. */
     private static int[] drawState(int mode){
         int[] state=stateScratch;state[0]=on(3042)?1:0;state[1]=src;state[2]=dst;state[3]=srcAlpha;state[4]=dstAlpha;state[5]=equation;state[6]=equationAlpha;state[7]=on(2929)&&framebuffers.get(drawTarget).depth>0?1:0;state[8]=depthMask?1:0;state[9]=depthFunc;state[10]=on(2884)?cullFace:0;state[11]=frontFace;state[12]=colorMask;state[13]=6914;state[14]=on(32823)?1:0;state[15]=mode;state[16]=0;

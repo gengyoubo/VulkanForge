@@ -19,7 +19,26 @@ public final class NativeBuffersSmoke {
         long fence=(Long)call("glFenceSync",37143,0);require((Integer)call("glClientWaitSync",fence,0,0L)==37146,"CPU copy completion fence");call("glDeleteSync",fence);
         try{call("glClientWaitSync",fence,0,0L);throw new AssertionError("Deleted CPU fence accepted");}catch(UnsupportedOperationException expected){}
         snapshotsAndDirtyRanges();
+        stableTopK();
+        guiFallbackSignature();
         System.out.println("NATIVE_BUFFERS_SMOKE=OK (partial maps, arena copy bindings/offsets, explicit flush, CPU copy fences, no OpenGL)");
+    }
+    @SuppressWarnings("unchecked") private static void guiFallbackSignature(){try{
+        Class<?> type=Class.forName(NativeDeviceState.class.getName()+"$Program");var constructor=type.getDeclaredConstructor();constructor.setAccessible(true);Object program=constructor.newInstance();
+        var programs=NativeDeviceState.class.getDeclaredField("programs");programs.setAccessible(true);((java.util.Map<Integer,Object>)programs.get(null)).put(990,program);
+        var linked=type.getDeclaredField("linked");linked.setAccessible(true);linked.setBoolean(program,true);var attributes=type.getDeclaredField("attributes");attributes.setAccessible(true);var layout=(java.util.Map<String,Integer>)attributes.get(program);layout.put("Position",0);layout.put("UV0",1);
+        var samplers=type.getDeclaredField("samplers");samplers.setAccessible(true);samplers.set(program,new String[]{"Sampler0"});var uniforms=type.getDeclaredField("uniforms");uniforms.setAccessible(true);String source="uniform mat4 ModelViewMat; uniform mat4 ProjMat; uniform vec4 ColorModulator; uniform sampler2D Sampler0;";uniforms.set(program,NativeUniformInfo.read(source,java.util.Set.of("Sampler0")));
+        require(NativeDeviceState.guiBlitSupported(990),"Standard GUI shader was rejected");var cached=type.getDeclaredField("guiBlit");cached.setAccessible(true);cached.set(program,null);uniforms.set(program,NativeUniformInfo.read(source+" uniform float CustomTint;",java.util.Set.of("Sampler0")));require(!NativeDeviceState.guiBlitSupported(990),"Custom GUI uniform bypassed compatibility fallback");
+        cached.set(program,null);uniforms.set(program,NativeUniformInfo.read(source,java.util.Set.of("Sampler0")));layout.put("UV0",7);require(!NativeDeviceState.guiBlitSupported(990),"Custom GUI input locations bypassed compatibility fallback");
+    }catch(ReflectiveOperationException error){throw new AssertionError(error);}}
+    private static void stableTopK(){
+        record Item(int value,int original) { }
+        var random=new java.util.Random(12012);var order=java.util.Comparator.comparingInt(Item::value);
+        for(int count:new int[]{0,1,10,100,1000})for(int maximum:new int[]{0,1,5,20,99,2000}){
+            var original=new java.util.ArrayList<Item>();for(int i=0;i<count;i++)original.add(new Item(random.nextInt(8),i));
+            var expected=new java.util.ArrayList<>(original);expected.sort(order);expected.subList(Math.min(maximum,count),expected.size()).clear();
+            NativeModOptimizations.selectStable(original,order,maximum);require(original.equals(expected),"Top-K changed stable selection for n="+count+", k="+maximum);
+        }
     }
     @SuppressWarnings("unchecked") private static void snapshotsAndDirtyRanges(){
         try{

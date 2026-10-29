@@ -97,7 +97,7 @@ minecraft {
                 property 'vulkanforge.startup', fpsMode == 'VK' ? 'VK:V1_4' : fpsMode == 'GL46' ? 'GL:GL_4_6' : 'GL:DEFAULT'
                 property 'vulkanforge.gameFps', fpsMode
                 property 'fps.output', project.file(project.findProperty('fps.output') ?: 'build/reports/game-fps/' + fpsMode).absolutePath
-                ['seconds','warmup','rounds','width','height','distance'].each { option ->
+                ['seconds','warmup','rounds','width','height','distance','cows','items','entityLimit','updates','hudCases','survivalHud'].each { option ->
                     if (project.hasProperty('fps.' + option)) property 'fps.' + option, project.property('fps.' + option)
                 }
                 property 'vulkanforge.gl46.profileGpu', 'false'
@@ -107,6 +107,12 @@ minecraft {
             }
             if (project.hasProperty('nativeDiagnostics') || project.hasProperty('nativeProfile')) property 'vulkanforge.nativeDiagnostics', 'true'
             if (project.hasProperty('nativeProfile')) property 'vulkanforge.nativeProfile', 'true'
+            if(project.hasProperty('hudAblation')){property 'vulkanforge.hudDiagnostics','true';property 'fps.hudCases',project.findProperty('fps.hudCases') ?: 'BASELINE,NO_HANDS,NO_HOTBAR,NO_HEALTH,NO_HUD,F1,NO_HANDS_HUD'}
+            if(project.hasProperty('guiFastCompare')){property 'vulkanforge.nativeGuiFastPath','true';property 'fps.guiCompare','true'}
+            if (project.hasProperty('nativeLegacyModSubmission')) property 'vulkanforge.nativeLegacyModSubmission', 'true'
+            ['nativeModSubmission','nativeRegionBridge','nativeDynamicBatching','nativeChlorideTopK','nativeGuiFastPath'].each { option ->
+                if(project.hasProperty(option)) property 'vulkanforge.'+option,'true'
+            }
             ['vulkanforge.entityProfile', 'vulkanforge.entityLegacyBatch', 'vulkanforge.noInteropOptimizations', 'vulkanforge.earlyGlInputFlush', 'vulkanforge.glTailCompatibility'].each { key ->
                 if (System.getProperty(key) != null) property key, System.getProperty(key)
             }

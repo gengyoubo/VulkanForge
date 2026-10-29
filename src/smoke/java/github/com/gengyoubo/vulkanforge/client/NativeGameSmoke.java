@@ -81,6 +81,8 @@ public final class NativeGameSmoke {
         int visible=(Integer)type.getMethod("getVisibleChunkCount").invoke(renderer);
         var stats=NativeGameWindow.diagnostics();
         require(visible>0&&stats.getOrDefault("embeddiumMultiDrawBatches",0L)>0&&stats.getOrDefault("embeddiumTerrainDraws",0L)>0,"Embeddium's actual terrain renderer did not submit visible chunks to Vulkan");
+        if((Boolean.getBoolean("vulkanforge.nativeModSubmission")||Boolean.getBoolean("vulkanforge.nativeRegionBridge"))&&!Boolean.getBoolean("vulkanforge.nativeLegacyModSubmission"))require(stats.getOrDefault("regionBridgeBatches",0L)>0,"Native region batch bridge was not exercised");
+        if(Boolean.getBoolean("vulkanforge.nativeProfile")){require(stats.getOrDefault("visibilityGraphCalls",0L)>0,"Chunk graph profiling hook was not exercised");if(net.minecraftforge.fml.ModList.get().isLoaded("chloride"))require(stats.getOrDefault("chlorideCullingCalls",0L)>0,"Chloride callback profiling hook was not exercised");}
         Files.writeString(report.resolve("embeddium.txt"),"RENDERER="+type.getName()+"\nVISIBLE_SECTIONS="+visible+"\nNATIVE_DIAGNOSTICS="+stats+"\n");
     }
     private static void verify(Path path)throws Exception {var image=javax.imageio.ImageIO.read(path.toFile());require(image!=null,"Missing native game screenshot");java.util.Set<Integer> colors=new java.util.HashSet<>();for(int y=0;y<image.getHeight();y+=3)for(int x=0;x<image.getWidth();x+=3)colors.add(image.getRGB(x,y));require(colors.size()>64,"Native game screenshot is blank");}

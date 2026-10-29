@@ -21,7 +21,7 @@ final class NativeShaderProgram implements AutoCloseable {
     private final Map<String,Uniform> uniforms = new LinkedHashMap<>();
     private final List<Object[]> uniformDefaults=new ArrayList<>();
     private final VulkanContext context;
-    final boolean terrain, entity, embeddium;
+    final boolean terrain, entity, embeddium, batchableDynamic, batchableGui;
     long textureLayout,layout,vertex,fragment;
     private final Map<PipelineKey,Long> pipelines = new HashMap<>();
     private record Stages(long vertex,long fragment){ }
@@ -63,6 +63,7 @@ final class NativeShaderProgram implements AutoCloseable {
         embeddium=vertexSource.contains("u_RegionOffset")&&vertexSource.contains("a_PosId");
         terrain=vertexSource.contains("ChunkOffset")||embeddium;
         entity=vertexSource.contains("UV1")&&vertexSource.contains("Normal")&&!terrain;
+        boolean drawIds=java.util.regex.Pattern.compile("gl_(?:VertexID|VertexIndex|InstanceID|InstanceIndex|DrawID|BaseVertex|BaseInstance|PrimitiveID|PrimitiveIDIn)(?:ARB|EXT)?\\b").matcher(vertexSource+fragmentSource).find();batchableDynamic=entity&&!drawIds;batchableGui=!terrain&&!drawIds;
         int next=0; Matcher matcher=UNIFORM.matcher(vertexSource+"\n"+fragmentSource);
         while(matcher.find()) {
             String type=matcher.group(1),name=matcher.group(2);
