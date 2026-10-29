@@ -37,6 +37,13 @@ public final class NativeMainWindow {
 
     private NativeMainWindow() { }
 
+    /** The constructor keeps Forge's original call in this branch for other mods' window redirects. */
+    public static boolean useForgeGlWindow(){return !NativeGameWindow.enabled()&&VulkanForgeConfig.startup().mode()==dev.vulkanforge.bridge.RenderMode.GL;}
+    public static long configureGlWindow(long legacy,IntSupplier width,IntSupplier height,Supplier<String> title,LongSupplier monitor){
+        var startup=VulkanForgeConfig.startup();LOGGER.info("VulkanForge startup renderer: {}",startup);
+        return Gl46Context.window(legacy,startup.openGLVersion(),width,height,title,monitor);
+    }
+
     public static long createWindow(IntSupplier width, IntSupplier height, Supplier<String> title, LongSupplier monitor) {
         if (NativeGameWindow.enabled()) return NativeGameWindow.create(width,height,title,monitor);
         var startup = VulkanForgeConfig.startup();

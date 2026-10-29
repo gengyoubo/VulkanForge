@@ -62,6 +62,7 @@ minecraft {
                 property 'vulkanforge.startup', shaderMode=='VK' ? 'VK:V1_4' : 'GL:DEFAULT'
                 property 'vulkanforge.shaderPackSmoke', shaderMode
                 property 'shaderPack.output', project.file(project.findProperty('shaderPack.output') ?: 'build/reports/shader-packs/' + shaderMode).absolutePath
+                if(project.hasProperty('shaderPack.reference'))property 'shaderPack.reference',project.file(project.property('shaderPack.reference')).absolutePath
                 mods { vulkanforge { source sourceSets.smoke } }
             }
             if (project.hasProperty('gameFps')) {
@@ -207,7 +208,7 @@ if(project.hasProperty('shaderPackSmoke')) tasks.matching { it.name=='runClient'
     def shaderMode=project.findProperty('shaderPackMode') ?: 'VK'
     def reports=project.file(project.findProperty('shaderPack.output') ?: 'build/reports/shader-packs/' + shaderMode)
     doFirst {
-        def directory=project.file('run-shaders/' + shaderMode);directory.mkdirs();new File(directory,'options.txt').text='renderDistance:3\nsimulationDistance:5\nguiScale:2\nmaxFps:60\nenableVsync:false\nfullscreen:false\nonboardAccessibility:false\n'
+        def directory=project.file('run-shaders/' + shaderMode);directory.mkdirs();new File(directory,'options.txt').text='renderDistance:3\nsimulationDistance:5\nguiScale:4\nmaxFps:60\nenableVsync:false\nfullscreen:false\nonboardAccessibility:false\nlang:zh_cn\ntutorialStep:none\n'
         reports.mkdirs();new File(reports,'result.txt').text='STATUS=RUNNING\n'
     }
     doLast {

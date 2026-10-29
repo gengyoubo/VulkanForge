@@ -3,10 +3,33 @@
 function initializeCoreMod() {
     var Opcodes = Java.type('org.objectweb.asm.Opcodes');
     var MethodInsnNode = Java.type('org.objectweb.asm.tree.MethodInsnNode');
+    var InsnList = Java.type('org.objectweb.asm.tree.InsnList');
+    var VarInsnNode = Java.type('org.objectweb.asm.tree.VarInsnNode');
+    var LabelNode = Java.type('org.objectweb.asm.tree.LabelNode');
+    var JumpInsnNode = Java.type('org.objectweb.asm.tree.JumpInsnNode');
     var ASMAPI = Java.type('net.minecraftforge.coremod.api.ASMAPI');
     var hook = 'github/com/gengyoubo/vulkanforge/client/NativeMainWindow';
     var forge = 'net/minecraftforge/fml/loading/ImmediateWindowHandler';
     var glfw = 'org/lwjgl/glfw/GLFW';
+
+    function windowCreation(method, call) {
+        // Keep the actual Forge invocation available to Embeddium's context-creation Redirect.
+        // ModLauncher recomputes frames after class transformers and subsequent mixins.
+        var base=method.maxLocals;method.maxLocals+=6;
+        var custom=new LabelNode(),done=new LabelNode(),before=new InsnList(),after=new InsnList();
+        for(var i=3;i>=0;i--)before.add(new VarInsnNode(Opcodes.ASTORE,base+i));
+        before.add(new MethodInsnNode(Opcodes.INVOKESTATIC,hook,'useForgeGlWindow','()Z',false));
+        before.add(new JumpInsnNode(Opcodes.IFEQ,custom));
+        for(var i=0;i<4;i++)before.add(new VarInsnNode(Opcodes.ALOAD,base+i));
+        method.instructions.insertBefore(call,before);
+        after.add(new VarInsnNode(Opcodes.LSTORE,base+4));after.add(new VarInsnNode(Opcodes.LLOAD,base+4));
+        for(var i=0;i<4;i++)after.add(new VarInsnNode(Opcodes.ALOAD,base+i));
+        after.add(new MethodInsnNode(Opcodes.INVOKESTATIC,hook,'configureGlWindow','(J'+call.desc.substring(1),false));
+        after.add(new JumpInsnNode(Opcodes.GOTO,done));after.add(custom);
+        for(var i=0;i<4;i++)after.add(new VarInsnNode(Opcodes.ALOAD,base+i));
+        after.add(new MethodInsnNode(Opcodes.INVOKESTATIC,hook,'createWindow',call.desc,false));after.add(done);
+        method.instructions.insert(call,after);
+    }
 
     function redirect(node, rules) {
         var counts = [];
@@ -20,7 +43,8 @@ function initializeCoreMod() {
                 for (var r = 0; r < rules.length; r++) {
                     var rule = rules[r];
                     if (insn.owner === rule.owner && insn.name === rule.name && insn.desc === rule.desc && (!rule.ctor || method.name === '<init>')) {
-                        method.instructions.set(insn, new MethodInsnNode(Opcodes.INVOKESTATIC, hook, rule.to, rule.desc, false));
+                        if(rule.to==='createWindow')windowCreation(method,insn);
+                        else method.instructions.set(insn, new MethodInsnNode(Opcodes.INVOKESTATIC, hook, rule.to, rule.desc, false));
                         counts[r]++;
                         break;
                     }

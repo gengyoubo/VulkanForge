@@ -6,6 +6,8 @@ Minecraft **1.20.1 / Forge 47.4.28 / Java 17** 客户端 Vulkan 渲染实验。
 
 **GL-VK 默认使用 GL 尾部兼容计划**：Vulkan 批量绘制地形，GL 负责兼容绘制、后处理、GUI/HUD 与最终输出。配置页的“GL-VK 执行计划”对应 `renderer.glVkPlan`，可在 `GL_TAIL` 与原 `INTERLEAVED` 之间切换，重启生效。下述 Vulkan Swapchain、实体/GUI 回放说明针对原交错计划。
 
+**游戏内光影包选择页**参考 Iris 的布局与交互，支持 ZIP/文件夹导入、启停、应用、取消、选项和失败保留原包。GL 与纯 VK 当前只执行标准格式的单颜色后处理子集；阴影、`gbuffers_*`、MRT 等仍会明确拒绝，尚不具备完整 Iris 包兼容性，DLSS 也未接入。范围与验证见 [光影包说明](docs/shader-packs.md)。
+
 当前已经打通五条路径：
 
 - 原生 VK 游戏（Windows）：CPU 资源与绘制状态 → 原版着色器转 SPIR-V → 私有 Vulkan 附件 → Vulkan Swapchain，全程无 OpenGL；使用独立的 `NativeGameBackend`。

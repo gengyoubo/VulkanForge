@@ -36,7 +36,8 @@ final class ShaderPackPass implements AutoCloseable {
             }
             if(NativeGameWindow.enabled())NativeGameWindow.call("prepareShaderPackProgram",linked);
             program=linked;linked=0;
-        }finally{if(vertex!=0)glDeleteShader(vertex);if(fragment!=0)glDeleteShader(fragment);if(linked!=0)glDeleteProgram(linked);}
+        }catch(RuntimeException error){Throwable cause=error;while(cause.getCause()!=null&&cause.getCause()!=cause)cause=cause.getCause();throw new ShaderPackException(name+": "+Objects.requireNonNullElse(cause.getMessage(),cause.toString()),error);}
+        finally{if(vertex!=0)glDeleteShader(vertex);if(fragment!=0)glDeleteShader(fragment);if(linked!=0)glDeleteProgram(linked);}
     }
     private int compile(int stage,String source){int shader=glCreateShader(stage);try{glShaderSource(shader,source);glCompileShader(shader);if(glGetShaderi(shader,GL_COMPILE_STATUS)==GL_FALSE)throw new ShaderPackException(name+": "+glGetShaderInfoLog(shader));return shader;}catch(Throwable error){glDeleteShader(shader);throw error;}}
     void values(Map<String,float[]> values){

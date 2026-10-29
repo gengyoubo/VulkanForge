@@ -19,6 +19,7 @@ public final class ShaderPackRuntime {
     private static final Properties preferences=new Properties();
     private static Map<String,String> requestedValues=Map.of();
     private static String runtimeError="";
+    private static String loggedError="";
     private static boolean initialized;
     private ShaderPackRuntime(){ }
     public static Path directory(){initialize();return directory;}
@@ -31,10 +32,14 @@ public final class ShaderPackRuntime {
         },graph->{try(ShaderPackState state=new ShaderPackState(4)){graph.close();}});
         String selected=preferences.getProperty("selected","");if(!selected.isBlank())request(selected,storedOptions(selected));
     }
-    public static List<String> available(){initialize();try(var files=Files.list(directory)){return files.filter(path->Files.isDirectory(path)||path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".zip")).map(path->path.getFileName().toString()).sorted(String.CASE_INSENSITIVE_ORDER).toList();}catch(IOException error){runtimeError=error.getMessage();return List.of();}}
+    public static List<String> available(){initialize();try(var files=Files.list(directory)){return files.filter(path->!path.getFileName().toString().startsWith(".")).filter(path->Files.isDirectory(path)||path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".zip")).map(path->path.getFileName().toString()).sorted(String.CASE_INSENSITIVE_ORDER).toList();}catch(IOException error){runtimeError=error.getMessage();return List.of();}}
     private static String key(String name){return Base64.getUrlEncoder().withoutPadding().encodeToString(name.getBytes(StandardCharsets.UTF_8));}
     private static Map<String,String> storedOptions(String name){Map<String,String> values=new HashMap<>();String prefix="pack."+key(name)+".";preferences.forEach((k,v)->{if(k.toString().startsWith(prefix))values.put(k.toString().substring(prefix.length()),v.toString());});return Map.copyOf(values);}
     public static void select(String name){initialize();request(name,storedOptions(name));}
+    public static String selectedPack(){initialize();String active=controller.status().active();return active.isEmpty()?preferences.getProperty("lastSelected",preferences.getProperty("selected","")):active;}
+    public static CompletableFuture<List<String>> importPacks(List<Path> files){
+        initialize();List<Path> paths=List.copyOf(files);return CompletableFuture.supplyAsync(()->{List<String> names=new ArrayList<>();try{for(Path path:paths)names.add(ShaderPackImporter.copy(path,directory));return List.copyOf(names);}catch(IOException error){throw new CompletionException(error);}},IO);
+    }
     public static void request(String name,Map<String,String> values){
         initialize();runtimeError="";requestedValues=Map.copyOf(values);
         if(name.isEmpty()){controller.request(null);return;}
@@ -47,8 +52,8 @@ public final class ShaderPackRuntime {
     public static Map<String,String> values(){initialize();var graph=controller.active();return graph==null?Map.of():graph.values;}
     public static boolean active(){return initialized&&controller.active()!=null;}
     public static void beginFrame(){
-        initialize();if(controller.beginFrame()){
-            var graph=controller.active();String name=graph==null?"":graph.pack.name();preferences.setProperty("selected",name);
+        initialize();String preparationError=controller.status().error();if(!preparationError.equals(loggedError)){loggedError=preparationError;if(!preparationError.isEmpty())VulkanForge.LOGGER.error("Shader pack preparation failed; keeping the active pack: {}",preparationError);}if(controller.beginFrame()){
+            var graph=controller.active();String name=graph==null?"":graph.pack.name();preferences.setProperty("selected",name);if(!name.isEmpty())preferences.setProperty("lastSelected",name);
             if(graph!=null){String prefix="pack."+key(name)+".";preferences.keySet().removeIf(k->k.toString().startsWith(prefix));graph.values.forEach((option,value)->preferences.setProperty(prefix+option,value));}
             try{Files.createDirectories(settings.getParent());Path temp=Files.createTempFile(settings.getParent(),"vulkanforge-shaders-",".tmp");try(Writer writer=Files.newBufferedWriter(temp,StandardCharsets.UTF_8)){preferences.store(writer,"Live shader pack selection");}try{Files.move(temp,settings,StandardCopyOption.ATOMIC_MOVE,StandardCopyOption.REPLACE_EXISTING);}catch(AtomicMoveNotSupportedException error){Files.move(temp,settings,StandardCopyOption.REPLACE_EXISTING);}}catch(IOException error){runtimeError="Could not save shader selection: "+error.getMessage();}
             VulkanForge.LOGGER.info("Shader pack committed at frame boundary: {}",name.isEmpty()?"OFF":name);

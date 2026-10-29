@@ -25,6 +25,11 @@ public final class ShaderPackSmoke {
             var source=overridden.stages().get(ShaderPack.Stage.VERTEX);require(source.text().startsWith("#version")&&source.text().contains("#line")&&source.sourceNames().containsValue("lib/common.glsl"),"Include source diagnostics");
             Path zip=work.resolve("fixture.zip");try(var output=new ZipOutputStream(Files.newOutputStream(zip));var files=Files.walk(root)){for(Path file:files.filter(Files::isRegularFile).toList()){output.putNextEntry(new ZipEntry("wrapper/shaders/"+root.relativize(file).toString().replace('\\','/')));Files.copy(file,output);output.closeEntry();}}
             require(ShaderPack.load(zip).programs("").keySet().equals(folder.programs("").keySet()),"ZIP/folder program parity");
+            Path installed=work.resolve("installed");String imported=ShaderPackImporter.copy(zip,installed);require(Files.mismatch(zip,installed.resolve(imported))==-1,"ZIP import changed the pack");
+            try{ShaderPackImporter.copy(zip,installed);throw new AssertionError("Import overwrote an existing pack");}catch(FileAlreadyExistsException expected){}
+            ShaderPackImporter.copy(pack,installed);require(ShaderPack.load(installed.resolve("fixture")).programs("").keySet().equals(folder.programs("").keySet()),"Folder import lost shader assets");
+            Path invalid=work.resolve("invalid.zip");Files.writeString(invalid,"not a ZIP");try{ShaderPackImporter.copy(invalid,installed);throw new AssertionError("Invalid import accepted");}catch(java.io.IOException expected){}
+            try(var entries=Files.list(installed)){require(entries.noneMatch(path->path.getFileName().toString().startsWith(".import-")),"Import left partial staging files");}
             hotSwitch(pack);
             try{ShaderPackArchive.resolve("a.vsh","../outside");throw new AssertionError("Include escaped pack");}catch(ShaderPackException expected){}
             write(root,"cycle.vsh","#version 120\n#include \"cycle.vsh\"\n");try(var archive=ShaderPackArchive.open(pack)){try{new ShaderPackIncludes(archive).expand("cycle.vsh");throw new AssertionError("Include cycle accepted");}catch(ShaderPackException expected){require(expected.getMessage().contains("cycle"),"Include cycle diagnostic");}}
