@@ -91,6 +91,7 @@ public final class NativeGameBackend implements AutoCloseable {
     private long vertexBytes,indexBytes,uniformBytes,terrainVertexBytes,terrainIndexBytes,descriptorSets,sceneSubmits,textureBytes;
     private long sceneFenceWaitNs,uploadDrainNs,flushCpuNs,hostCopyNs,descriptorCpuNs,sceneSubmitNs;
     private long descriptorResets,foldedClears;
+    private long residentUnreclaimable,splitResidentBudget,splitDrawLimit,splitVertexLimit,splitWaitNs;
     /** Labelled GPU timestamps; a section runs from its marker to the next one in the same frame. */
     private static final boolean MARKERS=PROFILE||Boolean.getBoolean("vulkanforge.shaderPackProfile");
     private static final int MAX_MARKERS=256,MARKER_WARMUP=120;
@@ -162,10 +163,13 @@ public final class NativeGameBackend implements AutoCloseable {
     private void reclaim(int index){waitSlot(index);Slot frame=slots[index];for(Runnable action:frame.retired)action.run();frame.retired.clear();}
     /** Submits the work queued so far and waits for it, so the frame continues within the per-submission limits. */
     private void splitFrame(){
-        frameSplits++;flush(null);
+        long started=stamp();frameSplits++;flush(null);
+        // With no scene commands the latest uploads may not be covered by any scene fence yet.
+        context.uploads.drain();
         // The flush may have submitted nothing, so the recording slot's fence alone need not cover the frame still in flight.
         for(int i=0;i<FRAMES;i++)waitSlot(i);
         for(int i=0;i<FRAMES;i++)reclaim(i);
+        splitWaitNs+=elapsed(started);
     }
     /**
      * A resident version, or null if the geometry cannot be resident even after reclaiming. Over the budget, versions
@@ -173,9 +177,10 @@ public final class NativeGameBackend implements AutoCloseable {
      */
     private NativeGeometryCache.Buffer resident(int id,long version,byte[] data,long base,int[] ranges){
         NativeGeometryCache.Buffer buffer=geometry.get(id,version,data,base,ranges);if(buffer!=null||data.length==0)return buffer;
+        if(!geometry.fitsAfterReclaim(data.length)){residentUnreclaimable++;return null;}
         residentReclaims++;for(int i=0;i<FRAMES;i++)if(i!=slotIndex)reclaim(i);
         buffer=geometry.get(id,version,data,-1,null);if(buffer!=null)return buffer;
-        splitFrame();return geometry.get(id,version,data,-1,null);
+        splitResidentBudget++;splitFrame();return geometry.get(id,version,data,-1,null);
     }
     private void endFrame(){frameOpen=false;slotIndex=(slotIndex+1)%FRAMES;}
     public String[] program(int id,String vertex,String fragment,Object[] bindings) {
@@ -292,7 +297,7 @@ public final class NativeGameBackend implements AutoCloseable {
         }
         long vertexCopy=vertex==null?((byte[])packet[1]).length:0,indexCopy=index==null?(indexCopyLength(packet)+3)&~3:0;
         if(vertexCopy>MAX_SUBMIT_VERTEX_BYTES)throw new UnsupportedOperationException("Native draw copies "+vertexCopy+" vertex bytes, above the "+MAX_SUBMIT_VERTEX_BYTES+" byte submission limit");
-        if(queuedDraws>0&&(queuedDraws+1>MAX_DRAWS||queuedVertexBytes+vertexCopy>MAX_SUBMIT_VERTEX_BYTES))splitFrame();
+        if(queuedDraws>0&&(queuedDraws+1>MAX_DRAWS||queuedVertexBytes+vertexCopy>MAX_SUBMIT_VERTEX_BYTES)){if(queuedDraws+1>MAX_DRAWS)splitDrawLimit++;else splitVertexLimit++;splitFrame();}
         commands.add(new Object[]{0,target(framebuffer),program,packet,inputs,vertex,index});queuedDraws++;queuedVertexBytes+=vertexCopy;queuedIndexBytes+=indexCopy;
     }
     public void deleteBuffer(int id){beginFrame();geometry.delete(id);}
@@ -546,6 +551,7 @@ public final class NativeGameBackend implements AutoCloseable {
     public String[] deviceInfo(){try(var stack=MemoryStack.stackPush()){var properties=VkPhysicalDeviceProperties.malloc(stack);vkGetPhysicalDeviceProperties(context.physical,properties);String vendor=switch(properties.vendorID()){case 0x10de->"NVIDIA Corporation";case 0x1002->"AMD";case 0x8086->"Intel";default->"Vulkan device vendor "+properties.vendorID();};return new String[]{properties.deviceNameString(),vendor};}}
     public Map<String,Long> diagnostics(){
         Map<String,Long> result=new LinkedHashMap<>(presentation==null?Map.of():presentation.diagnostics());result.putAll(geometry.stats());result.put("embeddiumTerrainDraws",embeddiumTerrainDraws);
+        result.put("residentUnreclaimable",residentUnreclaimable);result.put("splitResidentBudget",splitResidentBudget);result.put("splitDrawLimit",splitDrawLimit);result.put("splitVertexLimit",splitVertexLimit);result.put("splitInclusiveNs",splitWaitNs);
         String[] names={"frames","draws","terrainDraws","entityDraws","vertexBytes","indexBytes","uniformBytes","terrainVertexBytes","terrainIndexBytes","descriptorSets","sceneSubmits","textureBytes","sceneFenceWaitNs","uploadDrainNs","flushInclusiveNs","hostCopyNs","descriptorCpuNs","sceneSubmitNs","descriptorResets","foldedClears","cachedDescriptorSets","framesInFlight","multiDrawPackets","indirectDraws","hoistedInputs","frameSplits","residentReclaims"};
         long[] values={frames,draws,terrainDraws,entityDraws,vertexBytes,indexBytes,uniformBytes,terrainVertexBytes,terrainIndexBytes,descriptorSets,sceneSubmits,textureBytes,sceneFenceWaitNs,uploadDrainNs,flushCpuNs,hostCopyNs,descriptorCpuNs,sceneSubmitNs,descriptorResets,foldedClears,Arrays.stream(slots).mapToLong(frame->frame.persistentDescriptors.size()).sum(),FRAMES,multiDrawPackets,indirectDraws,hoistedInputs,frameSplits,residentReclaims};
         for(int i=0;i<names.length;i++)result.put(names[i],values[i]);long[] upload=context.uploads.stats();result.put("uploadSubmits",upload[0]);result.put("uploadBytes",upload[2]);

@@ -9,6 +9,9 @@ public final class NativeDeviceState {
     private static final boolean DIAGNOSTICS=Boolean.getBoolean("vulkanforge.nativeDiagnostics"),PROFILE=Boolean.getBoolean("vulkanforge.nativeProfile");
     private static long adapterCalls,adapterNs,drawAdapterNs,bufferGeneration,terrainSubmissions,unchangedTerrainSubmissions,unchangedTerrainBytes,indexSliceBytes,embeddiumBatches;
     private static long textureGeneration;
+    private static final int[] EMPTY_RANGES=new int[0],stateScratch=new int[81],areaScratch=new int[8];
+    private static int[] stateSnapshot,areaSnapshot;
+    private static float[] rasterSnapshot;
     private static final Set<Long> cpuFences=new HashSet<>();
     private static final Map<Integer,Long> bufferVersions=new HashMap<>();
     private record BufferUse(long version,long frame) { }
@@ -29,7 +32,7 @@ public final class NativeDeviceState {
     private static final Map<Integer,Framebuffer> framebuffers=new HashMap<>();
     private static final class Shader {int type;String source;}
     private static final Map<Integer,Shader> shaders=new HashMap<>();
-    private static final class Program {final List<Integer> shaders=new ArrayList<>();final Map<String,Integer> attributes=new LinkedHashMap<>(),outputs=new LinkedHashMap<>();final Map<String,float[]> values=new LinkedHashMap<>();final Map<String,Object[]> entries=new LinkedHashMap<>();Object[] snapshot;String[] samplers={};List<NativeUniformInfo.Uniform> uniforms=List.of();boolean linked,terrain;}
+    private static final class Program {final List<Integer> shaders=new ArrayList<>();final Map<String,Integer> attributes=new LinkedHashMap<>(),outputs=new LinkedHashMap<>();final Map<String,float[]> values=new LinkedHashMap<>();final Map<String,Object[]> entries=new LinkedHashMap<>();Object[] snapshot;String[] samplers={};int[] textureScratch,overrideScratch,textures,overrides;List<NativeUniformInfo.Uniform> uniforms=List.of();boolean linked,terrain;}
     private static final Map<Integer,Program> programs=new HashMap<>();
     private static final class Sampler {int flags=56;boolean whiteBorder;final Map<Integer,Integer> parameters=new HashMap<>();}
     private static final Map<Integer,Sampler> samplerObjects=new HashMap<>();
@@ -66,7 +69,7 @@ public final class NativeDeviceState {
     public static Object call(String operation,Object[] a) {
         if(!PROFILE)return execute(operation,a);
         long start=System.nanoTime();
-        try{return execute(operation,a);}finally{long spent=System.nanoTime()-start;adapterCalls++;adapterNs+=spent;if(operation.equals("glDrawElements"))drawAdapterNs+=spent;}
+        try{return execute(operation,a);}finally{long spent=System.nanoTime()-start;adapterCalls++;adapterNs+=spent;if(operation.equals("glDrawElements")||operation.equals("nglMultiDrawElementsBaseVertex"))drawAdapterNs+=spent;}
     }
     public static Map<String,Long> diagnostics(){
         Map<String,Long> result=new LinkedHashMap<>();result.put("adapterCalls",adapterCalls);result.put("adapterInclusiveNs",adapterNs);result.put("adapterDrawInclusiveNs",drawAdapterNs);
@@ -228,17 +231,18 @@ public final class NativeDeviceState {
         mapping.bytes().duplicate().position(offset).limit(offset+size).get(data,mapping.offset()+offset,size);buffers.put(target,data);bufferVersions.put(target,++bufferGeneration);written(target,mapping.offset()+offset,mapping.offset()+offset+size);
     }
     private static void replaced(int buffer){Dirty value=dirty.computeIfAbsent(buffer,key->new Dirty());value.full=true;value.ranges.clear();}
-    /** Merges [start,end) into the buffer's sorted, disjoint dirty list; too many ranges degrade to a full upload. */
+    /** Merges byte writes; at the range limit, uploading the smallest clean gap avoids a whole-arena upload. */
     private static void written(int buffer,int start,int end){
         Dirty value=dirty.computeIfAbsent(buffer,key->new Dirty());if(value.full||end<=start)return;
         List<int[]> ranges=value.ranges;int at=0;while(at<ranges.size()&&ranges.get(at)[1]<start)at++;
-        int[] merged={start,end};while(at<ranges.size()&&ranges.get(at)[0]<=end){int[] range=ranges.remove(at);merged[0]=Math.min(merged[0],range[0]);merged[1]=Math.max(merged[1],range[1]);}
-        ranges.add(at,merged);if(ranges.size()>MAX_DIRTY_RANGES){value.full=true;ranges.clear();}
+        int[] merged={start,end};while(at<ranges.size()&&ranges.get(at)[0]<=merged[1]){int[] range=ranges.remove(at);merged[0]=Math.min(merged[0],range[0]);merged[1]=Math.max(merged[1],range[1]);}
+        ranges.add(at,merged);
+        if(ranges.size()>MAX_DIRTY_RANGES){int closest=0,gap=Integer.MAX_VALUE;for(int i=0;i+1<ranges.size();i++){int distance=ranges.get(i+1)[0]-ranges.get(i)[1];if(distance<gap){gap=distance;closest=i;}}ranges.get(closest)[1]=ranges.remove(closest+1)[1];}
     }
     /** {start0,end0,...} written since {@code submitted[0]}, or null for a full upload; this version becomes the submitted one. */
-    private static int[] take(int buffer,long version,long[] submitted){
-        Dirty value=dirty.computeIfAbsent(buffer,key->new Dirty());submitted[0]=value.submitted;
-        int[] ranges=null;if(!value.full){ranges=new int[value.ranges.size()*2];for(int i=0;i<value.ranges.size();i++){ranges[i*2]=value.ranges.get(i)[0];ranges[i*2+1]=value.ranges.get(i)[1];}}
+    private static int[] take(int buffer,long version,long[] submitted,int at){
+        Dirty value=dirty.computeIfAbsent(buffer,key->new Dirty());submitted[at]=value.submitted;
+        int[] ranges=null;if(!value.full){ranges=value.ranges.isEmpty()?EMPTY_RANGES:new int[value.ranges.size()*2];for(int i=0;i<value.ranges.size();i++){ranges[i*2]=value.ranges.get(i)[0];ranges[i*2+1]=value.ranges.get(i)[1];}}
         value.submitted=version;value.full=false;value.ranges.clear();return ranges;
     }
     private static boolean on(int value){return enabled.getOrDefault(value,false);}
@@ -268,7 +272,7 @@ public final class NativeDeviceState {
     private static void uniform(Object[] a) {
         Location location=locations.get(number(a,0));if(location==null)return;Object input=a[a.length-1];float[] values;
         if(input instanceof float[] data)values=data.clone();else if(input instanceof int[] data){values=new float[data.length];for(int i=0;i<data.length;i++)values[i]=data[i];}else if(input instanceof FloatBuffer data){values=new float[data.remaining()];data.duplicate().get(values);}else if(input instanceof IntBuffer data){values=new float[data.remaining()];for(int i=0;i<values.length;i++)values[i]=data.get(data.position()+i);}else values=new float[]{((Number)input).floatValue()};
-        Program program=programs.get(location.program());program.values.put(location.name(),values);
+        Program program=programs.get(location.program());if(Arrays.equals(program.values.get(location.name()),values))return;program.values.put(location.name(),values);
         program.entries.put(location.name(),new Object[]{location.name(),values});program.snapshot=null;
     }
     private static void prepareTarget(int id) {
@@ -315,17 +319,28 @@ public final class NativeDeviceState {
                 if(old!=null&&old.version()==version&&old.frame()!=frame){unchangedTerrainSubmissions++;unchangedTerrainBytes+=vertexBytes.length;}
             }
         }
-        int[] textures=new int[program.samplers.length],samplerOverrides=new int[program.samplers.length];Arrays.fill(samplerOverrides,-1);for(int i=0;i<textures.length;i++){float[] value=program.values.get(program.samplers[i]);int unit=value==null?0:(int)value[0];textures[i]=boundTextures[unit];ensureTexture(textures[i]);if(boundSamplers[unit]!=0){Sampler sampler=Objects.requireNonNull(samplerObjects.get(boundSamplers[unit]));samplerOverrides[i]=sampler.flags|((sampler.flags&64)!=0&&!sampler.whiteBorder?128:0);}}
-        int[] state={on(3042)?1:0,src,dst,srcAlpha,dstAlpha,equation,equationAlpha,on(2929)&&framebuffers.get(drawTarget).depth>0?1:0,depthMask?1:0,depthFunc,on(2884)?cullFace:0,frontFace,colorMask,6914,on(32823)?1:0,mode,0};
-        boolean indexed=false;for(int[] blend:indexedBlend)if(blend!=null){indexed=true;break;}
-        if(indexed){state=Arrays.copyOf(state,17+8*8);for(int i=0;i<8;i++)System.arraycopy(indexedBlend[i]==null?new int[]{on(3042)?1:0,src,dst,srcAlpha,dstAlpha,equation,equationAlpha,colorMask}:indexedBlend[i],0,state,17+i*8,8);}
-        int[] box=clip(drawTarget),area={viewport[0],viewport[1],viewport[2],viewport[3],box[0],box[1],box[2],box[3]};
+        if(program.textureScratch==null||program.textureScratch.length!=program.samplers.length){program.textureScratch=new int[program.samplers.length];program.overrideScratch=new int[program.samplers.length];}
+        int[] textures=program.textureScratch,samplerOverrides=program.overrideScratch;Arrays.fill(samplerOverrides,-1);for(int i=0;i<textures.length;i++){float[] value=program.values.get(program.samplers[i]);int unit=value==null?0:(int)value[0];textures[i]=boundTextures[unit];ensureTexture(textures[i]);if(boundSamplers[unit]!=0){Sampler sampler=Objects.requireNonNull(samplerObjects.get(boundSamplers[unit]));samplerOverrides[i]=sampler.flags|((sampler.flags&64)!=0&&!sampler.whiteBorder?128:0);}}
+        if(!Arrays.equals(program.textures,textures))program.textures=textures.clone();if(!Arrays.equals(program.overrides,samplerOverrides))program.overrides=samplerOverrides.clone();
+        int[] state=drawState(mode);
+        Framebuffer fb=framebuffers.get(drawTarget);boolean clipped=on(3089);int x=clipped?Math.max(0,scissor[0]):0,y=clipped?Math.max(0,scissor[1]):0;
+        System.arraycopy(viewport,0,areaScratch,0,4);areaScratch[4]=x;areaScratch[5]=y;areaScratch[6]=Math.max(0,(clipped?Math.min(fb.width,scissor[0]+scissor[2]):fb.width)-x);areaScratch[7]=Math.max(0,(clipped?Math.min(fb.height,scissor[1]+scissor[3]):fb.height)-y);
+        if(!Arrays.equals(areaSnapshot,areaScratch))areaSnapshot=areaScratch.clone();
+        if(rasterSnapshot==null||Float.compare(rasterSnapshot[0],offsetFactor)!=0||Float.compare(rasterSnapshot[1],offsetUnits)!=0)rasterSnapshot=new float[]{offsetFactor,offsetUnits};
         Object[] values=program.snapshot;if(values==null){values=program.entries.values().toArray();program.snapshot=values;}
-        long vertexVersion=bufferVersions.getOrDefault(vertexBuffer,0L),indexVersion=bufferVersions.getOrDefault(array.indices,0L);long[] vertexBase={-1},indexBase={-1};
-        int[][] ranges={take(vertexBuffer,vertexVersion,vertexBase),take(array.indices,indexVersion,indexBase)};
-        long[] resources={vertexBuffer,vertexVersion,array.indices,indexVersion,offset,baseVertex,vertexBase[0],indexBase[0]};
+        long vertexVersion=bufferVersions.getOrDefault(vertexBuffer,0L),indexVersion=bufferVersions.getOrDefault(array.indices,0L);
+        long[] resources={vertexBuffer,vertexVersion,array.indices,indexVersion,offset,baseVertex,-1,-1};
+        int[][] ranges={take(vertexBuffer,vertexVersion,resources,6),take(array.indices,indexVersion,resources,7)};
         Object[] constants=constantSnapshot;if(constants==null){constants=constantAttributes.entrySet().stream().map(entry->new Object[]{entry.getKey(),entry.getValue()}).toArray();constantSnapshot=constants;}
-        NativeGameWindow.draw(drawTarget,new Object[]{currentProgram,vertexBytes,allIndices,type,count,stride,attributes,state,area,new float[]{offsetFactor,offsetUnits},values,textures,resources,samplerOverrides,constants,counts,offsets,bases,ranges});
+        NativeGameWindow.draw(drawTarget,new Object[]{currentProgram,vertexBytes,allIndices,type,count,stride,attributes,state,areaSnapshot,rasterSnapshot,values,program.textures,resources,program.overrides,constants,counts,offsets,bases,ranges});
+    }
+    /** Scratch arrays never leave the adapter; queued packets retain immutable snapshots across later state changes. */
+    private static int[] drawState(int mode){
+        int[] state=stateScratch;state[0]=on(3042)?1:0;state[1]=src;state[2]=dst;state[3]=srcAlpha;state[4]=dstAlpha;state[5]=equation;state[6]=equationAlpha;state[7]=on(2929)&&framebuffers.get(drawTarget).depth>0?1:0;state[8]=depthMask?1:0;state[9]=depthFunc;state[10]=on(2884)?cullFace:0;state[11]=frontFace;state[12]=colorMask;state[13]=6914;state[14]=on(32823)?1:0;state[15]=mode;state[16]=0;
+        boolean indexed=false;for(int[] blend:indexedBlend)if(blend!=null){indexed=true;break;}
+        int length=indexed?81:17;if(indexed)for(int i=0;i<8;i++){int at=17+i*8;if(indexedBlend[i]!=null)System.arraycopy(indexedBlend[i],0,state,at,8);else{System.arraycopy(state,0,state,at,7);state[at+7]=colorMask;}}
+        boolean same=stateSnapshot!=null&&stateSnapshot.length==length;for(int i=0;same&&i<length;i++)same=stateSnapshot[i]==state[i];
+        if(!same)stateSnapshot=Arrays.copyOf(state,length);return stateSnapshot;
     }
     private static UnsupportedOperationException unsupported(String operation){return new UnsupportedOperationException("Unimplemented native operation (GL fallback forbidden): "+operation);}
 }

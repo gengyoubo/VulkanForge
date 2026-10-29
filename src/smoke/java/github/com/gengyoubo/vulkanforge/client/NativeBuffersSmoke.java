@@ -18,7 +18,29 @@ public final class NativeBuffersSmoke {
         try{call("glMapBufferRange",34962,100L,4L,2);throw new AssertionError("Out of range mapping accepted");}catch(IndexOutOfBoundsException expected){}
         long fence=(Long)call("glFenceSync",37143,0);require((Integer)call("glClientWaitSync",fence,0,0L)==37146,"CPU copy completion fence");call("glDeleteSync",fence);
         try{call("glClientWaitSync",fence,0,0L);throw new AssertionError("Deleted CPU fence accepted");}catch(UnsupportedOperationException expected){}
+        snapshotsAndDirtyRanges();
         System.out.println("NATIVE_BUFFERS_SMOKE=OK (partial maps, arena copy bindings/offsets, explicit flush, CPU copy fences, no OpenGL)");
+    }
+    @SuppressWarnings("unchecked") private static void snapshotsAndDirtyRanges(){
+        try{
+            var take=NativeDeviceState.class.getDeclaredMethod("take",int.class,long.class,long[].class,int.class);take.setAccessible(true);
+            var written=NativeDeviceState.class.getDeclaredMethod("written",int.class,int.class,int.class);written.setAccessible(true);
+            long[] versions=new long[8];take.invoke(null,900,1L,versions,6);
+            written.invoke(null,900,8,12);written.invoke(null,900,16,20);written.invoke(null,900,4,16);
+            int[] ranges=(int[])take.invoke(null,900,2L,versions,6);
+            require(java.util.Arrays.equals(ranges,new int[]{4,20})&&versions[6]==1,"Dirty ranges bridging adjacent writes / base version");
+            Object empty=take.invoke(null,900,2L,versions,6);require(empty==take.invoke(null,900,2L,versions,6),"Unchanged buffer allocates dirty ranges");
+            for(int i=0;i<65;i++)written.invoke(null,900,i*1024,i*1024+1);
+            ranges=(int[])take.invoke(null,900,3L,versions,6);require(ranges!=null&&ranges.length==128,"Many small patches degraded to a whole arena upload");
+            for(int i=0;i<65;i++){boolean covered=false;for(int j=0;j<ranges.length;j+=2)if(ranges[j]<=i*1024&&ranges[j+1]>=i*1024+1)covered=true;require(covered,"Coalescing lost a dirty byte");}
+            var fbo=Class.forName(NativeDeviceState.class.getName()+"$Framebuffer").getDeclaredConstructor();fbo.setAccessible(true);
+            var targets=NativeDeviceState.class.getDeclaredField("framebuffers");targets.setAccessible(true);((java.util.Map<Integer,Object>)targets.get(null)).put(0,fbo.newInstance());
+            var state=NativeDeviceState.class.getDeclaredMethod("drawState",int.class);state.setAccessible(true);
+            int[] a=(int[])state.invoke(null,4);require(a==state.invoke(null,4),"Unchanged draw state allocated");
+            call("glEnable",3042);int[] b=(int[])state.invoke(null,4);require(a!=b&&a[0]==0&&b[0]==1,"Queued state snapshot mutated");
+            call("glBlendFuncSeparatei",1,770,771,1,0);int[] c=(int[])state.invoke(null,4);call("glDisablei",3042,1);int[] d=(int[])state.invoke(null,4);
+            require(c.length==81&&c[25]==1&&d[25]==0&&c[26]==770,"Indexed blend snapshot mutated");
+        }catch(ReflectiveOperationException error){throw new AssertionError(error);}
     }
     private static byte[] read(int id){call("glBindBuffer",34962,id);ByteBuffer data=(ByteBuffer)call("glMapBuffer",34962,35000);byte[] bytes=new byte[data.remaining()];data.get(bytes);call("glUnmapBuffer",34962);return bytes;}
     private static Object call(String name,Object...args){return NativeDeviceState.call(name,args);}

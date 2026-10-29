@@ -49,6 +49,17 @@ public final class NativeGeometrySmoke {
                     for(Runnable action:retired)action.run();
                 }
             }
+            retired.clear();
+            try(NativeGeometryCache cache=new NativeGeometryCache(context,retired::add,128)){
+                byte[] bytes=new byte[29];for(int i=0;i<bytes.length;i++)bytes[i]=(byte)i;
+                var a=cache.get(9,1,bytes);byte[] original=bytes;bytes=bytes.clone();bytes[1]=61;bytes[5]=62;bytes[28]=63;
+                var b=cache.get(9,2,bytes,1,new int[]{1,2,5,6,28,29});
+                context.uploads.drain();readback(context,a,Arrays.copyOf(original,32));readback(context,b,Arrays.copyOf(bytes,32));
+                require(cache.stats().get("residentPartialBytes")==12,"Unaligned/overlapping aligned ranges or padded tail");
+                require(!cache.fitsAfterReclaim(100),"Active working set ignored in reclaim estimate");
+                require(cache.fitsAfterReclaim(96),"Retired versions excluded incorrectly");
+                for(Runnable action:retired)action.run();retired.clear();
+            }
         }
         require(context.validationErrors()==0,"Geometry cache validation errors="+context.validationErrors());
         System.out.println("NATIVE_GEOMETRY_SMOKE=OK (GPU readback, immutable versions, deferred deletion, budget recovery, zero validation errors)");

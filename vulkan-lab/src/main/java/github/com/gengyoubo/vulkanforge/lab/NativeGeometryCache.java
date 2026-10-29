@@ -20,7 +20,7 @@ final class NativeGeometryCache implements AutoCloseable {
     private final Consumer<Runnable> retire;
     private final long budget;
     private final Map<Integer,Buffer> buffers=new HashMap<>();
-    private long liveBytes,peakBytes,uploads,uploadedBytes,reuses,fallbacks,partialUploads,partialBytes;
+    private long liveBytes,retiredBytes,peakBytes,uploads,uploadedBytes,reuses,fallbacks,partialUploads,partialBytes;
     NativeGeometryCache(VulkanContext context,Consumer<Runnable> retire){this(context,retire,256L<<20);}
     NativeGeometryCache(VulkanContext context,Consumer<Runnable> retire,long budget){this.context=context;this.retire=retire;this.budget=budget;}
     Buffer get(int id,long version,byte[] data){return get(id,version,data,-1,null);}
@@ -32,13 +32,14 @@ final class NativeGeometryCache implements AutoCloseable {
     Buffer get(int id,long version,byte[] data,long base,int[] ranges){
         Buffer old=buffers.get(id);
         if(old!=null&&old.version==version){reuses++;return old;}
-        if(old!=null){buffers.remove(id);retire.accept(()->release(old));}
+        if(old!=null){buffers.remove(id);retire(old);}
         int size=Math.addExact(data.length,3)&~3;
         if(size==0||size>budget-liveBytes){fallbacks++;return null;}
         GpuBuffer gpu=new GpuBuffer(context,size,VK_BUFFER_USAGE_VERTEX_BUFFER_BIT|VK_BUFFER_USAGE_INDEX_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT,false);
         Buffer next=new Buffer(gpu,version,size);
+        ranges=alignedRanges(ranges,data.length,size);
         int dirty=0;if(ranges!=null)for(int i=0;i<ranges.length;i+=2)dirty+=ranges[i+1]-ranges[i];
-        if(old!=null&&!old.closed&&ranges!=null&&old.version==base&&old.bytes==size&&dirty*2<size){
+        if(old!=null&&!old.closed&&ranges!=null&&old.version==base&&old.bytes==size&&(long)dirty*2<size){
             try{partial(old,gpu,data,ranges,dirty,size);}catch(RuntimeException|Error error){gpu.close();throw error;}
             buffers.put(id,next);liveBytes+=size;peakBytes=Math.max(peakBytes,liveBytes);partialUploads++;partialBytes+=dirty;return next;
         }
@@ -55,8 +56,19 @@ final class NativeGeometryCache implements AutoCloseable {
         }catch(RuntimeException|Error error){gpu.close();throw error;}
         buffers.put(id,next);liveBytes+=size;peakBytes=Math.max(peakBytes,liveBytes);uploads++;uploadedBytes+=size;return next;
     }
+    /** Vulkan buffer copies require four-byte offsets/sizes; expand and merge byte writes, including the padded tail. */
+    private static int[] alignedRanges(int[] ranges,int length,int size){
+        if(ranges==null)return null;if((ranges.length&1)!=0)throw new IllegalArgumentException("Odd dirty range list");
+        int[] aligned=new int[ranges.length];int used=0;
+        for(int i=0;i<ranges.length;i+=2){int start=ranges[i],end=ranges[i+1];Objects.checkFromToIndex(start,end,length);if(start==end)continue;
+            start&=~3;end=Math.min(size,(end+3)&~3);
+            if(used>0&&start<aligned[used-2])throw new IllegalArgumentException("Unsorted dirty ranges");
+            if(used>0&&start<=aligned[used-1])aligned[used-1]=Math.max(aligned[used-1],end);else{aligned[used++]=start;aligned[used++]=end;}
+        }
+        return Arrays.copyOf(aligned,used);
+    }
     private void partial(Buffer old,GpuBuffer gpu,byte[] data,int[] ranges,int dirty,int size){
-        byte[] payload=new byte[Math.max(4,dirty)];int at=0;for(int i=0;i<ranges.length;i+=2){System.arraycopy(data,ranges[i],payload,at,ranges[i+1]-ranges[i]);at+=ranges[i+1]-ranges[i];}
+        byte[] payload=new byte[Math.max(4,dirty)];int at=0;for(int i=0;i<ranges.length;i+=2){System.arraycopy(data,ranges[i],payload,at,Math.min(data.length,ranges[i+1])-ranges[i]);at+=ranges[i+1]-ranges[i];}
         // The old version is retired after this frame's fence, which follows this upload batch in submission order.
         context.uploads.submit(payload,(command,staging,offset,stack)->{
             var read=VkBufferMemoryBarrier2.calloc(1,stack).sType$Default().buffer(old.gpu.buffer).size(VK_WHOLE_SIZE)
@@ -79,8 +91,11 @@ final class NativeGeometryCache implements AutoCloseable {
         });
         uploads++;uploadedBytes+=dirty;
     }
-    void delete(int id){Buffer old=buffers.remove(id);if(old!=null)retire.accept(()->release(old));}
+    /** If even releasing every retired version cannot admit this buffer, waiting cannot help. */
+    boolean fitsAfterReclaim(int bytes){long size=((long)bytes+3)&~3L;return size>0&&size<=budget-(liveBytes-retiredBytes);}
+    private void retire(Buffer buffer){retiredBytes+=buffer.bytes;retire.accept(()->{retiredBytes-=buffer.bytes;release(buffer);});}
+    void delete(int id){Buffer old=buffers.remove(id);if(old!=null)retire(old);}
     private void release(Buffer buffer){if(!buffer.closed){buffer.closed=true;buffer.gpu.close();liveBytes-=buffer.bytes;}}
-    Map<String,Long> stats(){return Map.of("residentGeometryBytes",liveBytes,"residentGeometryPeakBytes",peakBytes,"residentUploads",uploads,"residentUploadBytes",uploadedBytes,"residentReuses",reuses,"residentFallbacks",fallbacks,"residentPartialUploads",partialUploads,"residentPartialBytes",partialBytes);}
+    Map<String,Long> stats(){return Map.of("residentGeometryBytes",liveBytes,"residentGeometryPeakBytes",peakBytes,"residentUploads",uploads,"residentUploadBytes",uploadedBytes,"residentReuses",reuses,"residentFallbacks",fallbacks,"residentPartialUploads",partialUploads,"residentPartialBytes",partialBytes,"residentReclaimableBytes",retiredBytes,"residentBudgetBytes",budget);}
     @Override public void close(){for(Buffer buffer:buffers.values())release(buffer);buffers.clear();}
 }

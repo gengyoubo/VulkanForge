@@ -50,6 +50,17 @@ public final class NativeMrtSmoke {
             backend.clear(72,16384,new float[4],1,new int[]{0,0,32,32});for(int i=0;i<16500;i++)backend.draw(72,packet(6,0));
             backend.finishOffscreenFrame();backend.beginFrame();corners(backend.readTextureFloats(22),.6f,.2f,.8f,"Split oversized frame");
             if(backend.diagnostics().get("frameSplits")<1)throw new AssertionError("Oversized frame was not split");
+            if(backend.diagnostics().get("splitDrawLimit")!=1)throw new AssertionError("Missing draw-limit split reason");
+            // Oversized resident working set: no amount of waiting can fit both 12 MiB arenas in a 16 MiB budget.
+            long splits=backend.diagnostics().get("frameSplits"),blocked=backend.diagnostics().get("residentUnreclaimable");
+            Object[] large=Arrays.copyOf(packet(7,0),19);large[1]=Arrays.copyOf((byte[])large[1],12<<20);large[13]=new int[0];large[14]=new Object[0];large[18]=new int[][]{null,null};
+            for(int frame=0;frame<3;frame++){
+                for(int draw=0;draw<6;draw++){Object[] p=large.clone();p[12]=new long[]{902+draw%2,1,904,1,0,0,-1,-1};backend.draw(72,p);}
+                backend.finishOffscreenFrame();backend.beginFrame();
+            }
+            corners(backend.readTextureFloats(22),.2f,.8f,.4f,"Resident-budget streaming fallback");
+            if(backend.diagnostics().get("frameSplits")!=splits||backend.diagnostics().get("residentUnreclaimable")<=blocked)throw new AssertionError("Unreclaimable working set repeatedly forced synchronization");
+            var pressure=backend.diagnostics();Files.writeString(report.resolve("pressure.txt"),"BUDGET_BYTES="+pressure.get("residentBudgetBytes")+"\nARENA_BYTES="+(12<<20)+"\nUNRECLAIMABLE_DRAWS="+(pressure.get("residentUnreclaimable")-blocked)+"\nRESIDENCY_FRAME_SPLITS="+(pressure.get("frameSplits")-splits)+"\nDRAW_LIMIT_SPLITS="+pressure.get("splitDrawLimit")+"\nPIXELS=PASS\n");
             if(backend.stats()[5]!=0)throw new AssertionError("Vulkan validation errors during MRT execution");
         }
         Files.writeString(report.resolve("result.txt"),"STATUS=OK\nMRT_REORDER=true\nMRT_HOLE=true\nRGBA16F_HDR=true\nSHARED_DEPTH=true\nDEPTH_ONLY=true\nATTACHED_TEXTURE_LIFETIME=true\nPIPELINE_FORMAT_KEY=true\n");

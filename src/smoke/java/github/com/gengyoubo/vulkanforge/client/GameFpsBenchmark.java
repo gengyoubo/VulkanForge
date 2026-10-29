@@ -29,6 +29,8 @@ public final class GameFpsBenchmark {
     private static final double SECONDS=Double.parseDouble(System.getProperty("fps.seconds","10")),WARMUP=Double.parseDouble(System.getProperty("fps.warmup","10"));
     private static final long[] periods=new long[1<<20];
     private static final List<Map<String,Object>> results=new ArrayList<>();
+    private static final List<Map<String,Long>> timeline=new ArrayList<>();
+    private static final boolean TIMELINE=Boolean.getBoolean("vulkanforge.nativeProfile");
     private static final long launched=System.nanoTime();
     private static int stage,ticks,count,round;
     private static long warmStart,last,measureStart,presentedStart,startEpoch;
@@ -102,10 +104,11 @@ public final class GameFpsBenchmark {
                 if((now-warmStart)/1e9<(round==0?WARMUP:3))return;
                 com.mojang.logging.LogUtils.getLogger().info("FPS_MEASURE {} round {}",MODE,round+1);
                 count=0;presentedStart=MODE.equals("VK")?NativeGameWindow.stats()[0]:0;
-                diagnosticsStart=MODE.equals("VK")?NativeGameWindow.diagnostics():Map.of();allocatedStart=allocated();cpuStart=threadCpu();
+                diagnosticsStart=MODE.equals("VK")?NativeGameWindow.diagnostics():Map.of();timeline.clear();if(TIMELINE&&MODE.equals("VK"))sampleTimeline(0);allocatedStart=allocated();cpuStart=threadCpu();
                 startEpoch=System.currentTimeMillis();measureStart=last=System.nanoTime();stage=4;return;
             }
             require(count<periods.length,"Frame sample capacity exceeded");periods[count++]=now-last;last=now;
+            if(TIMELINE&&MODE.equals("VK")&&count%120==0)sampleTimeline(count);
             if((now-measureStart)/1e9>=SECONDS)finishRound(mc,now);
         }catch(Throwable error){fail(mc,error);}
     }
@@ -130,6 +133,11 @@ public final class GameFpsBenchmark {
         results.add(row);Files.writeString(output.resolve("results.json"),JSON.toJson(results));
         StringBuilder csv=new StringBuilder("frame,period_ns\n");for(int i=0;i<count;i++)csv.append(i).append(',').append(periods[i]).append('\n');
         Files.writeString(output.resolve("round-"+round+".csv"),csv);
+        if(TIMELINE&&MODE.equals("VK")){
+            sampleTimeline(count);StringBuilder trace=new StringBuilder();List<String> keys=new ArrayList<>(timeline.get(0).keySet());trace.append(String.join(",",keys)).append('\n');
+            for(var sample:timeline){for(int i=0;i<keys.size();i++){if(i>0)trace.append(',');trace.append(sample.getOrDefault(keys.get(i),0L));}trace.append('\n');}
+            Files.writeString(output.resolve("timeline-"+round+".csv"),trace);
+        }
         com.mojang.logging.LogUtils.getLogger().info("FPS_RESULT {}",JSON.toJson(row));
         if(round<ROUNDS){warmStart=System.nanoTime();stage=3;}
         else {
@@ -138,6 +146,9 @@ public final class GameFpsBenchmark {
             ticks=0;stage=5;
         }
     }
+
+    /** Cumulative counters every 120 frames; GPU samples are collected later at the existing slot fence. No extra waits. */
+    private static void sampleTimeline(int frame){Map<String,Long> sample=new LinkedHashMap<>();sample.put("sampleFrame",(long)frame);sample.put("epochMs",System.currentTimeMillis());sample.putAll(NativeGameWindow.diagnostics());timeline.add(sample);}
 
     private static void buildScene(Minecraft mc) {
         var server=mc.getSingleplayerServer();var uuid=mc.player.getUUID();server.execute(()->{

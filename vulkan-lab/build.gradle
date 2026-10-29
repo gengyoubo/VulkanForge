@@ -123,6 +123,7 @@ tasks.register('smokeNativeMrt', JavaExec) {
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'github.com.gengyoubo.vulkanforge.lab.VkOnlyLauncher'
     args 'github.com.gengyoubo.vulkanforge.lab.NativeMrtSmoke'
+    systemProperty 'vulkanforge.residentGeometryMB', '16'
     systemProperty 'vulkanforge.smokeReportDir', rootProject.file('build/reports/native-mrt').absolutePath
     if (rootProject.hasProperty('validationSmoke')) systemProperty 'vulkanforge.requireValidation', 'true'
 }

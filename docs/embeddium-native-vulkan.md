@@ -41,8 +41,8 @@ GL BufferStorage 与持久映射 staging 路径不适用于无 GL 上下文的�
 
 - 多重绘制：`glMultiDrawElementsBaseVertex` 在适配器中只捕获一次状态，整个区域批次作为一个包交给后端；后端绑定一次管线、描述符与缓冲，在 `multiDrawIndirect` 可用时用一次 `vkCmdDrawIndexedIndirect` 提交所有 section，否则在同一包内循环 `vkCmdDrawIndexed`。`-Dvulkanforge.disableMultiDrawIndirect=true` 强制后者。计数：`multiDrawPackets`、`indirectDraws`。
 - 在途帧：后端默认 2 帧在途（`-Dvulkanforge.framesInFlight=1..3`）。每帧槽有自己的命令缓冲、fence、描述符池与 CPU 写入的顶点/索引/uniform/indirect 环；一个槽只在等待它自己的 fence 后复用，录制期间退役的资源在该槽 fence 之后销毁。帧开始不再等待全部上传完成，只回收已完成的批次。
-- Arena 局部更新：适配器记录每个缓冲自上次交给后端以来写入的字节范围（`glCopyBufferSubData`、映射刷新）。常驻版本正是该基线且尺寸不变、脏数据少于一半时，新版本由旧版本的设备内复制加上仅脏范围的 staging 上传构成；否则整块上传。计数：`residentPartialUploads`、`residentPartialBytes`。
-- 常驻预算：常驻地形预算为最大 device-local 堆的 1/4（256 MiB–2 GiB，`-Dvulkanforge.residentGeometryMB` 覆盖），启动时写入 `RESIDENT_GEOMETRY_BUDGET_MB`。超出预算时先销毁已完成帧退役的版本，再拆分当前帧释放本帧退役的版本，之后才退回每帧复制。单次提交超过 16384 个绘制或 256 MiB 顶点复制时拆分提交并等待，不再抛出 `Native frame upload budget exceeded`。计数：`residentReclaims`、`frameSplits`。
+- Arena 局部更新：适配器记录每个缓冲自上次交给后端以来写入的字节范围（`glCopyBufferSubData`、映射刷新）。超过 64 个范围时合并最小间隙，保留局部上传机会；后端按四字节扩展并合并范围，包含缓冲尾部填充。常驻版本正是该基线且尺寸不变、对齐后的脏数据少于一半时，新版本由旧版本的设备内复制加上仅脏范围的 staging 上传构成；否则整块上传。计数：`residentPartialUploads`、`residentPartialBytes`，后者包含对齐与合并带来的额外字节。
+- 常驻预算：常驻地形预算为最大 device-local 堆的 1/4（256 MiB–2 GiB，`-Dvulkanforge.residentGeometryMB` 覆盖），启动时写入 `RESIDENT_GEOMETRY_BUDGET_MB`。预算不足时先判断释放全部退役版本后能否容纳新缓冲；不能容纳则直接使用流式上传，避免每次绘制都无效拆帧。能容纳时先回收其他帧的退役版本，必要时拆分当前帧后回收。单次提交超过 16384 个绘制或 256 MiB 顶点复制仍拆分提交并等待。`frameSplits` 按 `splitResidentBudget`、`splitDrawLimit`、`splitVertexLimit` 区分原因；`residentUnreclaimable` 记录等待也无法解决的常驻预算回退。
 - 屏障：一次渲染开始时，会把该渲染内所有绘制采样的纹理一并转为只读布局（`hoistedInputs`），后续首次使用的输入不再打断渲染。
 - 调用开销：每次绘制通过绑定到后端的 `MethodHandle` 调用，不再按名称反射；常量顶点属性快照只在 `glVertexAttrib` 改变后重建。
 
