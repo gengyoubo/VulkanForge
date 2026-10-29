@@ -184,11 +184,14 @@ repositories {
 configurations { shaderRuntimeMods { transitive=false } }
 dependencies {
     minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
-    //if (!project.hasProperty('withoutEmbeddium')) implementation fg.deobf("curse.maven:embeddium-908741:5681725")
+    if (!project.hasProperty('withoutEmbeddium')) implementation fg.deobf("curse.maven:embeddium-908741:5681725")
     // Reference implementation is never part of the production loader/runtime bundle.
     if(project.hasProperty('irisReference')||project.hasProperty('oculusSmoke'))implementation fg.deobf('maven.modrinth:oculus:1.20.1-1.8.0')
+    implementation fg.deobf("curse.maven:chloride-931925:8462759")
+    implementation fg.deobf("curse.maven:magnesium-extras-558905:6041697")
+    implementation fg.deobf("curse.maven:flerovium-1142875:8284677")
     nativeBootstrapImplementation 'org.ow2.asm:asm-tree:9.5'
-    //shaderRuntimeMods 'curse.maven:embeddium-908741:5681725'
+    shaderRuntimeMods 'curse.maven:embeddium-908741:5681725'
 }
 
 tasks.register('shaderRuntimeBundle',Zip){

@@ -28,7 +28,7 @@ final class NativeSwapchain implements AutoCloseable {
     private final VulkanContext context;
     private final Consumer<String> log;
     private final boolean bottomOrigin;
-    private final Slot[] slots = {new Slot(), new Slot()};
+    private final Slot[] slots;
     private long pool, swapchain;
     private long[] images = {}, views = {}, finished = {};
     private long[] presentFences = {};
@@ -44,6 +44,12 @@ final class NativeSwapchain implements AutoCloseable {
         this(context,log,false);
     }
     NativeSwapchain(VulkanContext context, Consumer<String> log, boolean bottomOrigin) {
+        this(context, log, bottomOrigin, 2);
+    }
+    /** {@code frameSlots}: present command buffers in flight, one per frame the caller keeps in flight. */
+    NativeSwapchain(VulkanContext context, Consumer<String> log, boolean bottomOrigin, int frameSlots) {
+        slots = new Slot[Math.max(2, frameSlots)];
+        for (int i = 0; i < slots.length; i++) slots[i] = new Slot();
         if (context.interopEnabled() || context.surface == 0 || !context.nativePresentFences)
             throw new IllegalArgumentException("Native presentation needs a private device with a surface and presentation fences");
         this.context = context; this.log = log; this.bottomOrigin = bottomOrigin;

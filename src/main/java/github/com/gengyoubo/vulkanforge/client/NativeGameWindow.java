@@ -20,6 +20,8 @@ public final class NativeGameWindow {
     private static URLClassLoader loader;
     private static long frameSerial;
     private static final Map<String,Method> methods=new HashMap<>();
+    /** The per-draw entry point, bound to the backend: no name lookup, varargs array or reflective access check per draw. */
+    private static java.lang.invoke.MethodHandle drawHandle;
     private NativeGameWindow() { }
     public static boolean enabled(){return Boolean.getBoolean("vulkanforge.nativeBootstrap");}
     public static long handle(){return window;}
@@ -42,6 +44,7 @@ public final class NativeGameWindow {
             Path report=FMLPaths.GAMEDIR.get().resolve("logs/vulkanforge/native-game-report.txt");
             backend=type.getConstructor(String.class,long.class,long.class,int.class,String.class,boolean.class).newInstance(report.toAbsolutePath().toString(),hwnd,instance,startup.vulkanVersion().apiVersion,startup.nvidiaExtensionNames(),Boolean.getBoolean("vulkanforge.requireValidation"));
             for(Method method:type.getMethods())if(method.getDeclaringClass()==type)methods.put(method.getName(),method);
+            drawHandle=java.lang.invoke.MethodHandles.publicLookup().unreflect(type.getMethod("draw",int.class,Object[].class)).bindTo(backend).asType(java.lang.invoke.MethodType.methodType(void.class,int.class,Object[].class));
             NativeModeAvailability.markActive(report.resolveSibling("vk-native-compatibility.json"));
             return window;
         }catch(Throwable error){
@@ -54,6 +57,10 @@ public final class NativeGameWindow {
     public static Object call(String name,Object...arguments) {
         if(backend==null)throw new IllegalStateException("Native device is not initialized: "+name);
         try{return methods.get(name).invoke(backend,arguments);}catch(Throwable error){throw new IllegalStateException("Native Vulkan operation failed: "+name,cause(error));}
+    }
+    public static void draw(int framebuffer,Object[] packet){
+        if(drawHandle==null)throw new IllegalStateException("Native device is not initialized: draw");
+        try{drawHandle.invokeExact(framebuffer,packet);}catch(Throwable error){throw new IllegalStateException("Native Vulkan operation failed: draw",cause(error));}
     }
     private static Throwable cause(Throwable error){return error instanceof InvocationTargetException&&error.getCause()!=null?error.getCause():error;}
     public static void hint(int name,int value) {
@@ -77,6 +84,6 @@ public final class NativeGameWindow {
     public static void captureNext(Path path){call("captureNext",path.toAbsolutePath().toString());}
     static void close() {
         try{if(backend!=null)call("close");}
-        finally{backend=null;methods.clear();try{if(loader!=null)loader.close();}catch(java.io.IOException error){throw new IllegalStateException(error);}finally{loader=null;window=0;}}
+        finally{backend=null;drawHandle=null;methods.clear();try{if(loader!=null)loader.close();}catch(java.io.IOException error){throw new IllegalStateException(error);}finally{loader=null;window=0;}}
     }
 }

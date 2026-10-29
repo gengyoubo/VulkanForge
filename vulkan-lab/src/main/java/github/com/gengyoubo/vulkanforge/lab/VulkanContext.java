@@ -49,6 +49,8 @@ final class VulkanContext implements AutoCloseable {
     /** Shared by every pipeline build; persisted by {@link PipelineCache}. 0 when disabled. */
     long pipelineCache;
     long pipelinesCreated;
+    /** VkPhysicalDeviceFeatures.multiDrawIndirect is enabled: one vkCmdDrawIndexedIndirect may carry many draws. */
+    boolean multiDrawIndirect;
 
     VulkanContext() { this(requestedApiVersion()); }
 
@@ -195,7 +197,9 @@ final class VulkanContext implements AutoCloseable {
             var enabled12 = VkPhysicalDeviceVulkan12Features.calloc(stack).sType$Default().pNext(renderingFeatures)
                     .timelineSemaphore(capabilities.timeline()).drawIndirectCount(driven);
             var enabled11 = VkPhysicalDeviceVulkan11Features.calloc(stack).sType$Default().pNext(enabled12.address()).shaderDrawParameters(driven);
-            var core = VkPhysicalDeviceFeatures.calloc(stack).multiDrawIndirect(driven).drawIndirectFirstInstance(driven);
+            // Independent of the GPU-driven path: the native executor turns Embeddium multi-draws into indirect draws.
+            multiDrawIndirect = capabilities.multiDraw() && !Boolean.getBoolean("vulkanforge.disableMultiDrawIndirect");
+            var core = VkPhysicalDeviceFeatures.calloc(stack).multiDrawIndirect(driven || multiDrawIndirect).drawIndirectFirstInstance(driven);
             var graphicsFeatures=VkPhysicalDeviceFeatures.calloc(stack);vkGetPhysicalDeviceFeatures(physical,graphicsFeatures);
             core.independentBlend(graphicsFeatures.independentBlend()).shaderClipDistance(graphicsFeatures.shaderClipDistance()).shaderCullDistance(graphicsFeatures.shaderCullDistance());
             if(requestPipelineStatistics) {

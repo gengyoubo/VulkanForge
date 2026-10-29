@@ -19,6 +19,8 @@ import static github.com.gengyoubo.vulkanforge.lab.VulkanCommands.vkCmdWriteTime
 public final class NativeGameBackend implements AutoCloseable {
     private static final boolean DIAGNOSTICS=Boolean.getBoolean("vulkanforge.nativeDiagnostics"),PROFILE=Boolean.getBoolean("vulkanforge.nativeProfile");
     private static final int MAX_DRAWS=16384;
+    /** Host-visible vertex ring bytes one submission may copy; a frame beyond this is split, never failed. */
+    private static final long MAX_SUBMIT_VERTEX_BYTES=256L*1024*1024;
     private final VulkanContext context;
     private final PrintWriter report;
     private final NativeSwapchain presentation;
@@ -64,26 +66,37 @@ public final class NativeGameBackend implements AutoCloseable {
     }
     private final Map<Integer,Texture> textures=new HashMap<>();
     private final Map<Integer,Target> targets=new HashMap<>();
-    private final List<Runnable> retired=new ArrayList<>();
     private final List<Object[]> commands=new ArrayList<>();
     private final long[] samplers=new long[256];
-    private long pool,fence,descriptors,frames,draws,uploads,terrainDraws,entityDraws,embeddiumTerrainDraws;
+    private long pool,frames,draws,uploads,terrainDraws,entityDraws,embeddiumTerrainDraws,multiDrawPackets,indirectDraws,hoistedInputs,frameSplits,residentReclaims;
+    /** Work queued since the last flush, checked against the submission limits as draws arrive. */
+    private long queuedDraws,queuedVertexBytes,queuedIndexBytes;
+    /**
+     * CPU-written state of one frame. With FRAMES slots the CPU records frame N+1 while the GPU still executes frame N;
+     * a slot is reused only after its own fence, and resources retired while it records are destroyed then.
+     */
+    private static final int FRAMES=Math.max(1,Math.min(3,Integer.getInteger("vulkanforge.framesInFlight",2)));
+    private static final class Slot {
+        VkCommandBuffer command;long fence,descriptors,descriptorUniforms,persistentSamplers;boolean pending,descriptorsStale=true;
+        GpuBuffer vertices,indices,uniforms,constantVertices,indirect;
+        final Map<DescriptorKey,Long> persistentDescriptors=new HashMap<>();final List<Runnable> retired=new ArrayList<>();final List<String> markers=new ArrayList<>();
+    }
+    private final Slot[] slots=new Slot[FRAMES];
+    private Slot slot;
+    private int slotIndex;
+    /** The recording slot's command buffer. */
     private VkCommandBuffer command;
-    private GpuBuffer vertices,indices,uniforms,constantVertices;
-    private boolean pending,frameOpen,closed;
+    private boolean frameOpen,closed;
     private GpuTimers timers;
     private long vertexBytes,indexBytes,uniformBytes,terrainVertexBytes,terrainIndexBytes,descriptorSets,sceneSubmits,textureBytes;
     private long sceneFenceWaitNs,uploadDrainNs,flushCpuNs,hostCopyNs,descriptorCpuNs,sceneSubmitNs;
-    private final Map<DescriptorKey,Long> persistentDescriptors=new HashMap<>();
-    private long descriptorUniforms,persistentSamplers,descriptorResets,foldedClears;
-    private boolean descriptorsStale=true;
+    private long descriptorResets,foldedClears;
     /** Labelled GPU timestamps; a section runs from its marker to the next one in the same frame. */
     private static final boolean MARKERS=PROFILE||Boolean.getBoolean("vulkanforge.shaderPackProfile");
     private static final int MAX_MARKERS=256,MARKER_WARMUP=120;
     private long markerPool,markerFrames;
     private int markerBits;
     private double markerPeriod;
-    private final List<String> recordedMarkers=new ArrayList<>();
     private final Map<String,double[]> markerStats=new TreeMap<>();
     private static long stamp(){return PROFILE?System.nanoTime():0;}
     private static long elapsed(long start){return PROFILE?System.nanoTime()-start:0;}
@@ -93,42 +106,88 @@ public final class NativeGameBackend implements AutoCloseable {
     public static NativeGameBackend offscreen(String reportPath,int api,boolean validation)throws IOException{return new NativeGameBackend(reportPath,0,0,api,"",validation,true);}
     private NativeGameBackend(String reportPath,long hwnd,long hinstance,int api,String extensions,boolean validation,boolean offscreen)throws IOException {
         Path path=Path.of(reportPath).toAbsolutePath();Files.createDirectories(path.getParent());report=new PrintWriter(Files.newBufferedWriter(path),true);
-        context=new VulkanContext(api,extensions);geometry=new NativeGeometryCache(context,retired::add);NativeSwapchain created=null;
+        context=new VulkanContext(api,extensions);NativeSwapchain created=null;long geometryBudget;
         try {
-            if(offscreen)context.initialize(0,api,validation);else context.initializeNativeWin32(hwnd,hinstance,validation);created=offscreen?null:new NativeSwapchain(context,report::println,true);
+            if(offscreen)context.initialize(0,api,validation);else context.initializeNativeWin32(hwnd,hinstance,validation);created=offscreen?null:new NativeSwapchain(context,report::println,true,FRAMES);
+            geometryBudget=geometryBudget(context);
             try(var stack=MemoryStack.stackPush()) {
                 var h=stack.mallocLong(1);
                 check(vkCreateCommandPool(context.device,VkCommandPoolCreateInfo.calloc(stack).sType$Default().queueFamilyIndex(context.queueFamily).flags(VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT),null,h),"native game command pool");pool=h.get(0);
-                var p=stack.mallocPointer(1);check(vkAllocateCommandBuffers(context.device,VkCommandBufferAllocateInfo.calloc(stack).sType$Default().commandPool(pool).level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1),p),"native game command");command=new VkCommandBuffer(p.get(0),context.device);
-                check(vkCreateFence(context.device,VkFenceCreateInfo.calloc(stack).sType$Default().flags(VK_FENCE_CREATE_SIGNALED_BIT),null,h),"native game fence");fence=h.get(0);
+                var p=stack.mallocPointer(FRAMES);check(vkAllocateCommandBuffers(context.device,VkCommandBufferAllocateInfo.calloc(stack).sType$Default().commandPool(pool).level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(FRAMES),p),"native game command");
                 var sizes=VkDescriptorPoolSize.calloc(2,stack);sizes.get(0).type(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(MAX_DRAWS*16);sizes.get(1).type(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC).descriptorCount(MAX_DRAWS);
-                check(vkCreateDescriptorPool(context.device,VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(MAX_DRAWS).pPoolSizes(sizes),null,h),"native game descriptor pool");descriptors=h.get(0);
+                for(int i=0;i<FRAMES;i++){
+                    Slot frame=slots[i]=new Slot();frame.command=new VkCommandBuffer(p.get(i),context.device);
+                    check(vkCreateFence(context.device,VkFenceCreateInfo.calloc(stack).sType$Default().flags(VK_FENCE_CREATE_SIGNALED_BIT),null,h),"native game fence");frame.fence=h.get(0);
+                    check(vkCreateDescriptorPool(context.device,VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(MAX_DRAWS).pPoolSizes(sizes),null,h),"native game descriptor pool");frame.descriptors=h.get(0);
+                }
+                slot=slots[0];command=slot.command;
                 for(int i=0;i<samplers.length;i++){int wrap=(i&64)!=0?VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER:(i&2)!=0?VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE:VK_SAMPLER_ADDRESS_MODE_REPEAT;
                     check(vkCreateSampler(context.device,VkSamplerCreateInfo.calloc(stack).sType$Default().minFilter((i&1)!=0?VK_FILTER_LINEAR:VK_FILTER_NEAREST).magFilter((i&32)!=0?VK_FILTER_LINEAR:VK_FILTER_NEAREST).mipmapMode((i&16)!=0?VK_SAMPLER_MIPMAP_MODE_LINEAR:VK_SAMPLER_MIPMAP_MODE_NEAREST).maxLod((i&8)!=0?16:0).compareEnable((i&4)!=0).compareOp(VK_COMPARE_OP_LESS_OR_EQUAL).borderColor((i&128)!=0?VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK:VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE)
                         .addressModeU(wrap).addressModeV(wrap).addressModeW(wrap),null,h),"native game sampler");samplers[i]=h.get(0);}
             }
-            report.println("BACKEND="+(offscreen?"VK_NATIVE_OFFSCREEN_TEST":"VK_NATIVE_GAME")+"\nOPENGL_CONTEXTS=0\nSHARED_IMAGES=0\nEXTERNAL_SEMAPHORES=0\nVALIDATION="+(context.validationEnabled()?"ENABLED":"UNAVAILABLE"));
-            if(PROFILE)timers=new GpuTimers(context,1,report::println,"NATIVE_SCENE");
+            report.println("BACKEND="+(offscreen?"VK_NATIVE_OFFSCREEN_TEST":"VK_NATIVE_GAME")+"\nOPENGL_CONTEXTS=0\nSHARED_IMAGES=0\nEXTERNAL_SEMAPHORES=0\nVALIDATION="+(context.validationEnabled()?"ENABLED":"UNAVAILABLE")+"\nFRAMES_IN_FLIGHT="+FRAMES+"\nMULTI_DRAW_INDIRECT="+context.multiDrawIndirect);
+            if(PROFILE)timers=new GpuTimers(context,FRAMES,report::println,"NATIVE_SCENE");
         }catch(RuntimeException|Error error){if(created!=null)created.close();context.close();report.close();throw error;}
-        presentation=created;
+        presentation=created;geometry=new NativeGeometryCache(context,this::retire,geometryBudget);report.println("RESIDENT_GEOMETRY_BUDGET_MB="+(geometryBudget>>20));
         texture(0,1,1,0,new byte[]{-1,-1,-1,-1});
+    }
+    /**
+     * Resident terrain is all of Embeddium's region arenas plus versions retired by frames still in flight. A quarter of the
+     * largest device-local heap, 256 MiB to 2 GiB; {@code -Dvulkanforge.residentGeometryMB} overrides it.
+     */
+    private static long geometryBudget(VulkanContext context){
+        Integer override=Integer.getInteger("vulkanforge.residentGeometryMB");if(override!=null)return Math.max(16L,override)<<20;
+        try(var stack=MemoryStack.stackPush()){
+            var memory=VkPhysicalDeviceMemoryProperties.malloc(stack);vkGetPhysicalDeviceMemoryProperties(context.physical,memory);long heap=0;
+            for(int i=0;i<memory.memoryHeapCount();i++)if((memory.memoryHeaps(i).flags()&VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)!=0)heap=Math.max(heap,memory.memoryHeaps(i).size());
+            return Math.max(256L<<20,Math.min(2048L<<20,heap/4));
+        }
     }
     public void beginFrame() {
         if(closed)throw new IllegalStateException("Native game backend closed");if(frameOpen)return;
-        if(pending){long start=stamp();check(vkWaitForFences(context.device,fence,true,10_000_000_000L),"native game frame complete");sceneFenceWaitNs+=elapsed(start);pending=false;if(timers!=null)timers.collect(0);collectMarkers();}
-        if(presentation!=null)presentation.waitSlot(0);long drainStart=stamp();context.uploads.drain();uploadDrainNs+=elapsed(drainStart);
-        for(Runnable action:retired)action.run();retired.clear();frameOpen=true;
+        slot=slots[slotIndex];command=slot.command;
+        long start=stamp();waitSlot(slotIndex);sceneFenceWaitNs+=elapsed(start);
+        if(presentation!=null)presentation.waitSlot(slotIndex);
+        // Uploads are ordered before the scene by submission order and their own barriers; only completed batches are recycled here.
+        long drainStart=stamp();context.uploads.poll();uploadDrainNs+=elapsed(drainStart);
+        for(Runnable action:slot.retired)action.run();slot.retired.clear();frameOpen=true;
     }
+    private void waitSlot(int index){
+        Slot frame=slots[index];if(!frame.pending)return;
+        check(vkWaitForFences(context.device,frame.fence,true,10_000_000_000L),"native game frame complete");frame.pending=false;if(timers!=null)timers.collect(index);collectMarkers(frame,index);
+    }
+    /** Destroyed once every frame that may reference it has completed: the recording slot's fence covers all earlier submissions. */
+    private void retire(Runnable action){slot.retired.add(action);}
+    /** Waits for slot {@code index} and destroys what it retired; nothing queued for recording can still reference those. */
+    private void reclaim(int index){waitSlot(index);Slot frame=slots[index];for(Runnable action:frame.retired)action.run();frame.retired.clear();}
+    /** Submits the work queued so far and waits for it, so the frame continues within the per-submission limits. */
+    private void splitFrame(){
+        frameSplits++;flush(null);
+        // The flush may have submitted nothing, so the recording slot's fence alone need not cover the frame still in flight.
+        for(int i=0;i<FRAMES;i++)waitSlot(i);
+        for(int i=0;i<FRAMES;i++)reclaim(i);
+    }
+    /**
+     * A resident version, or null if the geometry cannot be resident even after reclaiming. Over the budget, versions
+     * retired by completed frames are destroyed first, then the frame is split so this frame's retired versions go too.
+     */
+    private NativeGeometryCache.Buffer resident(int id,long version,byte[] data,long base,int[] ranges){
+        NativeGeometryCache.Buffer buffer=geometry.get(id,version,data,base,ranges);if(buffer!=null||data.length==0)return buffer;
+        residentReclaims++;for(int i=0;i<FRAMES;i++)if(i!=slotIndex)reclaim(i);
+        buffer=geometry.get(id,version,data,-1,null);if(buffer!=null)return buffer;
+        splitFrame();return geometry.get(id,version,data,-1,null);
+    }
+    private void endFrame(){frameOpen=false;slotIndex=(slotIndex+1)%FRAMES;}
     public String[] program(int id,String vertex,String fragment,Object[] bindings) {
         return programWithOutputs(id,vertex,fragment,bindings,new Object[0]);
     }
     public String[] programWithOutputs(int id,String vertex,String fragment,Object[] bindings,Object[] outputs) {
         beginFrame();Map<String,Integer> attributes=new LinkedHashMap<>();for(Object binding:bindings){Object[] pair=(Object[])binding;attributes.put((String)pair[0],(Integer)pair[1]);}
         Map<String,Integer> locations=new LinkedHashMap<>();for(Object output:outputs){Object[] pair=(Object[])output;locations.put((String)pair[0],(Integer)pair[1]);}
-        NativeShaderProgram next=new NativeShaderProgram(context,vertex,fragment,attributes,locations),old=programs.put(id,next);if(old!=null)retired.add(old::close);
+        NativeShaderProgram next=new NativeShaderProgram(context,vertex,fragment,attributes,locations),old=programs.put(id,next);if(old!=null)retire(old::close);
         return next.samplers.toArray(String[]::new);
     }
-    public void deleteProgram(int id){beginFrame();NativeShaderProgram old=programs.remove(id);if(old!=null)retired.add(old::close);}
+    public void deleteProgram(int id){beginFrame();NativeShaderProgram old=programs.remove(id);if(old!=null)retire(old::close);}
     public String[] programUniforms(int id){return Objects.requireNonNull(programs.get(id),"Native shader program").activeUniforms.toArray(String[]::new);}
     /** Validate a fullscreen pack pipeline before publishing a hot-reload candidate. */
     public void prepareShaderPackProgram(int id){
@@ -159,10 +218,10 @@ public final class NativeGameBackend implements AutoCloseable {
     }
     private static int component(int value){return switch(value){case 0->VK_COMPONENT_SWIZZLE_ZERO;case 1->VK_COMPONENT_SWIZZLE_ONE;case 6403->VK_COMPONENT_SWIZZLE_R;case 6404->VK_COMPONENT_SWIZZLE_G;case 6405->VK_COMPONENT_SWIZZLE_B;case 6406->VK_COMPONENT_SWIZZLE_A;default->throw new UnsupportedOperationException("Texture component "+value);};}
     private void retain(Image image){if(image!=null)image.references++;}
-    private void release(Image image){if(image!=null&&--image.references==0)retired.add(image.gpu::close);}
+    private void release(Image image){if(image!=null&&--image.references==0)retire(image.gpu::close);}
     private void putTexture(int id,Texture texture){retain(texture.image());Texture old=textures.put(id,texture);if(old!=null){if(old.view()!=old.image().gpu.sampledView)retireView(old.view());release(old.image());}}
     /** A destroyed view's handle may be reused by a new view, so cached descriptor sets naming it must not be matched again. */
-    private void retireView(long view){descriptorsStale=true;retired.add(()->vkDestroyImageView(context.device,view,null));}
+    private void retireView(long view){for(Slot frame:slots)frame.descriptorsStale=true;retire(()->vkDestroyImageView(context.device,view,null));}
     private void release(Target target){for(Image color:target.attachments)release(color);release(target.depth);}
     public void deleteTexture(int id){beginFrame();Texture old=textures.remove(id);if(old!=null){if(old.view()!=old.image().gpu.sampledView)retireView(old.view());release(old.image());}}
     public void renderTexture(int id,int width,int height,int internal,int flags){
@@ -197,17 +256,17 @@ public final class NativeGameBackend implements AutoCloseable {
             var properties=VkPhysicalDeviceProperties.malloc(stack);vkGetPhysicalDeviceProperties(context.physical,properties);var count=stack.ints(0);vkGetPhysicalDeviceQueueFamilyProperties(context.physical,count,null);
             var families=VkQueueFamilyProperties.malloc(count.get(0),stack);vkGetPhysicalDeviceQueueFamilyProperties(context.physical,count,families);
             markerBits=families.get(context.queueFamily).timestampValidBits();markerPeriod=properties.limits().timestampPeriod();if(markerBits==0||markerPeriod<=0)return;
-            var handle=stack.mallocLong(1);check(vkCreateQueryPool(context.device,VkQueryPoolCreateInfo.calloc(stack).sType$Default().queryType(VK_QUERY_TYPE_TIMESTAMP).queryCount(MAX_MARKERS),null,handle),"GPU marker timestamps");markerPool=handle.get(0);
+            var handle=stack.mallocLong(1);check(vkCreateQueryPool(context.device,VkQueryPoolCreateInfo.calloc(stack).sType$Default().queryType(VK_QUERY_TYPE_TIMESTAMP).queryCount(MAX_MARKERS*FRAMES),null,handle),"GPU marker timestamps");markerPool=handle.get(0);
         }
     }
     /** After the frame fence: per-label sums of this frame, one sample per label and frame. */
-    private void collectMarkers(){
-        int n=recordedMarkers.size();if(markerPool==0||n<2){recordedMarkers.clear();return;}
+    private void collectMarkers(Slot frame,int index){
+        List<String> recordedMarkers=frame.markers;int n=recordedMarkers.size();if(markerPool==0||n<2){recordedMarkers.clear();return;}
         try(var stack=MemoryStack.stackPush()){
-            var values=stack.mallocLong(n);if(vkGetQueryPoolResults(context.device,markerPool,0,n,values,8,VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WAIT_BIT)!=VK_SUCCESS){recordedMarkers.clear();return;}
+            var values=stack.mallocLong(n);if(vkGetQueryPoolResults(context.device,markerPool,index*MAX_MARKERS,n,values,8,VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WAIT_BIT)!=VK_SUCCESS){recordedMarkers.clear();return;}
             if(++markerFrames>MARKER_WARMUP){
-                Map<String,Double> frame=new LinkedHashMap<>();for(int i=0;i+1<n;i++)frame.merge(recordedMarkers.get(i),GpuTimers.elapsedTicks(values.get(i),values.get(i+1),markerBits)*markerPeriod/1e6,Double::sum);
-                frame.forEach((label,ms)->{double[] stat=markerStats.computeIfAbsent(label,unused->new double[3]);stat[0]++;stat[1]+=ms;stat[2]=Math.max(stat[2],ms);});
+                Map<String,Double> sums=new LinkedHashMap<>();for(int i=0;i+1<n;i++)sums.merge(recordedMarkers.get(i),GpuTimers.elapsedTicks(values.get(i),values.get(i+1),markerBits)*markerPeriod/1e6,Double::sum);
+                sums.forEach((label,ms)->{double[] stat=markerStats.computeIfAbsent(label,unused->new double[3]);stat[0]++;stat[1]+=ms;stat[2]=Math.max(stat[2],ms);});
             }
         }
         recordedMarkers.clear();
@@ -226,34 +285,50 @@ public final class NativeGameBackend implements AutoCloseable {
         beginFrame();NativeShaderProgram program=programs.get((Integer)packet[0]);if(program==null)throw new IllegalStateException("Missing native shader program "+packet[0]);
         int[] ids=(int[])packet[11],overrides=packet.length>13?(int[])packet[13]:null;Texture[] inputs=new Texture[ids.length];for(int i=0;i<ids.length;i++){inputs[i]=textures.get(ids[i]);if(inputs[i]==null)throw new IllegalStateException("Missing native texture "+ids[i]);if(overrides!=null&&overrides[i]>=0)inputs[i]=new Texture(inputs[i].image(),samplers[overrides[i]&255],inputs[i].view());}
         NativeGeometryCache.Buffer vertex=null,index=null;
-        if(program.terrain&&packet.length>12){long[] resource=(long[])packet[12];vertex=geometry.get((int)resource[0],resource[1],(byte[])packet[1]);index=geometry.get((int)resource[2],resource[3],(byte[])packet[2]);}
-        commands.add(new Object[]{0,target(framebuffer),program,packet,inputs,vertex,index});
+        if(program.terrain&&packet.length>12){
+            long[] resource=(long[])packet[12];int[][] ranges=packet.length>18?(int[][])packet[18]:null;
+            vertex=resident((int)resource[0],resource[1],(byte[])packet[1],resource.length>6?resource[6]:-1,ranges==null?null:ranges[0]);
+            index=resident((int)resource[2],resource[3],(byte[])packet[2],resource.length>7?resource[7]:-1,ranges==null?null:ranges[1]);
+        }
+        long vertexCopy=vertex==null?((byte[])packet[1]).length:0,indexCopy=index==null?(indexCopyLength(packet)+3)&~3:0;
+        if(vertexCopy>MAX_SUBMIT_VERTEX_BYTES)throw new UnsupportedOperationException("Native draw copies "+vertexCopy+" vertex bytes, above the "+MAX_SUBMIT_VERTEX_BYTES+" byte submission limit");
+        if(queuedDraws>0&&(queuedDraws+1>MAX_DRAWS||queuedVertexBytes+vertexCopy>MAX_SUBMIT_VERTEX_BYTES))splitFrame();
+        commands.add(new Object[]{0,target(framebuffer),program,packet,inputs,vertex,index});queuedDraws++;queuedVertexBytes+=vertexCopy;queuedIndexBytes+=indexCopy;
     }
     public void deleteBuffer(int id){beginFrame();geometry.delete(id);}
     private static int indexLength(Object[] packet){return Math.multiplyExact((Integer)packet[4],(Integer)packet[3]==5123?2:4);}
+    /** Sub-draw counts of a multi-draw packet, or null. Their offsets are absolute in the packet's index data. */
+    private static int[] multi(Object[] packet){return packet.length>15?(int[])packet[15]:null;}
+    /** Index bytes a non-resident draw copies: its range, or all index data for a multi-draw. */
+    private static int indexCopyLength(Object[] packet){return multi(packet)!=null?((byte[])packet[2]).length:indexLength(packet);}
     private static int indexStart(Object[] packet){return packet.length>12?Math.toIntExact(((long[])packet[12])[4]):0;}
     private GpuBuffer ensure(GpuBuffer buffer,int size,int usage){if(buffer!=null&&buffer.mapped.capacity()>=size)return buffer;if(buffer!=null)buffer.close();return new GpuBuffer(context,Math.max(4096,Integer.highestOneBit(Math.max(1,size-1))<<1),usage);}
     private void flush(Image presented) {
         if(commands.isEmpty()&&(presented==null||presented.layout==VK_IMAGE_LAYOUT_UNDEFINED||presented.layout==VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL))return;
         long flushStart=stamp();
-        int vb=0,ib=0,count=0,uniformSize=0,samplerInputs=0;boolean marked=false;for(Object[] entry:commands)if((Integer)entry[0]==0){Object[] p=(Object[])entry[3];if(entry[5]==null)vb=Math.addExact(vb,((byte[])p[1]).length);if(entry[6]==null)ib=Math.addExact(ib,(indexLength(p)+3)&~3);uniformSize=Math.addExact(uniformSize,((NativeShaderProgram)entry[2]).uniformStride);samplerInputs+=((Texture[])entry[4]).length;count++;}else if((Integer)entry[0]==7)marked=true;
-        if(count>MAX_DRAWS||vb>256*1024*1024)throw new UnsupportedOperationException("Native frame upload budget exceeded; no draws discarded");
-        vertices=ensure(vertices,vb,VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);indices=ensure(indices,ib,VK_BUFFER_USAGE_INDEX_BUFFER_BIT);uniforms=ensure(uniforms,uniformSize,VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-        constantVertices=ensure(constantVertices,count*512,VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);FloatBuffer constants=constantVertices.mapped.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer();
+        int vb=0,ib=0,count=0,uniformSize=0,samplerInputs=0,subDraws=0;boolean marked=false;for(Object[] entry:commands)if((Integer)entry[0]==0){Object[] p=(Object[])entry[3];if(entry[5]==null)vb=Math.addExact(vb,((byte[])p[1]).length);if(entry[6]==null)ib=Math.addExact(ib,(indexCopyLength(p)+3)&~3);uniformSize=Math.addExact(uniformSize,((NativeShaderProgram)entry[2]).uniformStride);samplerInputs+=((Texture[])entry[4]).length;int[] multi=multi(p);if(multi!=null)subDraws+=multi.length;count++;}else if((Integer)entry[0]==7)marked=true;
+        queuedDraws=queuedVertexBytes=queuedIndexBytes=0;
+        if(count>MAX_DRAWS||vb>MAX_SUBMIT_VERTEX_BYTES)throw new UnsupportedOperationException("Native frame upload budget exceeded; no draws discarded (draws="+count+", vertexBytes="+vb+", indexBytes="+ib+")");
+        Slot frame=slot;GpuBuffer vertices,indices,uniforms,constantVertices,indirect;
+        vertices=frame.vertices=ensure(frame.vertices,vb,VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);indices=frame.indices=ensure(frame.indices,ib,VK_BUFFER_USAGE_INDEX_BUFFER_BIT);uniforms=frame.uniforms=ensure(frame.uniforms,uniformSize,VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+        constantVertices=frame.constantVertices=ensure(frame.constantVertices,count*512,VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);FloatBuffer constants=constantVertices.mapped.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer();
+        indirect=frame.indirect=ensure(frame.indirect,Math.max(20,subDraws*20),VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);IntBuffer indirectData=indirect.mapped.duplicate().order(ByteOrder.nativeOrder()).asIntBuffer();
         ByteBuffer vertexData=vertices.mapped.duplicate().clear(),indexData=indices.mapped.duplicate().clear();FloatBuffer values=uniforms.mapped.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer();
         try(var frameStack=MemoryStack.stackPush()) {
             // Descriptor sets outlive the frame: (program, inputs) keeps its set until a view it names may be destroyed,
             // the uniform ring is reallocated, or this frame could exhaust the pool. The previous frame's fence has completed.
-            if(descriptorsStale||descriptorUniforms!=uniforms.buffer||persistentDescriptors.size()+count>MAX_DRAWS||persistentSamplers+samplerInputs>MAX_DRAWS*16){
-                check(vkResetDescriptorPool(context.device,descriptors,0),"reset native game descriptors");persistentDescriptors.clear();persistentSamplers=0;descriptorUniforms=uniforms.buffer;descriptorsStale=false;descriptorResets++;
+            if(frame.descriptorsStale||frame.descriptorUniforms!=uniforms.buffer||frame.persistentDescriptors.size()+count>MAX_DRAWS||frame.persistentSamplers+samplerInputs>MAX_DRAWS*16){
+                check(vkResetDescriptorPool(context.device,frame.descriptors,0),"reset native game descriptors");frame.persistentDescriptors.clear();frame.persistentSamplers=0;frame.descriptorUniforms=uniforms.buffer;frame.descriptorsStale=false;descriptorResets++;
             }
             check(vkResetCommandBuffer(command,0),"reset native game command");
             check(vkBeginCommandBuffer(command,VkCommandBufferBeginInfo.calloc(frameStack).sType$Default().flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)),"begin native game command");
-            recordedMarkers.clear();if(marked&&markerPool==0)createMarkers();if(markerPool!=0)vkCmdResetQueryPool(command,markerPool,0,MAX_MARKERS);
-            if(timers!=null){timers.begin(command,0);timers.start(command,0,0,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);}
+            List<String> recordedMarkers=frame.markers;int markerBase=slotIndex*MAX_MARKERS;
+            recordedMarkers.clear();if(marked&&markerPool==0)createMarkers();if(markerPool!=0)vkCmdResetQueryPool(command,markerPool,markerBase,MAX_MARKERS);
+            if(timers!=null){timers.begin(command,slotIndex);timers.start(command,slotIndex,0,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);}
             Target active=null;int drawIndex=0,uniformOffset=0;long boundPipeline=0,boundIndex=0,boundIndexOffset=-1;int boundIndexType=-1;int[] previousArea=null;float previousBias=Float.NaN,previousSlope=Float.NaN;
-            Map<DescriptorKey,Long> descriptorCache=persistentDescriptors;
-            for(Object[] entry:commands) {
+            Map<DescriptorKey,Long> descriptorCache=frame.persistentDescriptors;int indirectOffset=0;
+            for(int at=0;at<commands.size();at++) {
+                Object[] entry=commands.get(at);
                 try(var stack=MemoryStack.stackPush()) {
                 int kind=(Integer)entry[0];
                 if(kind==0) {
@@ -262,14 +337,14 @@ public final class NativeGameBackend implements AutoCloseable {
                     if(active!=output||transition){
                         if(active!=null)vkCmdEndRendering(command);
                         // Inputs and attachments share one barrier batch.
-                        Barriers barriers=new Barriers(stack,inputs.length+output.colors.length+1);for(Texture input:inputs)barriers.add(input.image(),VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT|VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-                        begin(output,stack,barriers,0,null,1);active=output;
+                        begin(output,stack,sampled(output,at,stack,output.colors.length+1),0,null,1);active=output;
                     }
                     long copyStart=stamp();
                     byte[] vertexBytes=(byte[])p[1],indexBytes=(byte[])p[2];int vertexOffset=vertexData.position(),indexOffset=indexData.position(),indexLength=indexLength(p);
                     NativeGeometryCache.Buffer residentVertex=(NativeGeometryCache.Buffer)entry[5],residentIndex=(NativeGeometryCache.Buffer)entry[6];
                     if(residentVertex==null)vertexData.put(vertexBytes);
-                    if(residentIndex==null)indexData.put(indexBytes,indexStart(p),indexLength).position((indexData.position()+3)&~3);
+                    int[] multi=multi(p);
+                    if(residentIndex==null){if(multi==null)indexData.put(indexBytes,indexStart(p),indexLength);else indexData.put(indexBytes);indexData.position((indexData.position()+3)&~3);}
                     program.writeValues((Object[])p[10],values,uniformOffset/4);
                     hostCopyNs+=elapsed(copyStart);
                     if(DIAGNOSTICS){if(residentVertex==null)this.vertexBytes+=vertexBytes.length;if(residentIndex==null)this.indexBytes+=indexLength;uniformBytes+=program.uniformBytes;if(program.terrain){if(residentVertex==null)terrainVertexBytes+=vertexBytes.length;if(residentIndex==null)terrainIndexBytes+=indexLength;}}
@@ -286,25 +361,35 @@ public final class NativeGameBackend implements AutoCloseable {
                     long descriptorStart=stamp();
                     DescriptorKey key=new DescriptorKey(program,inputs);Long binding=descriptorCache.get(key);
                     if(binding==null){
-                    var descriptor=stack.mallocLong(1);check(vkAllocateDescriptorSets(context.device,VkDescriptorSetAllocateInfo.calloc(stack).sType$Default().descriptorPool(descriptors).pSetLayouts(stack.longs(program.textureLayout)),descriptor),"native draw descriptors");
+                    var descriptor=stack.mallocLong(1);check(vkAllocateDescriptorSets(context.device,VkDescriptorSetAllocateInfo.calloc(stack).sType$Default().descriptorPool(frame.descriptors).pSetLayouts(stack.longs(program.textureLayout)),descriptor),"native draw descriptors");
                     var writes=VkWriteDescriptorSet.calloc(inputs.length+1,stack);
                     for(int i=0;i<inputs.length;i++){Texture input=inputs[i];writes.get(i).sType$Default().dstSet(descriptor.get(0)).dstBinding(program.samplerBindings[i]).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1).pImageInfo(VkDescriptorImageInfo.calloc(1,stack).sampler(input.sampler()).imageView(input.view()).imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));}
                     writes.get(inputs.length).sType$Default().dstSet(descriptor.get(0)).dstBinding(program.uniformBinding).descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC).pBufferInfo(VkDescriptorBufferInfo.calloc(1,stack).buffer(uniforms.buffer).range(program.uniformBytes));vkUpdateDescriptorSets(context.device,writes,null);
-                    binding=descriptor.get(0);descriptorCache.put(key,binding);persistentSamplers+=inputs.length;descriptorSets++;
+                    binding=descriptor.get(0);descriptorCache.put(key,binding);frame.persistentSamplers+=inputs.length;descriptorSets++;
                     }
                     descriptorCpuNs+=elapsed(descriptorStart);
                     vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,program.layout,0,stack.longs(binding),stack.ints(uniformOffset));
                     vkCmdBindVertexBuffers(command,0,stack.longs(residentVertex==null?vertices.buffer:residentVertex.gpu.buffer),stack.longs(residentVertex==null?vertexOffset:0));
                     if(vertexLayout!=(int[][])p[6])vkCmdBindVertexBuffers(command,1,stack.longs(constantVertices.buffer),stack.longs(drawIndex*512L));
-                    long indexBuffer=residentIndex==null?indices.buffer:residentIndex.gpu.buffer,indexByteOffset=residentIndex==null?indexOffset:indexStart(p);int indexType=(Integer)p[3]==5123?VK_INDEX_TYPE_UINT16:VK_INDEX_TYPE_UINT32;
+                    long indexBuffer=residentIndex==null?indices.buffer:residentIndex.gpu.buffer,indexByteOffset=residentIndex==null?indexOffset:multi!=null?0:indexStart(p);int indexType=(Integer)p[3]==5123?VK_INDEX_TYPE_UINT16:VK_INDEX_TYPE_UINT32;
                     if(boundIndex!=indexBuffer||boundIndexOffset!=indexByteOffset||boundIndexType!=indexType){vkCmdBindIndexBuffer(command,indexBuffer,indexByteOffset,indexType);boundIndex=indexBuffer;boundIndexOffset=indexByteOffset;boundIndexType=indexType;}
                     int baseVertex=p.length>12&&((long[])p[12]).length>5?Math.toIntExact(((long[])p[12])[5]):0;
-                    vkCmdDrawIndexed(command,(Integer)p[4],1,0,baseVertex,0);draws++;if(program.terrain)terrainDraws++;if(program.embeddium)embeddiumTerrainDraws++;if(program.entity)entityDraws++;drawIndex++;uniformOffset+=program.uniformStride;
+                    int drawn=1;
+                    if(multi==null)vkCmdDrawIndexed(command,(Integer)p[4],1,0,baseVertex,0);
+                    else{
+                        // One packet per Embeddium region: shared state was bound once; the sections become one indirect draw.
+                        int[] offsets=(int[])p[16],bases=(int[])p[17];int indexSize=indexType==VK_INDEX_TYPE_UINT16?2:4;drawn=multi.length;multiDrawPackets++;
+                        if(context.multiDrawIndirect){
+                            for(int i=0;i<multi.length;i++)indirectData.put(multi[i]).put(1).put(offsets[i]/indexSize).put(bases[i]).put(0);
+                            vkCmdDrawIndexedIndirect(command,indirect.buffer,indirectOffset,multi.length,20);indirectOffset+=multi.length*20;indirectDraws++;
+                        }else for(int i=0;i<multi.length;i++)vkCmdDrawIndexed(command,multi[i],1,offsets[i]/indexSize,bases[i],0);
+                    }
+                    draws+=drawn;if(program.terrain)terrainDraws+=drawn;if(program.embeddium)embeddiumTerrainDraws+=drawn;if(program.entity)entityDraws+=drawn;drawIndex++;uniformOffset+=program.uniformStride;
                 } else if(kind==1) {
-                    active=clearCommand(entry,active,stack);
+                    active=clearCommand(entry,active,at,stack);
                 } else if(kind==7) {
                     // Timestamps are legal inside rendering: markers never split a pass.
-                    if(markerPool!=0&&recordedMarkers.size()<MAX_MARKERS){vkCmdWriteTimestamp2(command,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,markerPool,recordedMarkers.size());recordedMarkers.add((String)entry[1]);}
+                    if(markerPool!=0&&recordedMarkers.size()<MAX_MARKERS){vkCmdWriteTimestamp2(command,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,markerPool,markerBase+recordedMarkers.size());recordedMarkers.add((String)entry[1]);}
                 } else {
                     if(active!=null){vkCmdEndRendering(command);active=null;}
                     if(kind==2)blitCommand(entry,stack);
@@ -320,14 +405,33 @@ public final class NativeGameBackend implements AutoCloseable {
             // The presentation pass consumes the final color in COLOR_ATTACHMENT_OPTIMAL. Every other image keeps its layout;
             // its next use transitions it from the tracked state.
             if(presented!=null&&presented.layout!=VK_IMAGE_LAYOUT_UNDEFINED)transition(command,frameStack,presented,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-            if(timers!=null)timers.end(command,0,0,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
-            check(vkEndCommandBuffer(command),"end native game command");context.uploads.flush();check(vkResetFences(context.device,fence),"reset native game fence");
-            long submitStart=stamp();check(vkQueueSubmit2(context.queue,VkSubmitInfo2.calloc(1,frameStack).sType$Default().pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1,frameStack).sType$Default().commandBuffer(command)),fence),"native game submit");sceneSubmitNs+=elapsed(submitStart);sceneSubmits++;pending=true;if(timers!=null)timers.submitted(0);
+            if(timers!=null)timers.end(command,slotIndex,0,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+            check(vkEndCommandBuffer(command),"end native game command");context.uploads.flush();check(vkResetFences(context.device,frame.fence),"reset native game fence");
+            long submitStart=stamp();check(vkQueueSubmit2(context.queue,VkSubmitInfo2.calloc(1,frameStack).sType$Default().pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1,frameStack).sType$Default().commandBuffer(command)),frame.fence),"native game submit");sceneSubmitNs+=elapsed(submitStart);sceneSubmits++;frame.pending=true;if(timers!=null)timers.submitted(slotIndex);
         }
         commands.clear();
         flushCpuNs+=elapsed(flushStart);
     }
     private void begin(Target target,MemoryStack stack){begin(target,stack,new Barriers(stack,target.colors.length+1),0,null,1);}
+    /**
+     * Barriers for a rendering of {@code target} that starts at command {@code from}: every texture sampled by the run of
+     * commands that stays inside it (its draws, clears and markers) moves to SHADER_READ up front. Inside the run only the
+     * target's attachments are written, so this is the same dependency, and a later first-use input no longer splits the pass.
+     */
+    private Barriers sampled(Target target,int from,MemoryStack stack,int extra){
+        List<Image> inputs=new ArrayList<>();
+        for(int at=from;at<commands.size();at++){
+            Object[] entry=commands.get(at);int kind=(Integer)entry[0];
+            if(kind==7)continue;
+            if(kind==1&&entry[1]==target)continue;
+            if(kind!=0||entry[1]!=target)break;
+            for(Texture input:(Texture[])entry[4]){Image image=input.image();if(!target.contains(image)&&image.layout!=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL&&!inputs.contains(image))inputs.add(image);}
+        }
+        Barriers barriers=new Barriers(stack,inputs.size()+extra);
+        for(Image image:inputs)barriers.add(image,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT|VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        if(inputs.size()>1)hoistedInputs+=inputs.size()-1;
+        return barriers;
+    }
     /**
      * Starts dynamic rendering after one batched barrier for {@code barriers} plus the attachments. Attachments in
      * {@code clearMask} use loadOp CLEAR, so a full-target glClear costs neither a load nor a separate clear pass.
@@ -350,14 +454,15 @@ public final class NativeGameBackend implements AutoCloseable {
      * glClear. Inside the target's open rendering it is a vkCmdClearAttachments; a full-target clear otherwise starts
      * the target's rendering with loadOp CLEAR. Rendering is left open, so following draws to the target continue in it.
      */
-    private Target clearCommand(Object[] entry,Target active,MemoryStack stack){
+    private Target clearCommand(Object[] entry,Target active,int index,MemoryStack stack){
         Target target=(Target)entry[1];int mask=(Integer)entry[2];int[] rect=(int[])entry[5];float[] value=(float[])entry[3];
         if(rect[2]<=0||rect[3]<=0)return active;
         boolean full=rect[0]<=0&&rect[1]<=0&&rect[0]+rect[2]>=target.width()&&rect[1]+rect[3]>=target.height();
         if(active!=target){
             if(active!=null)vkCmdEndRendering(command);
-            if(full){begin(target,stack,new Barriers(stack,target.colors.length+1),mask,value,(Float)entry[4]);foldedClears++;return target;}
-            begin(target,stack);
+            Barriers barriers=sampled(target,index+1,stack,target.colors.length+1);
+            if(full){begin(target,stack,barriers,mask,value,(Float)entry[4]);foldedClears++;return target;}
+            begin(target,stack,barriers,0,null,1);
         }
         int count=0;if((mask&16384)!=0)for(Image color:target.colors)if(color!=null)count++;if((mask&256)!=0)count++;
         if(count==0)return target;
@@ -405,8 +510,8 @@ public final class NativeGameBackend implements AutoCloseable {
         mipToSource(cmd,stack,image,image.gpu.levels-1);image.layout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;image.stage=VK_PIPELINE_STAGE_2_BLIT_BIT;image.access=VK_ACCESS_2_TRANSFER_READ_BIT|VK_ACCESS_2_TRANSFER_WRITE_BIT;
         transition(cmd,stack,image,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT|VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     }
-    public void present(int framebuffer,int width,int height){beginFrame();Target source=target(framebuffer);flush(source.color());if(presentation.begin(0,width,height)){presentation.present(source.color().gpu);frames++;}frameOpen=false;}
-    public void finishOffscreenFrame(){if(presentation!=null)throw new IllegalStateException("Offscreen frame operation on a game window");beginFrame();flush(null);frameOpen=false;}
+    public void present(int framebuffer,int width,int height){beginFrame();Target source=target(framebuffer);flush(source.color());if(presentation.begin(slotIndex,width,height)){presentation.present(source.color().gpu);frames++;}endFrame();}
+    public void finishOffscreenFrame(){if(presentation!=null)throw new IllegalStateException("Offscreen frame operation on a game window");beginFrame();flush(null);endFrame();}
     public void setVsync(boolean enabled){presentation.setVsync(enabled);}
     public void captureNext(String path){presentation.captureNext(path);}
     /** Explicit game screenshot/thumbnail readback. Never used to transport a normal rendered frame. */
@@ -422,8 +527,8 @@ public final class NativeGameBackend implements AutoCloseable {
     }
     private byte[] readTextureBytes(int id,int pixelBytes) {
         beginFrame();flush(null);
-        if(pending){check(vkWaitForFences(context.device,fence,true,10_000_000_000L),"wait native screenshot source");pending=false;if(timers!=null)timers.collect(0);collectMarkers();}
-        context.uploads.drain();Texture source=Objects.requireNonNull(textures.get(id),"Native readback texture");
+        for(int i=0;i<FRAMES;i++)waitSlot(i);
+        context.uploads.drain();long fence=slot.fence;Texture source=Objects.requireNonNull(textures.get(id),"Native readback texture");
         Image image=source.image();int width=image.gpu.width,height=image.gpu.height,size=Math.multiplyExact(Math.multiplyExact(width,height),pixelBytes),previous=image.layout;
         try(GpuBuffer storage=new GpuBuffer(context,size,VK_BUFFER_USAGE_TRANSFER_DST_BIT);var stack=MemoryStack.stackPush()) {
             check(vkResetCommandBuffer(command,0),"reset native screenshot command");check(vkBeginCommandBuffer(command,VkCommandBufferBeginInfo.calloc(stack).sType$Default().flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)),"begin native screenshot command");
@@ -441,8 +546,8 @@ public final class NativeGameBackend implements AutoCloseable {
     public String[] deviceInfo(){try(var stack=MemoryStack.stackPush()){var properties=VkPhysicalDeviceProperties.malloc(stack);vkGetPhysicalDeviceProperties(context.physical,properties);String vendor=switch(properties.vendorID()){case 0x10de->"NVIDIA Corporation";case 0x1002->"AMD";case 0x8086->"Intel";default->"Vulkan device vendor "+properties.vendorID();};return new String[]{properties.deviceNameString(),vendor};}}
     public Map<String,Long> diagnostics(){
         Map<String,Long> result=new LinkedHashMap<>(presentation==null?Map.of():presentation.diagnostics());result.putAll(geometry.stats());result.put("embeddiumTerrainDraws",embeddiumTerrainDraws);
-        String[] names={"frames","draws","terrainDraws","entityDraws","vertexBytes","indexBytes","uniformBytes","terrainVertexBytes","terrainIndexBytes","descriptorSets","sceneSubmits","textureBytes","sceneFenceWaitNs","uploadDrainNs","flushInclusiveNs","hostCopyNs","descriptorCpuNs","sceneSubmitNs","descriptorResets","foldedClears","cachedDescriptorSets"};
-        long[] values={frames,draws,terrainDraws,entityDraws,vertexBytes,indexBytes,uniformBytes,terrainVertexBytes,terrainIndexBytes,descriptorSets,sceneSubmits,textureBytes,sceneFenceWaitNs,uploadDrainNs,flushCpuNs,hostCopyNs,descriptorCpuNs,sceneSubmitNs,descriptorResets,foldedClears,persistentDescriptors.size()};
+        String[] names={"frames","draws","terrainDraws","entityDraws","vertexBytes","indexBytes","uniformBytes","terrainVertexBytes","terrainIndexBytes","descriptorSets","sceneSubmits","textureBytes","sceneFenceWaitNs","uploadDrainNs","flushInclusiveNs","hostCopyNs","descriptorCpuNs","sceneSubmitNs","descriptorResets","foldedClears","cachedDescriptorSets","framesInFlight","multiDrawPackets","indirectDraws","hoistedInputs","frameSplits","residentReclaims"};
+        long[] values={frames,draws,terrainDraws,entityDraws,vertexBytes,indexBytes,uniformBytes,terrainVertexBytes,terrainIndexBytes,descriptorSets,sceneSubmits,textureBytes,sceneFenceWaitNs,uploadDrainNs,flushCpuNs,hostCopyNs,descriptorCpuNs,sceneSubmitNs,descriptorResets,foldedClears,Arrays.stream(slots).mapToLong(frame->frame.persistentDescriptors.size()).sum(),FRAMES,multiDrawPackets,indirectDraws,hoistedInputs,frameSplits,residentReclaims};
         for(int i=0;i<names.length;i++)result.put(names[i],values[i]);long[] upload=context.uploads.stats();result.put("uploadSubmits",upload[0]);result.put("uploadBytes",upload[2]);
         if(timers!=null){double[] metric=timers.metric(0);result.put("sceneGpuSamples",(long)metric[0]);result.put("sceneGpuNs",Math.round(metric[1]*1e6));}return result;
     }
@@ -450,13 +555,13 @@ public final class NativeGameBackend implements AutoCloseable {
     @Override public void close(){
         if(closed)return;closed=true;if(presentation!=null)presentation.close();if(context.device!=null)vkDeviceWaitIdle(context.device);
         context.uploads.drain();closeDiagnostics();
-        for(Runnable action:retired)action.run();retired.clear();Set<Image> images=Collections.newSetFromMap(new IdentityHashMap<>());
+        for(Slot frame:slots){for(Runnable action:frame.retired)action.run();frame.retired.clear();}Set<Image> images=Collections.newSetFromMap(new IdentityHashMap<>());
         geometry.close();
         for(Texture texture:textures.values()){if(texture.view()!=texture.image().gpu.sampledView)vkDestroyImageView(context.device,texture.view(),null);images.add(texture.image());}for(Target target:targets.values()){for(Image color:target.attachments)if(color!=null)images.add(color);images.add(target.depth());}
         for(Image image:images)image.gpu.close();for(NativeShaderProgram program:programs.values())program.close();
-        if(vertices!=null)vertices.close();if(indices!=null)indices.close();if(uniforms!=null)uniforms.close();if(constantVertices!=null)constantVertices.close();
+        for(Slot frame:slots){for(GpuBuffer buffer:new GpuBuffer[]{frame.vertices,frame.indices,frame.uniforms,frame.constantVertices,frame.indirect})if(buffer!=null)buffer.close();vkDestroyDescriptorPool(context.device,frame.descriptors,null);vkDestroyFence(context.device,frame.fence,null);}
         for(long sampler:samplers)if(sampler!=0)vkDestroySampler(context.device,sampler,null);
-        vkDestroyDescriptorPool(context.device,descriptors,null);vkDestroyFence(context.device,fence,null);vkDestroyCommandPool(context.device,pool,null);
+        vkDestroyCommandPool(context.device,pool,null);
         report.println("FINAL_PRESENTED_FRAMES="+frames+"\nNATIVE_DRAWS="+draws+"\nCPU_TEXTURE_UPLOADS="+uploads+"\nVALIDATION_ERRORS="+context.validationErrors());
         context.close();report.println("CLOSED=true");report.close();
     }

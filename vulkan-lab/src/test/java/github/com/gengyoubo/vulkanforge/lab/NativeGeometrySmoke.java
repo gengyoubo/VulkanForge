@@ -35,7 +35,14 @@ public final class NativeGeometrySmoke {
                 var c=cache.get(7,3,first);
                 require(c!=null,"Cache did not recover after budget pressure");
                 context.uploads.drain(); readback(context,c,first);
-                require(cache.stats().get("residentUploads")==3&&cache.stats().get("residentReuses")==1,"Incorrect upload/reuse accounting");
+                // Partial version: a device copy of version 3 plus only bytes [4,8) from staging.
+                byte[] edited=first.clone();for(int i=4;i<8;i++)edited[i]=(byte)(100+i);
+                var d=cache.get(7,4,edited,3,new int[]{4,8});
+                require(d!=null&&d!=c&&cache.stats().get("residentPartialUploads")==1&&cache.stats().get("residentPartialBytes")==4,"Arena update was not partial");
+                context.uploads.drain(); readback(context,d,edited);
+                for(Runnable action:retired)action.run(); retired.clear();
+                require(cache.get(7,5,first,3,new int[]{0,4})!=null&&cache.stats().get("residentPartialUploads")==1,"Partial update accepted a stale base version");
+                require(cache.stats().get("residentUploads")==5&&cache.stats().get("residentReuses")==1,"Incorrect upload/reuse accounting");
                 require(cache.stats().get("residentGeometryPeakBytes")==28,"Resident peak accounting");
                 } finally {
                     context.uploads.drain();

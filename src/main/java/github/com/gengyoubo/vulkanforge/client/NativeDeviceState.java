@@ -35,6 +35,15 @@ public final class NativeDeviceState {
     private static final Map<Integer,Sampler> samplerObjects=new HashMap<>();
     private static final int[] boundSamplers=new int[32];
     private static final Map<Integer,float[]> constantAttributes=new HashMap<>();
+    /** Draw-packet form of {@link #constantAttributes}; rebuilt only after a glVertexAttrib change. */
+    private static Object[] constantSnapshot;
+    /**
+     * Byte ranges written since a buffer's version was last handed to the backend, so a resident arena can be updated in
+     * place of a whole re-upload. {@code full} means the next submission must upload everything.
+     */
+    private static final class Dirty {long submitted=-1;boolean full=true;final List<int[]> ranges=new ArrayList<>();}
+    private static final Map<Integer,Dirty> dirty=new HashMap<>();
+    private static final int MAX_DIRTY_RANGES=64;
     private static String[] deviceInfo;
     private record Location(int program,String name) { }
     private static final Map<Integer,Location> locations=new HashMap<>();
@@ -87,7 +96,7 @@ public final class NativeDeviceState {
             case "glIsFramebuffer":return number(a,0)!=0&&framebuffers.containsKey(number(a,0));
             case "glIsProgram":return programs.containsKey(number(a,0));
             case "glDeleteTextures":for(int value:ids(a[0])){pages.remove(value);for(int unit=0;unit<boundTextures.length;unit++)if(boundTextures[unit]==value)boundTextures[unit]=0;NativeGameWindow.call("deleteTexture",value);}return null;
-            case "glDeleteBuffers":for(int value:ids(a[0])){buffers.remove(value);sharedBufferSnapshots.remove(value);mapped.remove(value);bufferVersions.remove(value);terrainUses.remove(value);NativeGameWindow.call("deleteBuffer",value);}return null;
+            case "glDeleteBuffers":for(int value:ids(a[0])){buffers.remove(value);dirty.remove(value);sharedBufferSnapshots.remove(value);mapped.remove(value);bufferVersions.remove(value);terrainUses.remove(value);NativeGameWindow.call("deleteBuffer",value);}return null;
             case "glDeleteVertexArrays":for(int value:ids(a[0]))arrays.remove(value);return null;
             case "glDeleteFramebuffers":for(int value:ids(a[0])){framebuffers.remove(value);NativeGameWindow.call("deleteTarget",value);}return null;
             case "glBindTexture":if(number(a,0)!=3553)throw unsupported(operation+" target "+a[0]);boundTextures[activeTexture]=number(a,1);if(number(a,1)>0)pages.computeIfAbsent(number(a,1),key->new Page());return null;
@@ -115,8 +124,8 @@ public final class NativeDeviceState {
                 for(int y=0;y<page.height;y++)MemoryUtil.memByteBuffer(destination+(long)(y+skipRows)*stride+skipPixels*4L,page.width*4).put(pixels,y*page.width*4,page.width*4);return null;
             }
             case "glBindBuffer":if(number(a,0)==34963)array().indices=number(a,1);else if(number(a,0)==34962)arrayBuffer=number(a,1);else integers.put(number(a,0),number(a,1));return null;
-            case "glBufferData":{int target=buffer(number(a,0));if(a[1] instanceof ByteBuffer bytes){byte[] data=new byte[bytes.remaining()];bytes.duplicate().get(data);buffers.put(target,data);}else if(a[1] instanceof float[] floats){ByteBuffer bytes=ByteBuffer.allocate(floats.length*4).order(ByteOrder.nativeOrder());bytes.asFloatBuffer().put(floats);buffers.put(target,bytes.array());}else buffers.put(target,new byte[Math.toIntExact(((Number)a[1]).longValue())]);bufferVersions.put(target,++bufferGeneration);return null;}
-            case "glCopyBufferSubData":{int source=buffer(number(a,0)),destination=buffer(number(a,1)),read=Math.toIntExact(((Number)a[2]).longValue()),write=Math.toIntExact(((Number)a[3]).longValue()),size=Math.toIntExact(((Number)a[4]).longValue());byte[] input=Objects.requireNonNull(buffers.get(source)),output=Objects.requireNonNull(buffers.get(destination));if(sharedBufferSnapshots.remove(destination))output=output.clone();System.arraycopy(input,read,output,write,size);buffers.put(destination,output);bufferVersions.put(destination,++bufferGeneration);return null;}
+            case "glBufferData":{int target=buffer(number(a,0));if(a[1] instanceof ByteBuffer bytes){byte[] data=new byte[bytes.remaining()];bytes.duplicate().get(data);buffers.put(target,data);}else if(a[1] instanceof float[] floats){ByteBuffer bytes=ByteBuffer.allocate(floats.length*4).order(ByteOrder.nativeOrder());bytes.asFloatBuffer().put(floats);buffers.put(target,bytes.array());}else buffers.put(target,new byte[Math.toIntExact(((Number)a[1]).longValue())]);bufferVersions.put(target,++bufferGeneration);replaced(target);return null;}
+            case "glCopyBufferSubData":{int source=buffer(number(a,0)),destination=buffer(number(a,1)),read=Math.toIntExact(((Number)a[2]).longValue()),write=Math.toIntExact(((Number)a[3]).longValue()),size=Math.toIntExact(((Number)a[4]).longValue());byte[] input=Objects.requireNonNull(buffers.get(source)),output=Objects.requireNonNull(buffers.get(destination));if(sharedBufferSnapshots.remove(destination))output=output.clone();System.arraycopy(input,read,output,write,size);buffers.put(destination,output);bufferVersions.put(destination,++bufferGeneration);written(destination,write,write+size);return null;}
             case "glMapBuffer":{int target=buffer(number(a,0)),access=number(a,1);return map(target,0,Objects.requireNonNull(buffers.get(target)).length,access==35000?1:access==35001?2:3);}
             case "glMapBufferRange":return map(buffer(number(a,0)),Math.toIntExact(((Number)a[1]).longValue()),Math.toIntExact(((Number)a[2]).longValue()),number(a,3));
             case "glFlushMappedBufferRange":{int target=buffer(number(a,0));publishMapping(target,Objects.requireNonNull(mapped.get(target)),Math.toIntExact(((Number)a[1]).longValue()),Math.toIntExact(((Number)a[2]).longValue()));return null;}
@@ -160,7 +169,7 @@ public final class NativeDeviceState {
             case "glUniform1i":case "glUniform1iv":case "glUniform2iv":case "glUniform3iv":case "glUniform4iv":case "glUniform1fv":case "glUniform2fv":case "glUniform3fv":case "glUniform4fv":case "glUniformMatrix2fv":case "glUniformMatrix3fv":case "glUniformMatrix4fv":uniform(a);return null;
             case "glUniform1f":case "glUniform2f":case "glUniform3f":case "glUniform4f":{float[] data=new float[a.length-1];for(int i=0;i<data.length;i++)data[i]=((Number)a[i+1]).floatValue();uniform(new Object[]{a[0],data});return null;}
             case "glUniform2i":case "glUniform3i":case "glUniform4i":{int[] data=new int[a.length-1];for(int i=0;i<data.length;i++)data[i]=number(a,i+1);uniform(new Object[]{a[0],data});return null;}
-            case "glVertexAttrib4f":constantAttributes.put(number(a,0),new float[]{((Number)a[1]).floatValue(),((Number)a[2]).floatValue(),((Number)a[3]).floatValue(),((Number)a[4]).floatValue()});return null;
+            case "glVertexAttrib4f":constantSnapshot=null;constantAttributes.put(number(a,0),new float[]{((Number)a[1]).floatValue(),((Number)a[2]).floatValue(),((Number)a[3]).floatValue(),((Number)a[4]).floatValue()});return null;
             case "glBindFramebuffer":{int target=number(a,0),value=number(a,1);if(target==36160||target==36009)drawTarget=value;if(target==36160||target==36008)readTarget=value;return null;}
             case "glFramebufferTexture2D":{Framebuffer framebuffer=framebuffers.computeIfAbsent(number(a,0)==36008?readTarget:drawTarget,key->new Framebuffer());int texture=number(a,3),attachment=number(a,1);if(attachment>=36064&&attachment<36080){framebuffer.colors[attachment-36064]=texture;if(attachment==36064)framebuffer.color=texture;}else if(attachment==36096)framebuffer.depth=texture;else throw unsupported(operation+" attachment "+attachment);framebuffer.dirty=true;if(texture>0)pages.get(texture).target=true;return null;}
             case "glDrawBuffer":setDrawBuffers(new int[]{number(a,0)});return null;
@@ -188,7 +197,7 @@ public final class NativeDeviceState {
             case "glClearColor":for(int i=0;i<4;i++)clearColor[i]=((Number)a[i]).floatValue();return null;
             case "glClear":{prepareTarget(drawTarget);int mask=number(a,0);if((mask&~(16384|256))!=0)throw unsupported(operation+" mask "+mask);if((mask&16384)!=0&&colorMask!=15)throw unsupported("masked color clear");NativeGameWindow.call("clear",drawTarget,mask,clearColor.clone(),clearDepth,clip(drawTarget));return null;}
             case "glDrawElements":draw(number(a,0),number(a,1),number(a,2),((Number)a[3]).longValue());return null;
-            case "nglMultiDrawElementsBaseVertex":{int count=number(a,4);long counts=((Number)a[1]).longValue(),offsets=((Number)a[3]).longValue(),bases=((Number)a[5]).longValue();embeddiumBatches++;for(int i=0;i<count;i++)draw(number(a,0),MemoryUtil.memGetInt(counts+i*4L),number(a,2),MemoryUtil.memGetAddress(offsets+i*(long)org.lwjgl.system.Pointer.POINTER_SIZE),MemoryUtil.memGetInt(bases+i*4L));return null;}
+            case "nglMultiDrawElementsBaseVertex":{embeddiumBatches++;multiDraw(number(a,0),number(a,2),((Number)a[1]).longValue(),((Number)a[3]).longValue(),((Number)a[5]).longValue(),number(a,4));return null;}
             case "glGetInteger":return integer(number(a,0));
             case "glGetIntegerv":{int[] value=number(a,0)==2978?viewport:number(a,0)==3088?scissor:new int[]{integer(number(a,0))};if(a[1] instanceof int[] out)System.arraycopy(value,0,out,0,value.length);else ((IntBuffer)a[1]).duplicate().put(value);return null;}
             case "glGetBoolean":return number(a,0)==2930?depthMask:on(number(a,0));
@@ -216,7 +225,21 @@ public final class NativeDeviceState {
     private static void publishMapping(int target,Mapping mapping,int offset,int size){
         if((mapping.flags()&2)==0)throw unsupported("flushing a read-only CPU mapping");Objects.checkFromIndexSize(offset,size,mapping.bytes().capacity());
         byte[] data=Objects.requireNonNull(buffers.get(target));if(sharedBufferSnapshots.remove(target))data=data.clone();
-        mapping.bytes().duplicate().position(offset).limit(offset+size).get(data,mapping.offset()+offset,size);buffers.put(target,data);bufferVersions.put(target,++bufferGeneration);
+        mapping.bytes().duplicate().position(offset).limit(offset+size).get(data,mapping.offset()+offset,size);buffers.put(target,data);bufferVersions.put(target,++bufferGeneration);written(target,mapping.offset()+offset,mapping.offset()+offset+size);
+    }
+    private static void replaced(int buffer){Dirty value=dirty.computeIfAbsent(buffer,key->new Dirty());value.full=true;value.ranges.clear();}
+    /** Merges [start,end) into the buffer's sorted, disjoint dirty list; too many ranges degrade to a full upload. */
+    private static void written(int buffer,int start,int end){
+        Dirty value=dirty.computeIfAbsent(buffer,key->new Dirty());if(value.full||end<=start)return;
+        List<int[]> ranges=value.ranges;int at=0;while(at<ranges.size()&&ranges.get(at)[1]<start)at++;
+        int[] merged={start,end};while(at<ranges.size()&&ranges.get(at)[0]<=end){int[] range=ranges.remove(at);merged[0]=Math.min(merged[0],range[0]);merged[1]=Math.max(merged[1],range[1]);}
+        ranges.add(at,merged);if(ranges.size()>MAX_DIRTY_RANGES){value.full=true;ranges.clear();}
+    }
+    /** {start0,end0,...} written since {@code submitted[0]}, or null for a full upload; this version becomes the submitted one. */
+    private static int[] take(int buffer,long version,long[] submitted){
+        Dirty value=dirty.computeIfAbsent(buffer,key->new Dirty());submitted[0]=value.submitted;
+        int[] ranges=null;if(!value.full){ranges=new int[value.ranges.size()*2];for(int i=0;i<value.ranges.size();i++){ranges[i*2]=value.ranges.get(i)[0];ranges[i*2+1]=value.ranges.get(i)[1];}}
+        value.submitted=version;value.full=false;value.ranges.clear();return ranges;
     }
     private static boolean on(int value){return enabled.getOrDefault(value,false);}
     private static String[] deviceInfo(){if(deviceInfo==null)deviceInfo=(String[])NativeGameWindow.call("deviceInfo");return deviceInfo;}
@@ -268,12 +291,24 @@ public final class NativeDeviceState {
         draw(mode,count,type,offset,0);
     }
     private static void draw(int mode,int count,int type,long offset,int baseVertex) {
-        if(count==0)return;prepareTarget(drawTarget);if(on(3058)||on(2960))throw unsupported("logic-op/stencil draw");Program program=program();VertexArray array=array();
+        if(count==0)return;submit(mode,count,type,offset,baseVertex,null,null,null);
+    }
+    /** A whole glMultiDrawElementsBaseVertex as one packet: shared state is captured once and the ranges travel as arrays. */
+    private static void multiDraw(int mode,int type,long counts,long offsets,long bases,int draws){
+        int[] count=new int[draws],offset=new int[draws],base=new int[draws];int used=0,total=0;
+        for(int i=0;i<draws;i++){int c=MemoryUtil.memGetInt(counts+i*4L);if(c==0)continue;count[used]=c;offset[used]=Math.toIntExact(MemoryUtil.memGetAddress(offsets+i*(long)org.lwjgl.system.Pointer.POINTER_SIZE));base[used]=bases==0?0:MemoryUtil.memGetInt(bases+i*4L);total=Math.addExact(total,c);used++;}
+        if(used==0)return;
+        if(used==1){submit(mode,count[0],type,offset[0],base[0],null,null,null);return;}
+        submit(mode,total,type,0,0,Arrays.copyOf(count,used),Arrays.copyOf(offset,used),Arrays.copyOf(base,used));
+    }
+    private static void submit(int mode,int count,int type,long offset,int baseVertex,int[] counts,int[] offsets,int[] bases) {
+        prepareTarget(drawTarget);if(on(3058)||on(2960))throw unsupported("logic-op/stencil draw");Program program=program();VertexArray array=array();
         int[][] attributes=array.layout;if(attributes==null){attributes=array.enabled.stream().sorted().map(array.attributes::get).filter(Objects::nonNull).toArray(int[][]::new);array.layout=attributes;}if(attributes.length==0)throw new IllegalStateException("Native draw has no vertex attributes");int stride=attributes[0][6],vertexBuffer=attributes[0][7];
         for(int[] attr:attributes)if(attr[6]!=stride||attr[7]!=vertexBuffer)throw unsupported("multiple native vertex streams");
         byte[] vertexBytes=Objects.requireNonNull(buffers.get(vertexBuffer),"Native vertex data"),allIndices=Objects.requireNonNull(buffers.get(array.indices),"Native index data");int indexBytes=type==5123?2:type==5125?4:0;if(indexBytes==0)throw unsupported("native index type "+type);
         sharedBufferSnapshots.add(vertexBuffer);sharedBufferSnapshots.add(array.indices);
-        Objects.checkFromIndexSize(Math.toIntExact(offset),Math.multiplyExact(count,indexBytes),allIndices.length);
+        if(counts==null)Objects.checkFromIndexSize(Math.toIntExact(offset),Math.multiplyExact(count,indexBytes),allIndices.length);
+        else for(int i=0;i<counts.length;i++){if(offsets[i]%indexBytes!=0)throw unsupported("unaligned native multi-draw index offset");Objects.checkFromIndexSize(offsets[i],Math.multiplyExact(counts[i],indexBytes),allIndices.length);}
         if(DIAGNOSTICS){
             if(program.terrain){terrainSubmissions++;long version=bufferVersions.getOrDefault(vertexBuffer,0L),frame=NativeGameWindow.frameSerial();
                 BufferUse old=terrainUses.put(vertexBuffer,new BufferUse(version,frame));
@@ -282,12 +317,15 @@ public final class NativeDeviceState {
         }
         int[] textures=new int[program.samplers.length],samplerOverrides=new int[program.samplers.length];Arrays.fill(samplerOverrides,-1);for(int i=0;i<textures.length;i++){float[] value=program.values.get(program.samplers[i]);int unit=value==null?0:(int)value[0];textures[i]=boundTextures[unit];ensureTexture(textures[i]);if(boundSamplers[unit]!=0){Sampler sampler=Objects.requireNonNull(samplerObjects.get(boundSamplers[unit]));samplerOverrides[i]=sampler.flags|((sampler.flags&64)!=0&&!sampler.whiteBorder?128:0);}}
         int[] state={on(3042)?1:0,src,dst,srcAlpha,dstAlpha,equation,equationAlpha,on(2929)&&framebuffers.get(drawTarget).depth>0?1:0,depthMask?1:0,depthFunc,on(2884)?cullFace:0,frontFace,colorMask,6914,on(32823)?1:0,mode,0};
-        if(Arrays.stream(indexedBlend).anyMatch(Objects::nonNull)){state=Arrays.copyOf(state,17+8*8);for(int i=0;i<8;i++)System.arraycopy(indexedBlend[i]==null?new int[]{on(3042)?1:0,src,dst,srcAlpha,dstAlpha,equation,equationAlpha,colorMask}:indexedBlend[i],0,state,17+i*8,8);}
+        boolean indexed=false;for(int[] blend:indexedBlend)if(blend!=null){indexed=true;break;}
+        if(indexed){state=Arrays.copyOf(state,17+8*8);for(int i=0;i<8;i++)System.arraycopy(indexedBlend[i]==null?new int[]{on(3042)?1:0,src,dst,srcAlpha,dstAlpha,equation,equationAlpha,colorMask}:indexedBlend[i],0,state,17+i*8,8);}
         int[] box=clip(drawTarget),area={viewport[0],viewport[1],viewport[2],viewport[3],box[0],box[1],box[2],box[3]};
         Object[] values=program.snapshot;if(values==null){values=program.entries.values().toArray();program.snapshot=values;}
-        long[] resources={vertexBuffer,bufferVersions.getOrDefault(vertexBuffer,0L),array.indices,bufferVersions.getOrDefault(array.indices,0L),offset,baseVertex};
-        Object[] constants=constantAttributes.entrySet().stream().map(entry->new Object[]{entry.getKey(),entry.getValue()}).toArray();
-        NativeGameWindow.call("draw",drawTarget,new Object[]{currentProgram,vertexBytes,allIndices,type,count,stride,attributes,state,area,new float[]{offsetFactor,offsetUnits},values,textures,resources,samplerOverrides,constants});
+        long vertexVersion=bufferVersions.getOrDefault(vertexBuffer,0L),indexVersion=bufferVersions.getOrDefault(array.indices,0L);long[] vertexBase={-1},indexBase={-1};
+        int[][] ranges={take(vertexBuffer,vertexVersion,vertexBase),take(array.indices,indexVersion,indexBase)};
+        long[] resources={vertexBuffer,vertexVersion,array.indices,indexVersion,offset,baseVertex,vertexBase[0],indexBase[0]};
+        Object[] constants=constantSnapshot;if(constants==null){constants=constantAttributes.entrySet().stream().map(entry->new Object[]{entry.getKey(),entry.getValue()}).toArray();constantSnapshot=constants;}
+        NativeGameWindow.draw(drawTarget,new Object[]{currentProgram,vertexBytes,allIndices,type,count,stride,attributes,state,area,new float[]{offsetFactor,offsetUnits},values,textures,resources,samplerOverrides,constants,counts,offsets,bases,ranges});
     }
     private static UnsupportedOperationException unsupported(String operation){return new UnsupportedOperationException("Unimplemented native operation (GL fallback forbidden): "+operation);}
 }

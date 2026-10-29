@@ -37,6 +37,17 @@ GL BufferStorage 与持久映射 staging 路径不适用于无 GL 上下文的�
 
 着色器保留 Embeddium 原始压缩顶点、材质、镂空、纹理、光照与雾逻辑。Vulkan 输入类型严格匹配：压缩光照的 unsigned16 先作为 `uvec2` 取值，再转为原 shader 使用的 int32，避免有符号短整数重解释。转换放在原条件编译分支内，非压缩的 `uint` 分支保持独立。显式长度的 shader 源码和 float 数组/scalar vector uniform 也纳入转换。
 
+## 性能路径
+
+- 多重绘制：`glMultiDrawElementsBaseVertex` 在适配器中只捕获一次状态，整个区域批次作为一个包交给后端；后端绑定一次管线、描述符与缓冲，在 `multiDrawIndirect` 可用时用一次 `vkCmdDrawIndexedIndirect` 提交所有 section，否则在同一包内循环 `vkCmdDrawIndexed`。`-Dvulkanforge.disableMultiDrawIndirect=true` 强制后者。计数：`multiDrawPackets`、`indirectDraws`。
+- 在途帧：后端默认 2 帧在途（`-Dvulkanforge.framesInFlight=1..3`）。每帧槽有自己的命令缓冲、fence、描述符池与 CPU 写入的顶点/索引/uniform/indirect 环；一个槽只在等待它自己的 fence 后复用，录制期间退役的资源在该槽 fence 之后销毁。帧开始不再等待全部上传完成，只回收已完成的批次。
+- Arena 局部更新：适配器记录每个缓冲自上次交给后端以来写入的字节范围（`glCopyBufferSubData`、映射刷新）。常驻版本正是该基线且尺寸不变、脏数据少于一半时，新版本由旧版本的设备内复制加上仅脏范围的 staging 上传构成；否则整块上传。计数：`residentPartialUploads`、`residentPartialBytes`。
+- 常驻预算：常驻地形预算为最大 device-local 堆的 1/4（256 MiB–2 GiB，`-Dvulkanforge.residentGeometryMB` 覆盖），启动时写入 `RESIDENT_GEOMETRY_BUDGET_MB`。超出预算时先销毁已完成帧退役的版本，再拆分当前帧释放本帧退役的版本，之后才退回每帧复制。单次提交超过 16384 个绘制或 256 MiB 顶点复制时拆分提交并等待，不再抛出 `Native frame upload budget exceeded`。计数：`residentReclaims`、`frameSplits`。
+- 屏障：一次渲染开始时，会把该渲染内所有绘制采样的纹理一并转为只读布局（`hoistedInputs`），后续首次使用的输入不再打断渲染。
+- 调用开销：每次绘制通过绑定到后端的 `MethodHandle` 调用，不再按名称反射；常量顶点属性快照只在 `glVertexAttrib` 改变后重建。
+
+GPU-driven 剔除（P3）尚未接入 Embeddium 路径：可见性仍由 Embeddium 在 CPU 上计算。
+
 ## 检查
 
 ```powershell
