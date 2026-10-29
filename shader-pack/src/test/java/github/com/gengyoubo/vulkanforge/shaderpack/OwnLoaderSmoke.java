@@ -21,7 +21,7 @@ public final class OwnLoaderSmoke {
             require(world.flipped().equals(state),"End-of-frame flip state");
             var missing=ShaderPackSupport.missing(pack,Map.of()).stream().map(ShaderPackSupport.Missing::feature).toList();
             require(missing.isEmpty(),"Preflight blocks the real pack's default configuration: "+missing);
-            require(ShaderPackSupport.approximations(pack,Map.of()).stream().anyMatch(item->item.approximation()==ShaderPackSupport.Approximation.SHADOW_CULLING),"Shadow culling stand-in not reported");
+            require(ShaderPackSupport.approximations(pack,Map.of()).stream().anyMatch(item->item.approximation()==ShaderPackSupport.Approximation.SHADOW_ENTITIES),"Unimplemented shadow entities were not reported");
             require(world.shadowPrograms().containsKey("shadow")&&world.shadowColors().keySet().equals(Set.of(0,1))&&world.shadowResolution()==2048&&world.shadowFiltering()[0]&&world.shadowFiltering()[1],"Shadow map configuration");
             // The pack's own POTATO profile disables its shadow program, leaving only reported approximations.
             var potato=options.profile("POTATO");require(ShaderPackSupport.missing(pack,potato).isEmpty(),"POTATO profile still blocked: "+ShaderPackSupport.missing(pack,potato));

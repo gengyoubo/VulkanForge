@@ -18,7 +18,9 @@ public final class ShaderPackSupport {
     private ShaderPackSupport(){ }
     /** Only programs enabled by the effective option set count; a disabled program never runs. */
     public static List<Missing> missing(ShaderPack pack,Map<String,String> selected)throws IOException{
-        var configuration=new ShaderPackConfiguration(pack,selected);
+        return missing(pack,new ShaderPackConfiguration(pack,selected));
+    }
+    public static List<Missing> missing(ShaderPack pack,ShaderPackConfiguration configuration){
         Map<Feature,String> missing=new EnumMap<>(Feature.class);
         for(String dimension:new TreeSet<>(pack.dimensions()))for(var program:new TreeMap<>(pack.programs(dimension)).values()){
             if(!configuration.enabled(dimension,program.name()))continue;
@@ -36,19 +38,20 @@ public final class ShaderPackSupport {
         return missing.entrySet().stream().map(entry->new Missing(entry.getKey(),entry.getValue())).toList();
     }
     public static List<Approximate> approximations(ShaderPack pack,Map<String,String> selected)throws IOException{
-        var configuration=new ShaderPackConfiguration(pack,selected);var options=new ShaderPackOptions(pack);
+        return approximations(pack,new ShaderPackConfiguration(pack,selected));
+    }
+    public static List<Approximate> approximations(ShaderPack pack,ShaderPackConfiguration configuration){
         Map<Approximation,String> result=new EnumMap<>(Approximation.class);
         for(String dimension:new TreeSet<>(pack.dimensions()))for(var program:new TreeMap<>(pack.programs(dimension)).values()){
             if(!configuration.enabled(dimension,program.name()))continue;String path=(dimension.isEmpty()?"":dimension+"/")+program.name();
             if(program.phase()==ShaderPack.Phase.SHADOW){
-                // The shadow map reuses the chunk list culled for the player camera, and draws terrain only.
-                result.putIfAbsent(Approximation.SHADOW_CULLING,path);
+                // Resident compiled sections are culled against the independent light frustum; entity replay remains separate.
                 if(!"false".equals(configuration.properties().get("shadowEntities"))||!"false".equals(configuration.properties().getOrDefault("shadowBlockEntities","true")))result.putIfAbsent(Approximation.SHADOW_ENTITIES,path);
             }
             if(program.phase()!=ShaderPack.Phase.GBUFFER)continue;result.putIfAbsent(Approximation.HAND_DEPTH,path);
             for(var source:program.stages().values()){
                 if(result.containsKey(Approximation.BLOCK_IDS)&&result.containsKey(Approximation.ENTITY_IDS))break;
-                String active=ShaderPackPreprocessor.active(options.apply(source.text(),configuration.values())).replaceAll("(?s)/\\*.*?\\*/|//[^\\r\\n]*"," ");
+                String active=configuration.active(source).replaceAll("(?s)/\\*.*?\\*/|//[^\\r\\n]*"," ");
                 if(BLOCK_ATTRIBUTES.matcher(active).find())result.putIfAbsent(Approximation.BLOCK_IDS,path);
                 if(ENTITY_UNIFORMS.matcher(active).find())result.putIfAbsent(Approximation.ENTITY_IDS,path);
             }

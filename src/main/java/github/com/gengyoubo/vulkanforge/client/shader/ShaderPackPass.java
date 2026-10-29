@@ -21,7 +21,10 @@ final class ShaderPackPass implements AutoCloseable {
     private boolean closed;
     /** {@code available} names every frame or expression uniform the graph can supply; anything else is a load error. */
     ShaderPackPass(ShaderPack.Program source,ShaderPackOptions options,Map<String,String> values,Set<String> available){
-        name=source.name();ShaderPackGlsl.Graphics graphics=ShaderPackGlsl.fullscreen(source,options,values);int vertex=0,fragment=0,linked=0;
+        this(source,ShaderPackGlsl.fullscreen(source,options,values),available);
+    }
+    ShaderPackPass(ShaderPack.Program source,ShaderPackGlsl.Graphics graphics,Set<String> available){
+        name=source.name();int vertex=0,fragment=0,linked=0;
         try {
             String all=graphics.vertex()+"\n"+graphics.fragment();
             if(Pattern.compile("\\buniform\\s+\\w+\\s+\\w+\\s*\\[").matcher(all).find()||Pattern.compile("\\buniform\\s+\\w+\\s*\\{").matcher(all).find())throw new ShaderPackException(name+": uniform arrays/blocks require an extended pack uniform layout");

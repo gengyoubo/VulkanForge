@@ -8,6 +8,7 @@ public final class ShaderPackConfiguration {
     private final ShaderPack pack;
     private final ShaderPackOptions options;
     private final Map<String,String> values,properties,macros;
+    private final Map<String,String> activeSources=new java.util.concurrent.ConcurrentHashMap<>();
     public ShaderPackConfiguration(ShaderPack pack,Map<String,String> selected)throws IOException{
         this.pack=pack;options=new ShaderPackOptions(pack);Map<String,String> merged=options.defaults();merged.putAll(selected);values=Map.copyOf(merged);
         Map<String,String> macros=ShaderPackPreprocessor.environment();
@@ -21,6 +22,9 @@ public final class ShaderPackConfiguration {
     }
     public Map<String,String> values(){return values;}
     public Map<String,String> properties(){return properties;}
+    public ShaderPackOptions options(){return options;}
+    /** One effective source per file and option set, shared by metadata, preflight and both graphics backends. */
+    public String active(ShaderPackIncludes.Source source){return activeSources.computeIfAbsent(source.path(),unused->ShaderPackPreprocessor.active(options.apply(source.text(),values)));}
     /** Preprocessor definitions for pack data files: platform macros plus the effective option values. */
     public Map<String,String> macros(){return macros;}
     public boolean enabled(String dimension,String program){

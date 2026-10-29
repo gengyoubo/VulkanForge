@@ -14,7 +14,9 @@ final class ShaderPackState implements AutoCloseable {
     private final boolean[] mask=new boolean[4],enabled;
     private static final int[] FLAGS={GL_BLEND,GL_DEPTH_TEST,GL_CULL_FACE,GL_SCISSOR_TEST,GL_POLYGON_OFFSET_FILL,GL_STENCIL_TEST,GL_COLOR_LOGIC_OP};
     private final int originalTexture=glGetInteger(GL_TEXTURE_BINDING_2D);
-    private boolean retiring;
+    private boolean retiring,engineChanged;
+    /** A replay through Minecraft's RenderType also changes its Java caches, unlike raw fullscreen work. */
+    ShaderPackState engineChanged(){engineChanged=true;return this;}
     /** A retiring graph may delete objects captured here; never rebind their now-invalid GL names. */
     ShaderPackState retiring(){retiring=true;return this;}
     ShaderPackState(int textureUnits){
@@ -31,6 +33,16 @@ final class ShaderPackState implements AutoCloseable {
         glUseProgram(retiring&&program!=0&&!glIsProgram(program)?0:program);glBindVertexArray(retiring&&vao!=0&&!glIsVertexArray(vao)?0:vao);glBindBuffer(GL_ARRAY_BUFFER,retiring&&array!=0&&!glIsBuffer(array)?0:array);
         glBindFramebuffer(GL_READ_FRAMEBUFFER,retiring&&read!=0&&!glIsFramebuffer(read)?0:read);glBindFramebuffer(GL_DRAW_FRAMEBUFFER,retiring&&draw!=0&&!glIsFramebuffer(draw)?0:draw);glViewport(viewport[0],viewport[1],viewport[2],viewport[3]);
         for(int i=0;i<textures.length;i++){glActiveTexture(GL_TEXTURE0+i);restoreTexture(textures[i]);}glActiveTexture(active);restoreTexture(originalTexture);
+        if(engineChanged){
+            for(int i=0;i<Math.min(12,textures.length);i++){com.mojang.blaze3d.platform.GlStateManager._activeTexture(GL_TEXTURE0+i);glActiveTexture(GL_TEXTURE0+i);com.mojang.blaze3d.platform.GlStateManager._bindTexture(textures[i]);restoreTexture(textures[i]);}
+            com.mojang.blaze3d.platform.GlStateManager._activeTexture(active);glActiveTexture(active);
+            if(enabled[0])com.mojang.blaze3d.platform.GlStateManager._enableBlend();else com.mojang.blaze3d.platform.GlStateManager._disableBlend();
+            com.mojang.blaze3d.platform.GlStateManager._blendFuncSeparate(src,dst,srcAlpha,dstAlpha);
+            if(enabled[1])com.mojang.blaze3d.platform.GlStateManager._enableDepthTest();else com.mojang.blaze3d.platform.GlStateManager._disableDepthTest();
+            com.mojang.blaze3d.platform.GlStateManager._depthMask(depthMask);com.mojang.blaze3d.platform.GlStateManager._depthFunc(depthFunc);
+            if(enabled[2])com.mojang.blaze3d.platform.GlStateManager._enableCull();else com.mojang.blaze3d.platform.GlStateManager._disableCull();
+            com.mojang.blaze3d.platform.GlStateManager._colorMask(mask[0],mask[1],mask[2],mask[3]);
+        }
         for(int i=0;i<FLAGS.length;i++)if(enabled[i])glEnable(FLAGS[i]);else glDisable(FLAGS[i]);glDepthMask(depthMask);glDepthFunc(depthFunc);glFrontFace(frontFace);glColorMask(mask[0],mask[1],mask[2],mask[3]);glBlendFuncSeparate(src,dst,srcAlpha,dstAlpha);glBlendEquationSeparate(equation,equationAlpha);glClearColor(clear[0],clear[1],clear[2],clear[3]);
     }
     private void restoreTexture(int value){glBindTexture(GL_TEXTURE_2D,retiring&&value!=0&&!glIsTexture(value)?0:value);}

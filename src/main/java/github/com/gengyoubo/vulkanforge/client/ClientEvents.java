@@ -45,6 +45,8 @@ public final class ClientEvents {
 
     @SubscribeEvent
     public static void terrain(RenderLevelStageEvent event) {
+        // Shadow section replay emits vanilla chunk-stage events; they must not advance the main frame or its captures.
+        if(github.com.gengyoubo.vulkanforge.client.shader.ShaderPackRuntime.shadowFrame())return;
         // This stage carries the view pose; AFTER_LEVEL in 1.20.1 carries a different pose stack.
         github.com.gengyoubo.vulkanforge.client.shader.ShaderPackRuntime.stage(event.getStage());
         if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_SKY) VulkanPreview.skyEnd(event);

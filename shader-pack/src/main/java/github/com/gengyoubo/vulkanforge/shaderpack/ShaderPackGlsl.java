@@ -2,6 +2,7 @@ package github.com.gengyoubo.vulkanforge.shaderpack;
 
 import java.util.*;
 import java.util.regex.*;
+import java.util.function.Function;
 
 /** Legacy GLSL interface normalization shared by the GL compiler and Vulkan translator. */
 public final class ShaderPackGlsl {
@@ -29,10 +30,14 @@ public final class ShaderPackGlsl {
     private static final Pattern UNIFORM=Pattern.compile("\\buniform\\s+(?:(?:lowp|mediump|highp)\\s+)?(\\w+)\\s+(\\w+(?:\\s*,\\s*\\w+)*)\\s*(=[^;]*)?;");
     private ShaderPackGlsl(){ }
     public static Graphics fullscreen(ShaderPack.Program program,ShaderPackOptions options,Map<String,String> values){
+        return fullscreen(program,source->ShaderPackPreprocessor.active(options.apply(source.text(),values)));
+    }
+    public static Graphics fullscreen(ShaderPack.Program program,ShaderPackConfiguration configuration){return fullscreen(program,configuration::active);}
+    private static Graphics fullscreen(ShaderPack.Program program,Function<ShaderPackIncludes.Source,String> active){
         for(ShaderPack.Stage stage:program.stages().keySet())if(stage!=ShaderPack.Stage.VERTEX&&stage!=ShaderPack.Stage.FRAGMENT)throw new ShaderPackException(program.name()+": "+stage+" stage is not implemented by the fullscreen renderer");
         var fragment=program.stages().get(ShaderPack.Stage.FRAGMENT);if(fragment==null)throw new ShaderPackException(program.name()+": missing fragment shader");
-        String vertex=program.stages().containsKey(ShaderPack.Stage.VERTEX)?options.apply(program.stages().get(ShaderPack.Stage.VERTEX).text(),values):"#version 120\nvarying vec2 texcoord;\nvoid main(){texcoord=gl_MultiTexCoord0.xy;gl_Position=ftransform();}";
-        vertex=ShaderPackPreprocessor.active(vertex);String pixel=ShaderPackPreprocessor.active(options.apply(fragment.text(),values));Set<Integer> legacyCoords=coords(vertex+"\n"+pixel);
+        String vertex=program.stages().containsKey(ShaderPack.Stage.VERTEX)?active.apply(program.stages().get(ShaderPack.Stage.VERTEX)):"#version 120\nvarying vec2 texcoord;\nvoid main(){texcoord=gl_MultiTexCoord0.xy;gl_Position=ftransform();}";
+        String pixel=active.apply(fragment);Set<Integer> legacyCoords=coords(vertex+"\n"+pixel);
         boolean legacyColor=vertex.contains("gl_FrontColor")||pixel.contains("gl_Color");
         return new Graphics(normalize(vertex,true,legacyCoords,legacyColor,null),normalize(pixel,false,legacyCoords,legacyColor,null),Map.of("Position",0,"UV0",1,"vaPosition",0,"vaUV0",1));
     }
@@ -41,6 +46,10 @@ public final class ShaderPackGlsl {
      * (Position, Color, UV0, UV1, UV2, Normal); {@code chunkOffset} is true only for shaders that receive a chunk offset (terrain).
      */
     public static World world(ShaderPack.Program program,ShaderPackOptions options,Map<String,String> values,Set<String> format,boolean chunkOffset,ShaderPackRenderPlan.AlphaTest alphaTest){
+        return world(program,source->ShaderPackPreprocessor.active(options.apply(source.text(),values)),format,chunkOffset,alphaTest);
+    }
+    public static World world(ShaderPack.Program program,ShaderPackConfiguration configuration,Set<String> format,boolean chunkOffset,ShaderPackRenderPlan.AlphaTest alphaTest){return world(program,configuration::active,format,chunkOffset,alphaTest);}
+    private static World world(ShaderPack.Program program,Function<ShaderPackIncludes.Source,String> active,Set<String> format,boolean chunkOffset,ShaderPackRenderPlan.AlphaTest alphaTest){
         Map<String,String> core=new HashMap<>(CORE),expressions=new HashMap<>(expressions("ModelViewMat","ProjMat"));
         if(chunkOffset)core.put("chunkOffset","ChunkOffset");else expressions.put("chunkOffset","vec3(0.0)");
         Map<String,String> attributes=new HashMap<>(),uniforms=new HashMap<>(ENGINE_UNIFORMS),metadata=new HashMap<>(METADATA);
@@ -48,7 +57,7 @@ public final class ShaderPackGlsl {
         Engine engine=new Engine(chunkOffset?"vec4(Position + ChunkOffset, 1.0)":"vec4(Position, 1.0)","ModelViewMat","ProjMat","TextureMat",format.contains("Normal")?"Normal":"vec3(0.0, 0.0, 1.0)",format.contains("Color")?"(Color * ColorModulator)":"ColorModulator",
             format.contains("UV0")?"vec4(UV0, 0.0, 1.0)":"vec4(0.0, 0.0, 0.0, 1.0)",format.contains("UV2")?"vec4(vec2(UV2), 0.0, 1.0)":"vec4(240.0, 240.0, 0.0, 1.0)",
             core,expressions,Map.of("texture","Sampler0","gtexture","Sampler0","tex","Sampler0","lightmap","Sampler2"),metadata,attributes,uniforms,"",null);
-        return translate(program,options,values,engine,alphaTest);
+        return translate(program,active,engine,alphaTest);
     }
     /**
      * Binds a world program to Embeddium's chunk shader interface. {@code vertexInclude} is Embeddium's own chunk vertex decoder
@@ -65,13 +74,13 @@ public final class ShaderPackGlsl {
             Map.of(),expressions,Map.of("texture","u_BlockTex","gtexture","u_BlockTex","tex","u_BlockTex","lightmap","u_LightTex"),
             Map.of("mc_Entity","vec4(vfEntity.x > 65534.5 ? -1.0 : vfEntity.x, -1.0, 0.0, 0.0)","mc_midTexCoord","vec4(vfMidTexCoord, 0.0, 1.0)","at_tangent","(vfTangent * 2.0 - 1.0)","at_midBlock","vec4(0.0)"),
             Map.of(),Map.of("u_ModelViewMatrix","mat4","u_ProjectionMatrix","mat4","u_RegionOffset","vec3"),prefix,"_vert_init();");
-        return translate(program,options,values,engine,alphaTest);
+        return translate(program,source->ShaderPackPreprocessor.active(options.apply(source.text(),values)),engine,alphaTest);
     }
     private static Map<String,String> expressions(String model,String projection){return Map.of("normalMatrix","mat3(transpose(inverse("+model+")))","modelViewMatrixInverse","inverse("+model+")","projectionMatrixInverse","inverse("+projection+")");}
-    private static World translate(ShaderPack.Program program,ShaderPackOptions options,Map<String,String> values,Engine engine,ShaderPackRenderPlan.AlphaTest alphaTest){
+    private static World translate(ShaderPack.Program program,Function<ShaderPackIncludes.Source,String> active,Engine engine,ShaderPackRenderPlan.AlphaTest alphaTest){
         for(ShaderPack.Stage stage:program.stages().keySet())if(stage!=ShaderPack.Stage.VERTEX&&stage!=ShaderPack.Stage.FRAGMENT)throw new ShaderPackException(program.name()+": "+stage+" stage is not implemented for world programs");
         var vertex=program.stages().get(ShaderPack.Stage.VERTEX);var fragment=program.stages().get(ShaderPack.Stage.FRAGMENT);if(vertex==null||fragment==null)throw new ShaderPackException(program.name()+": world program needs both graphics stages");
-        String vs=interfaces(ShaderPackPreprocessor.active(options.apply(vertex.text(),values)),engine),fs=interfaces(ShaderPackPreprocessor.active(options.apply(fragment.text(),values)),engine);
+        String vs=interfaces(active.apply(vertex),engine),fs=interfaces(active.apply(fragment),engine);
         Set<Integer> coords=coords(vs+"\n"+fs);boolean color=vs.contains("gl_FrontColor")||fs.contains("gl_Color");
         String vsOut=normalize(vs,true,coords,color,engine),fsOut=normalize(fs,false,coords,color,engine);
         if(alphaTest!=null)fsOut=alpha(fsOut,alphaTest,program.name());
@@ -94,16 +103,18 @@ public final class ShaderPackGlsl {
     private static String removeDeclaration(String source,String name){return source.replaceAll("(?m)^[ \\t]*(?:uniform|in|attribute)\\s+(?:(?:lowp|mediump|highp|flat)\\s+)?\\w+\\s+"+Pattern.quote(name)+"\\s*(?:=[^;]*)?;","");}
     /** Core-profile names are implicitly declared, as in the reference loader, unless the pack defines a variable of that name itself. */
     private static boolean core(String source,String name){
-        String code=strip(source);if(declared(source,name))return true;if(!Pattern.compile("\\b"+Pattern.quote(name)+"\\b").matcher(code).find())return false;
-        return !Pattern.compile("\\b(?:float|int|uint|bool|[iub]?vec[234]|mat[234](?:x[234])?)\\s+"+Pattern.quote(name)+"\\b").matcher(code).find();
+        if(!source.contains(name)||!Pattern.compile("\\b"+Pattern.quote(name)+"\\b").matcher(source).find())return false;
+        if(Pattern.compile("\\b(?:uniform|in|attribute)\\s+(?:(?:lowp|mediump|highp|flat)\\s+)?\\w+\\s+"+Pattern.quote(name)+"\\b").matcher(source).find())return true;
+        return !Pattern.compile("\\b(?:float|int|uint|bool|[iub]?vec[234]|mat[234](?:x[234])?)\\s+"+Pattern.quote(name)+"\\b").matcher(source).find();
     }
     /** Iris core-profile names and the albedo/lightmap sampler aliases become the engine's names. */
     private static String interfaces(String source,Engine engine){
-        for(var entry:engine.coreExpressions().entrySet())if(core(source,entry.getKey()))source=replace(removeDeclaration(source,entry.getKey()),Map.of(entry.getKey(),"("+entry.getValue()+")"));
-        Map<String,String> names=new HashMap<>();for(var entry:engine.core().entrySet())if(core(source,entry.getKey()))names.put(entry.getKey(),entry.getValue());source=replace(source,names);
+        String code=strip(source);Map<String,String> names=new HashMap<>();
+        for(var entry:engine.coreExpressions().entrySet())if(core(code,entry.getKey())){source=removeDeclaration(source,entry.getKey());names.put(entry.getKey(),"("+entry.getValue()+")");}
+        for(var entry:engine.core().entrySet())if(core(code,entry.getKey()))names.put(entry.getKey(),entry.getValue());source=replace(source,names);
         for(var alias:engine.samplers().entrySet()){
             // Only declared samplers are renamed; texture(...) calls keep the built-in function.
-            if(!Pattern.compile("\\buniform\\s+sampler2D\\s+"+alias.getKey()+"\\s*;").matcher(source).find())continue;
+            if(!source.contains(alias.getKey())||!Pattern.compile("\\buniform\\s+sampler2D\\s+"+alias.getKey()+"\\s*;").matcher(source).find())continue;
             source=source.replaceAll("(?<![.\\w])"+alias.getKey()+"(?!\\w)(?!\\s*\\()",alias.getValue());
         }
         for(String sampler:new TreeSet<>(engine.samplers().values())){Matcher duplicate=Pattern.compile("(?m)^[ \\t]*uniform\\s+sampler2D\\s+"+sampler+"\\s*;").matcher(source);boolean first=true;StringBuilder result=new StringBuilder();while(duplicate.find()){duplicate.appendReplacement(result,first?"$0":"");first=false;}duplicate.appendTail(result);source=result.toString();}
@@ -124,7 +135,7 @@ public final class ShaderPackGlsl {
         Matcher outputs=Pattern.compile("\\bgl_FragData\\s*\\[\\s*([^]]+)\\s*]").matcher(source);StringBuffer rewritten=new StringBuffer();Set<Integer> outputSlots=new TreeSet<>();
         while(outputs.find()){String raw=outputs.group(1).strip();if(!raw.matches("[0-7]"))throw new ShaderPackException("Fragment output must be a fixed location from 0 to 7: "+raw);int slot=Integer.parseInt(raw);outputs.appendReplacement(rewritten,"vfFragColor"+slot);outputSlots.add(slot);}outputs.appendTail(rewritten);source=rewritten.toString();
         if(source.contains("gl_FragColor")){source=source.replaceAll("\\bgl_FragColor\\b","vfFragColor0");outputSlots.add(0);}
-        StringBuilder prefix=new StringBuilder("\n#define MC_VERSION 12001\n");
+        StringBuilder prefix=new StringBuilder("\n#define MC_VERSION 12001\n").append(ShaderPackFormats.defines(source));
         if(vertex&&engine!=null)prefix.append(engine.vertexPrefix());
         if(Pattern.compile("\\bgl_FogFragCoord\\b").matcher(strip(source)).find()){
             source=replace(source,Map.of("gl_FogFragCoord","vfFogFragCoord"));
@@ -158,18 +169,20 @@ public final class ShaderPackGlsl {
             source=source.replaceFirst("\\bvoid\\s+main\\s*\\(\\s*(?:void\\s*)?\\)","void vfPackMain()");StringBuilder main=new StringBuilder("\nvoid main(){");for(int index:legacyCoords)main.append("vfTexCoord").append(index).append('=').append(uv).append(';');if(legacyColor)main.append("vfVertexColor=vec4(1);");source+=main+"vfPackMain();}\n";
         }
         if(engine!=null){
-            if(vertex)for(var metadata:engine.metadata().entrySet())if(Pattern.compile("\\b"+metadata.getKey()+"\\b").matcher(source).find()){
+            if(vertex)for(var metadata:new TreeMap<>(engine.metadata()).entrySet())if(Pattern.compile("\\b"+metadata.getKey()+"\\b").matcher(source).find()){
                 source=removeDeclaration(source,metadata.getKey());prefix.append("#define ").append(metadata.getKey()).append(' ').append(metadata.getValue()).append('\n');
             }
             String code=strip(source);
-            if(vertex)for(var attribute:engine.attributes().entrySet())if(Pattern.compile("\\b"+attribute.getKey()+"\\b").matcher(code+prefix).find()&&!declared(source,attribute.getKey()))prefix.append("in ").append(attribute.getValue()).append(' ').append(attribute.getKey()).append(";\n");
-            for(var uniform:engine.uniforms().entrySet())if(Pattern.compile("\\b"+uniform.getKey()+"\\b").matcher(code+prefix).find()&&!declared(source,uniform.getKey()))prefix.append("uniform ").append(uniform.getValue()).append(' ').append(uniform.getKey()).append(";\n");
+            String combined=code+prefix;
+            if(vertex)for(var attribute:new TreeMap<>(engine.attributes()).entrySet())if(Pattern.compile("\\b"+attribute.getKey()+"\\b").matcher(combined).find()&&!declared(source,attribute.getKey()))prefix.append("in ").append(attribute.getValue()).append(' ').append(attribute.getKey()).append(";\n");
+            for(var uniform:new TreeMap<>(engine.uniforms()).entrySet())if(Pattern.compile("\\b"+uniform.getKey()+"\\b").matcher(combined).find()&&!declared(source,uniform.getKey()))prefix.append("uniform ").append(uniform.getValue()).append(' ').append(uniform.getKey()).append(";\n");
             // The engine decodes its vertex inputs before the pack's main runs.
             if(vertex&&engine.vertexInit()!=null){source=source.replaceFirst("\\bvoid\\s+main\\s*\\(\\s*(?:void\\s*)?\\)","void vfEngineMain()");source+="\nvoid main(){"+engine.vertexInit()+"vfEngineMain();}\n";}
         }
         int end=source.indexOf('\n');return source.substring(0,end+1)+prefix+source.substring(end+1);
     }
     private static String replace(String source,Map<String,String> identifiers){
+        if(identifiers.isEmpty())return source;
         // Token boundaries prevent replacing names which merely contain a legacy identifier.
         Matcher tokens=Pattern.compile("\\b[A-Za-z_]\\w*\\b").matcher(source);StringBuffer result=new StringBuffer();while(tokens.find())tokens.appendReplacement(result,Matcher.quoteReplacement(identifiers.getOrDefault(tokens.group(),tokens.group())));tokens.appendTail(result);return result.toString();
     }

@@ -23,6 +23,7 @@ import org.lwjgl.glfw.GLFW;
 public final class ShaderPackGameSmoke {
     private static final String MODE=System.getProperty("vulkanforge.shaderPackSmoke","");
     private static final String RED="VF Smoke Red",GREEN="VF Smoke Green",BAD="VF Smoke Invalid",SKY="VF Smoke World Sky",TERRAIN="VF Smoke World Terrain";
+    private static final String HISTORY="VF Smoke History";
     private static String terrainResult="NOT_RUN";
     private static int stage,ticks;private static long started=System.nanoTime(),beforeFailure;private static Path output;
     private static boolean titleChecked;
@@ -31,13 +32,14 @@ public final class ShaderPackGameSmoke {
     @SubscribeEvent public static void tick(TickEvent.ClientTickEvent event){
         if(MODE.isEmpty()||stage==99||event.phase!=TickEvent.Phase.END)return;Minecraft mc=Minecraft.getInstance();mc.gui.vignetteBrightness=0;
         try{
+            if(mc.player!=null){mc.mouseHandler.releaseMouse();mc.player.setYRot(180);mc.player.yRotO=180;mc.player.setXRot(18);mc.player.xRotO=18;}
             require((System.nanoTime()-started)/1e9<(stage<2?600:180),"Shader pack game smoke timed out at "+stage);
             if(stage==0&&mc.screen instanceof TitleScreen&&mc.getOverlay()==null&&++ticks>15){
                 output=Path.of(System.getProperty("shaderPack.output"));Files.createDirectories(output);ShaderPackRuntime.select("");
                 mc.options.pauseOnLostFocus=false;mc.options.renderDistance().set(3);mc.options.graphicsMode().set(net.minecraft.client.GraphicsStatus.FAST);mc.options.enableVsync().set(false);mc.getWindow().updateVsync(false);
                 mc.options.tutorialStep=net.minecraft.client.tutorial.TutorialSteps.NONE;
                 if(!titleChecked){titleChecked=true;GLFW.glfwSetWindowSize(mc.getWindow().getWindow(),1918,987);mc.setScreen(new ShaderPackScreen(mc.screen));next(20);return;}
-                fixture(RED,"vec4(0.75,0.15,0.25,1.0)");fixture(GREEN,"vec4(0.1,0.65,0.2,1.0)");fixture(BAD,"invalid shader expression");world(SKY,"gbuffers_skybasic","vec4(0.8,0.1,0.8,1.0)");world(TERRAIN,"gbuffers_terrain","vec4(0.1,0.2,0.9,1.0)");
+                fixture(RED,"vec4(0.75,0.15,0.25,1.0)");fixture(GREEN,"vec4(0.1,0.65,0.2,1.0)");fixture(BAD,"invalid shader expression");world(SKY,"gbuffers_skybasic","vec4(0.8,0.1,0.8,1.0)");world(TERRAIN,"gbuffers_terrain","vec4(0.1,0.2,0.9,1.0)");history();
                 String reference=System.getProperty("shaderPack.reference");if(reference!=null){Path pack=Path.of(reference);referenceName=pack.getFileName().toString();if(!Files.exists(ShaderPackRuntime.directory().resolve(referenceName)))github.com.gengyoubo.vulkanforge.shaderpack.ShaderPackImporter.copy(pack,ShaderPackRuntime.directory());}
                 String unsupported=System.getProperty("shaderPack.unsupported");if(unsupported!=null){Path pack=Path.of(unsupported);unsupportedName=pack.getFileName().toString();if(!Files.exists(ShaderPackRuntime.directory().resolve(unsupportedName)))github.com.gengyoubo.vulkanforge.shaderpack.ShaderPackImporter.copy(pack,ShaderPackRuntime.directory());}
                 String name="Shader Pack Smoke "+System.currentTimeMillis();next(1);
@@ -60,7 +62,9 @@ public final class ShaderPackGameSmoke {
             else if(stage==7&&active(GREEN)){capture(mc,"green.png");next(8);}
             else if(stage==8&&++ticks>6){color("green.png",26,166,51);GLFW.glfwSetWindowSize(mc.getWindow().getWindow(),1024,640);next(9);}
             else if(stage==9&&mc.getMainRenderTarget().viewWidth==1024&&mc.getMainRenderTarget().viewHeight==640&&++ticks>20){capture(mc,"resized.png");next(10);}
-            else if(stage==10&&++ticks>6){color("resized.png",26,166,51);ShaderPackRuntime.select(SKY);next(40);}
+            else if(stage==10&&++ticks>6){color("resized.png",26,166,51);ShaderPackRuntime.select(HISTORY);next(50);}
+            else if(stage==50){require(ShaderPackRuntime.status().error().isEmpty(),ShaderPackRuntime.status().error());if(active(HISTORY)&&++ticks>40){capture(mc,"history.png");next(51);}}
+            else if(stage==51&&++ticks>6){color("history.png",26,166,51);ShaderPackRuntime.select(SKY);next(40);}
             // World programs: the sky shader is replaced by gbuffers_skybasic and drawn into colortex0, which final presents.
             else if(stage==40&&!ShaderPackRuntime.status().error().isEmpty())throw new AssertionError(ShaderPackRuntime.status().error());
             else if(stage==40&&active(SKY)&&ShaderPackRuntime.statistics()[2]>0){capture(mc,"world-sky.png");next(41);}
@@ -99,6 +103,13 @@ public final class ShaderPackGameSmoke {
     private static boolean active(String name){return ShaderPackRuntime.status().active().equals(name)&&ShaderPackRuntime.statistics()[0]>5;}
     private static void next(int value){stage=value;ticks=0;started=System.nanoTime();com.mojang.logging.LogUtils.getLogger().info("SHADER_PACK_SMOKE_STAGE={}",stage);}
     private static void fixture(String name,String color)throws Exception{Path root=ShaderPackRuntime.directory().resolve(name).resolve("shaders");Files.createDirectories(root);Files.writeString(root.resolve("final.vsh"),"#version 120\nvarying vec2 texcoord;\nvoid main(){texcoord=gl_MultiTexCoord0.xy;gl_Position=ftransform();}\n");Files.writeString(root.resolve("final.fsh"),"#version 120\nvarying vec2 texcoord;\nuniform sampler2D gcolor;\nvoid main(){gl_FragColor="+color+";}\n");}
+    private static void history()throws Exception{
+        fixture(HISTORY,"vec4(0)");Path root=ShaderPackRuntime.directory().resolve(HISTORY).resolve("shaders");Files.copy(root.resolve("final.vsh"),root.resolve("composite.vsh"),StandardCopyOption.REPLACE_EXISTING);
+        Files.writeString(root.resolve("composite.fsh"),"#version 120\nvarying vec2 texcoord;\nuniform sampler2D colortex1;\nuniform int frameCounter;\nconst bool colortex1Clear=false;\nconst int colortex1Format=RGBA32F;\n/* DRAWBUFFERS:1 */\nvoid main(){gl_FragData[0]=vec4(texture2D(colortex1,texcoord).r+0.0009765625,float(frameCounter+1)*0.0009765625,0,1);}\n");
+        Files.writeString(root.resolve("final.fsh"),"#version 120\nvarying vec2 texcoord;\nuniform sampler2D colortex1;\nvoid main(){vec2 value=texture2D(colortex1,texcoord).rg;gl_FragColor=abs(value.r-value.g)<0.00001?vec4(0.1,0.65,0.2,1):vec4(1,0,0,1);}\n");
+        // colortex1 defaults to white, so this fixture explicitly requests a zero initial history.
+        Files.writeString(root.resolve("shaders.properties"),"\n");Files.writeString(root.resolve("composite.fsh"),Files.readString(root.resolve("composite.fsh")).replace("const bool colortex1Clear=false;","const bool colortex1Clear=false;\nconst vec4 colortex1ClearColor=vec4(0);"));
+    }
     private static void world(String name,String program,String color)throws Exception{
         Path root=ShaderPackRuntime.directory().resolve(name).resolve("shaders");Files.createDirectories(root);
         Files.writeString(root.resolve(program+".vsh"),"#version 120\nvoid main(){gl_Position=ftransform();}\n");Files.writeString(root.resolve(program+".fsh"),"#version 120\n/* DRAWBUFFERS:0 */\nvoid main(){gl_FragData[0]="+color+";}\n");

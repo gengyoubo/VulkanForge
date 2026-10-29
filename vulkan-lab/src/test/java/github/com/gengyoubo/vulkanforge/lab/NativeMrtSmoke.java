@@ -7,7 +7,7 @@ import org.lwjgl.vulkan.VK;
 
 /** Actual MRT/HDR/depth execution and resource lifetime; the launcher forbids GL and GLFW. */
 public final class NativeMrtSmoke {
-    private static final String VERTEX="#version 330\nin vec3 Position;\nvoid main(){gl_Position=vec4(Position,1);}";
+    private static final String VERTEX="#version 330\nin vec3 Position;\nout float unusedFogDistance;\nvoid main(){gl_Position=vec4(Position,1);unusedFogDistance=length(Position);}";
     public static void main(String[] ignored)throws Exception{
         org.lwjgl.system.Configuration.STACK_SIZE.set(4096);
         Path report=Path.of(System.getProperty("vulkanforge.smokeReportDir","build/reports/native-mrt"));Files.createDirectories(report);
@@ -21,6 +21,9 @@ public final class NativeMrtSmoke {
             backend.framebuffer(51,new int[]{10,11},12,new int[]{0,-1,1},32,32);
             backend.program(2,VERTEX,"#version 330\nlayout(location=0) out vec4 color;\nlayout(location=2) out vec4 hdr;\nvoid main(){color=vec4(.5,.4,.3,1);hdr=vec4(3,2,1,.5);}",new Object[]{new Object[]{"Position",0}});
             backend.draw(51,packet(2,0));pixel(backend.readTextureFloats(10),.5f,.4f,.3f,1,.004f,"MRT hole output 0");pixel(backend.readTextureFloats(11),3,2,1,.5f,.001f,"MRT hole output 2");
+            backend.renderTexture(14,32,32,32856,0);backend.framebuffer(53,new int[]{14},0,new int[]{0},32,32);
+            backend.draw(53,packet(2,0));pixel(backend.readTextureFloats(14),.5f,.4f,.3f,1,.004f,"Disabled fragment output is private");
+            backend.draw(51,packet(2,0));pixel(backend.readTextureFloats(11),3,2,1,.5f,.001f,"Re-enabled fragment output survives variant cache");
             // Deleting a texture name must keep the image alive while an FBO/queued draw still references it.
             backend.deleteTexture(10);backend.draw(50,packet(1,0));backend.renderTexture(13,32,32,32856,0);backend.framebuffer(52,new int[]{13},0,new int[]{0},32,32);
             backend.blitAttachments(50,0,52,0,new int[]{0,0,32,32,0,0,32,32},16384,9728);pixel(backend.readTextureFloats(13),.1f,.2f,.3f,.4f,.004f,"Deleted texture retained by FBO");

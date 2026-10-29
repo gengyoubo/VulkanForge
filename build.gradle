@@ -72,7 +72,10 @@ minecraft {
                 workingDirectory project.file('run-own-pack/'+mode)
                 property 'vulkanforge.startup',mode=='VK'?'VK:V1_4':'GL:DEFAULT'
                 property 'vulkanforge.ownPackSmoke',mode
+                property 'vulkanforge.shaderPackProfile','true'
                 property 'ownPack.pack',project.findProperty('ownPackFile') ?: 'ComplementaryReimagined_r5.9.3.zip'
+                property 'ownPack.options',project.findProperty('ownPackOptions') ?: ''
+                if(project.hasProperty('ownPackStages'))property 'ownPack.stages','true'
                 property 'ownPack.output',project.file(project.findProperty('ownPack.output') ?: 'build/reports/own-pack/'+mode).absolutePath
                 property 'vulkanforge.shaderFailureDirectory',project.file('build/reports/own-pack/'+mode+'/failed-shaders').absolutePath
                 mods {vulkanforge {source sourceSets.smoke}}

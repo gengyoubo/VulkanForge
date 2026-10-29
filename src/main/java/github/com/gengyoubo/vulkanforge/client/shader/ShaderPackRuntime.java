@@ -17,26 +17,31 @@ public final class ShaderPackRuntime {
     private static final ExecutorService IO=Executors.newSingleThreadExecutor(r->{Thread thread=new Thread(r,"VulkanForge shader pack IO");thread.setDaemon(true);return thread;});
     private static Path directory,settings;
     private static final Properties preferences=new Properties();
-    private static Map<String,String> requestedValues=Map.of();
+    private static volatile Map<String,String> requestedValues=Map.of();
     private static String runtimeError="";
     private static String loggedError="";
     private static boolean initialized;
+    private static java.util.function.Consumer<String> diagnosticObserver;
+    public static void diagnosticObserver(java.util.function.Consumer<String> observer){diagnosticObserver=observer;}
+    static void diagnosticStage(String stage){var observer=diagnosticObserver;if(observer!=null)observer.accept(stage);}
     private ShaderPackRuntime(){ }
     public static Path directory(){initialize();return directory;}
     private static void initialize(){
         if(initialized)return;initialized=true;Minecraft mc=Minecraft.getInstance();directory=mc.gameDirectory.toPath().resolve("shaderpacks");settings=mc.gameDirectory.toPath().resolve("config/vulkanforge-shaders.properties");
         try{Files.createDirectories(directory);if(Files.isRegularFile(settings))try(Reader reader=Files.newBufferedReader(settings,StandardCharsets.UTF_8)){preferences.load(reader);}}catch(IOException error){runtimeError=error.getMessage();}
-        controller=new ShaderPackController<>(IO,mc::execute,pack->{
+        controller=new ShaderPackController<>(IO,mc::execute,pack->new ShaderPackPrepared(pack,requestedValues),prepared->{
+            ShaderPack pack=prepared.pack;
             if(VulkanForgeConfig.startup().mode()==dev.vulkanforge.bridge.RenderMode.GL_VK)throw new ShaderPackException("Shader pack execution currently requires GL or native VK mode");
-            var missing=ShaderPackSupport.missing(pack,requestedValues);StringBuilder report=new StringBuilder("PACK=").append(pack.name()).append("\nBACKEND=").append(VulkanForgeConfig.startup().mode()).append("\nPREFLIGHT=").append(missing.isEmpty()?"PASSED":"UNSUPPORTED_FEATURES").append('\n');
+            var missing=prepared.missing;StringBuilder report=new StringBuilder("PACK=").append(pack.name()).append("\nBACKEND=").append(VulkanForgeConfig.startup().mode()).append("\nPREFLIGHT=").append(missing.isEmpty()?"PASSED":"UNSUPPORTED_FEATURES").append('\n');
             for(var feature:missing)report.append(feature.feature()).append('=').append(feature.example()).append('\n');
-            if(missing.isEmpty())for(var approximation:ShaderPackSupport.approximations(pack,requestedValues))report.append("APPROXIMATED_").append(approximation.approximation()).append('=').append(approximation.example()).append('\n');
+            if(missing.isEmpty())for(var approximation:prepared.approximations)report.append("APPROXIMATED_").append(approximation.approximation()).append('=').append(approximation.example()).append('\n');
+            prepared.milliseconds.forEach((name,value)->report.append("CPU_").append(name).append("_MS=").append(value).append('\n'));
             writeDiagnostic(report.toString());
             if(!missing.isEmpty()){
                 String features=String.join("、",missing.stream().map(feature->net.minecraft.network.chat.Component.translatable("vulkanforge.shaders.feature."+feature.feature().name().toLowerCase(Locale.ROOT)).getString()).toList());
                 throw new ShaderPackException(net.minecraft.network.chat.Component.translatable("vulkanforge.shaders.unsupported",pack.name(),features).getString());
             }
-            ShaderPackGraph graph=new ShaderPackGraph(pack,requestedValues);
+            ShaderPackGraph graph=new ShaderPackGraph(prepared);
             // Chunk terrain drawn by a third-party chunk renderer bypasses the game's core shaders, so terrain programs would silently not run.
             if(graph.terrain()&&net.minecraftforge.fml.ModList.get().isLoaded("embeddium")){graph.close();throw new ShaderPackException(net.minecraft.network.chat.Component.translatable("vulkanforge.shaders.embeddium_terrain",pack.name()).getString());}
             return graph;
@@ -86,8 +91,9 @@ public final class ShaderPackRuntime {
     /** Every GameRenderer core-shader getter passes through here; outside a world-program frame it is the identity. */
     public static net.minecraft.client.renderer.ShaderInstance shader(net.minecraft.client.renderer.ShaderInstance vanilla){return worldFrame?controller.active().shader(vanilla):vanilla;}
     public static boolean worldFrame(){return worldFrame;}
+    public static boolean shadowFrame(){return active()&&controller.active().shadowing();}
     public static void stage(net.minecraftforge.client.event.RenderLevelStageEvent.Stage stage){
-        if(!worldFrame)return;var graph=controller.active();
+        if(!worldFrame||shadowFrame())return;var graph=controller.active();
         if(stage==net.minecraftforge.client.event.RenderLevelStageEvent.Stage.AFTER_SKY){graph.shadow(Minecraft.getInstance().levelRenderer);graph.phase(ShaderPackWorldPrograms.Phase.TERRAIN);}
         else if(stage==net.minecraftforge.client.event.RenderLevelStageEvent.Stage.AFTER_CUTOUT_BLOCKS)graph.phase(ShaderPackWorldPrograms.Phase.ENTITIES);
         else if(stage==net.minecraftforge.client.event.RenderLevelStageEvent.Stage.AFTER_ENTITIES)graph.phase(ShaderPackWorldPrograms.Phase.BLOCK_ENTITIES);

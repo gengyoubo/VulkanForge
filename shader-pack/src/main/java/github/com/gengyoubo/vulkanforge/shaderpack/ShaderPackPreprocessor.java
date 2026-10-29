@@ -15,6 +15,7 @@ public final class ShaderPackPreprocessor {
     private ShaderPackPreprocessor(){ }
     public static Map<String,String> environment(){
         Map<String,String> result=new HashMap<>();result.put("MC_VERSION","12001");
+        ShaderPackFormats.ENUMS.forEach((name,value)->result.put(name,Integer.toString(value)));
         String os=System.getProperty("os.name","").toLowerCase(Locale.ROOT);result.put(os.startsWith("windows")?"MC_OS_WINDOWS":os.contains("mac")?"MC_OS_MAC":"MC_OS_LINUX","1");return result;
     }
     public static String active(String source){return active(source,environment());}

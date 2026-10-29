@@ -13,6 +13,7 @@ final class NativeShaderProgram implements AutoCloseable {
     private record Uniform(String type,int slot,int columns) { }
     private static final Pattern UNIFORM = Pattern.compile("(?m)\\buniform\\s+(\\w+)\\s+(\\w+)(?:\\s*=\\s*([^;]+))?\\s*;");
     private static final Pattern IO = Pattern.compile("(?m)^(\\s*(?:flat\\s+|smooth\\s+|noperspective\\s+)?)\\b(in|out)\\s+(\\w+)\\s+(\\w+)(\\s*\\[\\s*\\d+\\s*])?\\s*;");
+    private static final Pattern OUTPUT=Pattern.compile("layout\\s*\\(\\s*location\\s*=\\s*(\\d+)\\s*\\)\\s*(?:(?:flat|smooth|noperspective|centroid)\\s+)*out\\s+(\\w+)\\s+(\\w+)(\\s*\\[\\s*\\d+\\s*])?\\s*;");
     final List<String> samplers = new ArrayList<>();
     final int[] samplerBindings;
     final int uniformBinding;
@@ -23,6 +24,11 @@ final class NativeShaderProgram implements AutoCloseable {
     final boolean terrain, entity, embeddium;
     long textureLayout,layout,vertex,fragment;
     private final Map<PipelineKey,Long> pipelines = new HashMap<>();
+    private record Stages(long vertex,long fragment){ }
+    private final Map<Integer,Stages> stageVariants=new HashMap<>();
+    private String translatedVertex,translatedFragment;
+    private int fragmentOutputMask;
+    private Set<Integer> fragmentInputs=Set.of();
     private final float[] uniformScratch;
     final int uniformBytes,uniformStride,uniformSlots;
     private Map<Integer,Integer> vertexInputs=Map.of();
@@ -76,8 +82,10 @@ final class NativeShaderProgram implements AutoCloseable {
         matcher=IO.matcher(fragmentSource);while(matcher.find())if(matcher.group(2).equals("in")&&!varying.containsKey(matcher.group(4))){varying.put(matcher.group(4),varyingSlot);varyingSlot+=matcher.group(5)==null?1:Integer.parseInt(matcher.group(5).replaceAll("\\D",""));}
         try(var stack=MemoryStack.stackPush()) {
             Set<Integer> live=new HashSet<>(),members=new HashSet<>();
-            vertex=ShaderCompiler.moduleSource(context,translate(vertexSource,true,attributes,varying,fragmentOutputs),"minecraft-native.vert",shaderc_glsl_vertex_shader,true,code->{vertexInputs=SpirvVertexInputs.read(code);live.addAll(SpirvDescriptorBindings.read(code));members.addAll(SpirvUniformMembers.read(code,uniformBinding));});
-            fragment=ShaderCompiler.moduleSource(context,translate(fragmentSource,false,attributes,varying,fragmentOutputs),"minecraft-native.frag",shaderc_glsl_fragment_shader,true,code->{live.addAll(SpirvDescriptorBindings.read(code));members.addAll(SpirvUniformMembers.read(code,uniformBinding));});
+            translatedVertex=translate(vertexSource,true,attributes,varying,fragmentOutputs);translatedFragment=translate(fragmentSource,false,attributes,varying,fragmentOutputs);
+            Matcher outputs=OUTPUT.matcher(translatedFragment);while(outputs.find()){int location=Integer.parseInt(outputs.group(1)),count=outputs.group(4)==null?1:Integer.parseInt(outputs.group(4).replaceAll("\\D",""));for(int i=0;i<count;i++)fragmentOutputMask|=1<<(location+i);}
+            fragment=ShaderCompiler.moduleSource(context,translatedFragment,"minecraft-native.frag",shaderc_glsl_fragment_shader,true,code->{fragmentInputs=SpirvLocations.inputs(code);live.addAll(SpirvDescriptorBindings.read(code));members.addAll(SpirvUniformMembers.read(code,uniformBinding));});
+            vertex=ShaderCompiler.moduleSource(context,privateOutputs(translatedVertex,fragmentInputs),"minecraft-native.vert",shaderc_glsl_vertex_shader,true,code->{vertexInputs=SpirvVertexInputs.read(code);live.addAll(SpirvDescriptorBindings.read(code));members.addAll(SpirvUniformMembers.read(code,uniformBinding));});
             List<String> declared=List.copyOf(samplers);samplers.clear();List<Integer> used=new ArrayList<>();for(int i=0;i<declared.size();i++)if(live.contains(i)){samplers.add(declared.get(i));used.add(i);}samplerBindings=used.stream().mapToInt(Integer::intValue).toArray();
             activeUniforms.addAll(samplers);uniforms.forEach((name,uniform)->{if(members.contains(uniform.slot()*16))activeUniforms.add(name);});
             var bindings=VkDescriptorSetLayoutBinding.calloc(samplers.size()+1,stack);
@@ -87,6 +95,21 @@ final class NativeShaderProgram implements AutoCloseable {
             check(vkCreateDescriptorSetLayout(context.device,VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(bindings),null,handle),"native game shader descriptors");textureLayout=handle.get(0);
             check(vkCreatePipelineLayout(context.device,VkPipelineLayoutCreateInfo.calloc(stack).sType$Default().pSetLayouts(stack.longs(textureLayout)),null,handle),"native game shader layout");layout=handle.get(0);
         }catch(RuntimeException|Error error){close();throw error;}
+    }
+    /** Unconsumed outputs stay ordinary GLSL variables, preserving references and side effects without an interface export. */
+    private static String privateOutputs(String source,Set<Integer> consumed){
+        Matcher matcher=OUTPUT.matcher(source);StringBuffer result=new StringBuffer();
+        while(matcher.find()){int location=Integer.parseInt(matcher.group(1));String declaration=consumed.contains(location)?matcher.group():matcher.group(2)+" "+matcher.group(3)+Objects.requireNonNullElse(matcher.group(4),"")+";";matcher.appendReplacement(result,Matcher.quoteReplacement(declaration));}matcher.appendTail(result);return result.toString();
+    }
+    private Stages stages(int[] formats){
+        int mask=0;Set<Integer> outputs=new HashSet<>();for(int i=0;i<formats.length;i++)if(formats[i]!=VK_FORMAT_UNDEFINED){mask|=1<<i;outputs.add(i);}
+        if((fragmentOutputMask&~mask)==0)return new Stages(vertex,fragment);
+        Stages cached=stageVariants.get(mask);if(cached!=null)return cached;
+        long pixel=0,geometry=vertex;try{
+            var inputs=new HashSet<Integer>();pixel=ShaderCompiler.moduleSource(context,privateOutputs(translatedFragment,outputs),"minecraft-native-masked.frag",shaderc_glsl_fragment_shader,true,code->inputs.addAll(SpirvLocations.inputs(code)));
+            if(!inputs.equals(fragmentInputs))geometry=ShaderCompiler.moduleSource(context,privateOutputs(translatedVertex,inputs),"minecraft-native-masked.vert",shaderc_glsl_vertex_shader,true,null);
+            Stages created=new Stages(geometry,pixel);stageVariants.put(mask,created);return created;
+        }catch(RuntimeException|Error error){if(pixel!=0)vkDestroyShaderModule(context.device,pixel,null);if(geometry!=vertex)vkDestroyShaderModule(context.device,geometry,null);throw error;}
     }
     private static String splitIo(String source){
         Matcher declarations=Pattern.compile("(?m)^(\\s*(?:(?:flat|smooth|noperspective)\\s+)?(?:in|out)\\s+\\w+\\s+)([A-Za-z_]\\w*(?:\\s*,\\s*[A-Za-z_]\\w*)+)\\s*;").matcher(source);StringBuffer result=new StringBuffer();while(declarations.find()){StringJoiner lines=new StringJoiner("\n");for(String name:declarations.group(2).split(","))lines.add(declarations.group(1)+name.strip()+";");declarations.appendReplacement(result,Matcher.quoteReplacement(lines.toString()));}declarations.appendTail(result);return result.toString();
@@ -170,8 +193,9 @@ final class NativeShaderProgram implements AutoCloseable {
         // Buffer names are resource identities, not pipeline state. Chunk recycling must reuse the same pipeline.
         int[][] layoutAttributes=Arrays.stream(consumed).map(attribute->Arrays.copyOf(attribute,6)).toArray(int[][]::new);
         try(var stack=MemoryStack.stackPush()) {
+            Stages modules=stages(formats);
             var stages=VkPipelineShaderStageCreateInfo.calloc(2,stack);
-            stages.get(0).sType$Default().stage(VK_SHADER_STAGE_VERTEX_BIT).module(vertex).pName(stack.UTF8("main"));stages.get(1).sType$Default().stage(VK_SHADER_STAGE_FRAGMENT_BIT).module(fragment).pName(stack.UTF8("main"));
+            stages.get(0).sType$Default().stage(VK_SHADER_STAGE_VERTEX_BIT).module(modules.vertex()).pName(stack.UTF8("main"));stages.get(1).sType$Default().stage(VK_SHADER_STAGE_FRAGMENT_BIT).module(modules.fragment()).pName(stack.UTF8("main"));
             var attrs=VkVertexInputAttributeDescription.calloc(consumed.length,stack);
             boolean constants=false;for(int i=0;i<consumed.length;i++){int[] a=consumed[i];boolean fixed=a[4]==2;constants|=fixed;attrs.get(i).location(a[0]).binding(fixed?1:0).format(format(a[1],a[2],a[3]!=0,vertexInputs.get(a[0])!=SpirvVertexInputs.FLOAT)).offset(a[5]);}
             var streams=VkVertexInputBindingDescription.calloc(constants?2:1,stack);streams.get(0).binding(0).stride(stride).inputRate(VK_VERTEX_INPUT_RATE_VERTEX);if(constants)streams.get(1).binding(1).stride(0).inputRate(VK_VERTEX_INPUT_RATE_INSTANCE);
@@ -212,5 +236,5 @@ final class NativeShaderProgram implements AutoCloseable {
     private static int compare(int value){if(value<512||value>519)throw new IllegalArgumentException("Native depth comparison "+value);return value-512;}
     private static int factor(int value){return switch(value){case 0->VK_BLEND_FACTOR_ZERO;case 1->VK_BLEND_FACTOR_ONE;case 768->VK_BLEND_FACTOR_SRC_COLOR;case 769->VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;case 770->VK_BLEND_FACTOR_SRC_ALPHA;case 771->VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;case 772->VK_BLEND_FACTOR_DST_ALPHA;case 773->VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;case 774->VK_BLEND_FACTOR_DST_COLOR;case 775->VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;default->throw new UnsupportedOperationException("Native blend factor "+value);};}
     private static int operation(int value){return switch(value){case 32774->VK_BLEND_OP_ADD;case 32775->VK_BLEND_OP_MIN;case 32776->VK_BLEND_OP_MAX;case 32778->VK_BLEND_OP_SUBTRACT;case 32779->VK_BLEND_OP_REVERSE_SUBTRACT;default->throw new UnsupportedOperationException("Native blend operation "+value);};}
-    @Override public void close(){for(long pipeline:pipelines.values())vkDestroyPipeline(context.device,pipeline,null);pipelines.clear();if(layout!=0)vkDestroyPipelineLayout(context.device,layout,null);if(textureLayout!=0)vkDestroyDescriptorSetLayout(context.device,textureLayout,null);if(vertex!=0)vkDestroyShaderModule(context.device,vertex,null);if(fragment!=0)vkDestroyShaderModule(context.device,fragment,null);}
+    @Override public void close(){for(long pipeline:pipelines.values())vkDestroyPipeline(context.device,pipeline,null);pipelines.clear();for(var modules:stageVariants.values()){if(modules.vertex()!=vertex)vkDestroyShaderModule(context.device,modules.vertex(),null);vkDestroyShaderModule(context.device,modules.fragment(),null);}stageVariants.clear();if(layout!=0)vkDestroyPipelineLayout(context.device,layout,null);if(textureLayout!=0)vkDestroyDescriptorSetLayout(context.device,textureLayout,null);if(vertex!=0)vkDestroyShaderModule(context.device,vertex,null);if(fragment!=0)vkDestroyShaderModule(context.device,fragment,null);}
 }

@@ -6,14 +6,17 @@ import java.util.regex.*;
 
 /** Backend-independent render graph built from the pack's active declarations and effective options. */
 public final class ShaderPackRenderPlan {
-    public record Color(int index,String format,boolean clear,float[] clearColor,float scaleX,float scaleY){
+    public record Color(int index,String format,boolean clear,float[] clearColor,float scaleX,float scaleY,boolean fogClear){
+        public Color(int index,String format,boolean clear,float[] clearColor,float scaleX,float scaleY){this(index,format,clear,clearColor,scaleX,scaleY,false);}
         public Color{clearColor=clearColor.clone();}
         @Override public float[] clearColor(){return clearColor.clone();}
         public int width(int width){return Math.max(1,Math.round(width*scaleX));}
         public int height(int height){return Math.max(1,Math.round(height*scaleY));}
         public boolean integer(){return format.matches(".*\\dU?I");}
     }
-    public record Blend(String source,String destination,String sourceAlpha,String destinationAlpha){ }
+    public record Blend(String source,String destination,String sourceAlpha,String destinationAlpha,boolean enabled){
+        public Blend(String source,String destination,String sourceAlpha,String destinationAlpha){this(source,destination,sourceAlpha,destinationAlpha,true);}
+    }
     /** {@code alphaTest.<program>}: fragments failing {@code alpha <function> reference} are discarded. */
     public record AlphaTest(String function,float reference){ }
     /** {@code alternate} lists buffers sampled from their alternate image when the pass runs; outputs are written to the other image. */
@@ -50,7 +53,10 @@ public final class ShaderPackRenderPlan {
     private static final Set<String> ALPHA_FUNCTIONS=Set.of("NEVER","LESS","EQUAL","LEQUAL","GREATER","NOTEQUAL","GEQUAL","ALWAYS");
     private static final Set<String> FACTORS=Set.of("ZERO","ONE","SRC_COLOR","ONE_MINUS_SRC_COLOR","DST_COLOR","ONE_MINUS_DST_COLOR","SRC_ALPHA","ONE_MINUS_SRC_ALPHA","DST_ALPHA","ONE_MINUS_DST_ALPHA","SRC_ALPHA_SATURATE");
     public ShaderPackRenderPlan(ShaderPack pack,Map<String,String> selected)throws IOException{
-        configuration=new ShaderPackConfiguration(pack,selected);expressions=new ShaderPackExpressions(configuration.properties());ShaderPackOptions options=new ShaderPackOptions(pack);
+        this(pack,new ShaderPackConfiguration(pack,selected));
+    }
+    public ShaderPackRenderPlan(ShaderPack pack,ShaderPackConfiguration configuration){
+        this.configuration=configuration;expressions=new ShaderPackExpressions(configuration.properties());
         Map<String,Map<String,String>> declaredTextures=new TreeMap<>();String noisePath=null;
         for(var entry:configuration.properties().entrySet()){
             String key=entry.getKey(),value=entry.getValue().strip();
@@ -69,7 +75,7 @@ public final class ShaderPackRenderPlan {
                 Set<Integer> mips=new TreeSet<>();
                 for(var source:program.stages().values()){
                     // OptiFine pack metadata is deliberately placed inside block comments in many existing packs.
-                    String active=ShaderPackPreprocessor.active(options.apply(source.text(),configuration.values())).replaceAll("//[^\\r\\n]*"," ");Matcher declarations=DECLARATION.matcher(active);
+                    String active=configuration.active(source).replaceAll("//[^\\r\\n]*"," ");Matcher declarations=DECLARATION.matcher(active);
                     Matcher samplers=SAMPLERS.matcher(active);while(samplers.find())for(String sampler:samplers.group(1).split(",")){int index=colorIndex(sampler.strip());if(index>=0){usedColors.add(index);colors.computeIfAbsent(index,MutableColor::new);}int shadowIndex=shadowColorIndex(sampler.strip());if(shadowIndex>=0)shadowColors.computeIfAbsent(shadowIndex,ShaderPackRenderPlan::shadowColor);}
                     while(declarations.find()){
                         String field=declarations.group(2),value=declarations.group(3).strip();
@@ -84,7 +90,7 @@ public final class ShaderPackRenderPlan {
                         }
                     }
                 }
-                int[] outputs=ShaderPack.drawBuffers(program,options,configuration.values());Set<Integer> flips=new TreeSet<>();
+                int[] outputs=ShaderPack.drawBuffers(program,configuration);Set<Integer> flips=new TreeSet<>();
                 if(outputs.length>8)throw new ShaderPackException(program.name()+": too many simultaneous color outputs");
                 // Shadow-map programs write shadowcolorN; every other program writes colortexN.
                 if(program.phase()==ShaderPack.Phase.SHADOW)for(int target:outputs){if(target<0||target>1)throw new ShaderPackException(program.name()+": shadow color target out of range: "+target);shadowColors.computeIfAbsent(target,ShaderPackRenderPlan::shadowColor);}
@@ -106,7 +112,7 @@ public final class ShaderPackRenderPlan {
             if(noiseResolution<1||noiseResolution>8192)throw new ShaderPackException("Invalid noiseTextureResolution: "+noiseResolution);
             if(!(shadowInterval>=0)||!Float.isFinite(shadowInterval))throw new ShaderPackException("Invalid shadowIntervalSize: "+shadowInterval);
             Map<Integer,Color> shadowImages=new TreeMap<>();shadowColors.forEach((index,color)->shadowImages.put(index,new Color(index,color.format,color.clear,color.color,1,1)));
-            Map<Integer,Color> immutable=new TreeMap<>();colors.forEach((index,color)->{if(!usedColors.contains(index))return;String scale=configuration.properties().get("size.buffer.colortex"+index);if(scale!=null){String[] values=scale.strip().split("\\s+");if(values.length!=2)throw new ShaderPackException("Invalid colortex size: "+scale);color.x=decimal(values[0],"size");color.y=decimal(values[1],"size");if(color.x<=0||color.y<=0||color.x>4||color.y>4)throw new ShaderPackException("Unsupported relative colortex size: "+scale);}if(index==1&&!color.colored)color.color=new float[]{1,1,1,1};immutable.put(index,new Color(index,color.format,color.clear,color.color,color.x,color.y));});
+            Map<Integer,Color> immutable=new TreeMap<>();colors.forEach((index,color)->{if(!usedColors.contains(index))return;String scale=configuration.properties().get("size.buffer.colortex"+index);if(scale!=null){String[] values=scale.strip().split("\\s+");if(values.length!=2)throw new ShaderPackException("Invalid colortex size: "+scale);color.x=decimal(values[0],"size");color.y=decimal(values[1],"size");if(color.x<=0||color.y<=0||color.x>4||color.y>4)throw new ShaderPackException("Unsupported relative colortex size: "+scale);}if(index==1&&!color.colored)color.color=new float[]{1,1,1,1};immutable.put(index,new Color(index,color.format,color.clear,color.color,color.x,color.y,index==0&&!color.colored));});
             Comparator<Pass> order=Comparator.comparingInt((Pass p)->p.source().order()).thenComparing(p->p.source().name());prepare.sort(order);shadows.sort(order);deferred.sort(order);composite.sort(order);
             // Every fullscreen pass starts from the main images; the schedule is static, so it is resolved once here.
             Set<Integer> state=new TreeSet<>();
@@ -131,7 +137,7 @@ public final class ShaderPackRenderPlan {
     public Dimension dimension(String name){Dimension result=dimensions.getOrDefault(name,dimensions.get(""));if(result==null)throw new ShaderPackException("No render graph for "+name);return result;}
     public static int colorIndex(String name){if(ALIASES.containsKey(name))return ALIASES.get(name);if(name.matches("colortex\\d+")){int index=Integer.parseInt(name.substring(8));if(index<32)return index;throw new ShaderPackException("Color target out of range: "+name);}return -1;}
     private Blend blend(String program){
-        String value=configuration.properties().get("blend."+program);if(value==null||value.strip().equals("off"))return null;
+        String value=configuration.properties().get("blend."+program);if(value==null)return null;if(value.strip().equals("off"))return new Blend("ONE","ZERO","ONE","ZERO",false);
         String[] factors=value.strip().split("\\s+");if(factors.length!=4||!FACTORS.containsAll(Arrays.asList(factors)))throw new ShaderPackException("Invalid blend."+program+": "+value);
         return new Blend(factors[0],factors[1],factors[2],factors[3]);
     }

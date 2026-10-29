@@ -170,7 +170,9 @@ final class VulkanContext implements AutoCloseable {
             // Vulkan 1.2 uses extension feature structures, never the promoted Vulkan 1.3 structure.
             long renderingFeatures;
             if (apiVersion >= VK_API_VERSION_1_3) {
-                var enabled = VkPhysicalDeviceVulkan13Features.calloc(stack).sType$Default().dynamicRendering(true).synchronization2(true);
+                var supported13=VkPhysicalDeviceVulkan13Features.calloc(stack).sType$Default();
+                vkGetPhysicalDeviceFeatures2(physical,VkPhysicalDeviceFeatures2.calloc(stack).sType$Default().pNext(supported13.address()));
+                var enabled = VkPhysicalDeviceVulkan13Features.calloc(stack).sType$Default().dynamicRendering(true).synchronization2(true).maintenance4(supported13.maintenance4());
                 if (apiVersion >= VK_API_VERSION_1_4)
                     enabled.pNext(VkPhysicalDeviceVulkan14Features.calloc(stack).sType$Default().pushDescriptor(
                             !Boolean.getBoolean("vulkanforge.disablePushDescriptors")).address());

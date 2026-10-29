@@ -11,6 +11,9 @@ import static org.lwjgl.opengl.GL30.*;
 /** Test-only attachment readback: a colorful sky must not hide missing world geometry. */
 public final class OwnPackDiagnostics {
     @SuppressWarnings("unchecked") public static void capture(Path folder)throws Exception{
+        capture(folder,null);
+    }
+    @SuppressWarnings("unchecked") public static void capture(Path folder,Set<Integer> selected)throws Exception{
         Files.createDirectories(folder);
         var controller=(ShaderPackController<?>)field(ShaderPackRuntime.class,null,"controller");
         var graph=(ShaderPackGraph)controller.active();if(graph==null)return;
@@ -18,6 +21,7 @@ public final class OwnPackDiagnostics {
         StringBuilder report=new StringBuilder();
         try(var state=new ShaderPackState(16)){
             for(var entry:new TreeMap<>(targets).entrySet())for(int side=0;side<2;side++){
+                if(selected!=null&&!selected.contains(entry.getKey()))continue;
                 var source=entry.getValue()[side];
                 try(var target=new ShaderPackTarget(source.width,source.height)){
                     glBindFramebuffer(GL_READ_FRAMEBUFFER,source.framebuffer);glReadBuffer(GL_COLOR_ATTACHMENT0);
@@ -33,6 +37,8 @@ public final class OwnPackDiagnostics {
         }
         var shaders=(Map<String,ShaderInstance>)field(ShaderPackGraph.class,graph,"worldShaders");
         for(var entry:new TreeMap<>(shaders).entrySet()){
+            var value=entry.getValue();var projection=value.getUniform("ProjMat");
+            if(value instanceof ShaderPackWorldShader worldShader&&worldShader.pass.source().phase()!=github.com.gengyoubo.vulkanforge.shaderpack.ShaderPack.Phase.SHADOW&&projection!=null&&Math.abs(projection.getFloatBuffer().get(15))>.0001f)throw new AssertionError("Shadow projection leaked into world program: "+entry.getKey());
             report.append(entry.getKey()).append(" program=").append(entry.getValue().getId()).append('\n');
             for(String name:List.of("ModelViewMat","ProjMat","ChunkOffset")){
                 var uniform=entry.getValue().getUniform(name);if(uniform==null)continue;var data=uniform.getFloatBuffer();float[] values=new float[data.limit()];data.duplicate().position(0).get(values);report.append(name).append('=').append(Arrays.toString(values)).append('\n');

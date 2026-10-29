@@ -27,13 +27,13 @@ public final class ShaderPack {
             Map<String,String> properties=new LinkedHashMap<>();for(String key:raw.stringPropertyNames())properties.put(key,raw.getProperty(key));
             Map<String,Map<String,EnumMap<Stage,String>>> found=new LinkedHashMap<>();found.put("",new LinkedHashMap<>());
             for(String file:archive.files()){Matcher match=ENTRY.matcher(file);if(!match.matches())continue;String dimension=Objects.requireNonNullElse(match.group(1),""),name=match.group(2);found.computeIfAbsent(dimension,unused->new LinkedHashMap<>()).computeIfAbsent(name,unused->new EnumMap<>(Stage.class)).put(Stage.from(match.group(3)),file);}
-            ShaderPackIncludes includes=new ShaderPackIncludes(archive);Map<String,Map<String,Program>> dimensions=new LinkedHashMap<>();
+            ShaderPackIncludes includes=new ShaderPackIncludes(archive);Map<String,ShaderPackIncludes.Source> expanded=new HashMap<>();Map<String,Map<String,Program>> dimensions=new LinkedHashMap<>();
             for(var dimension:found.entrySet()){
                 Map<String,EnumMap<Stage,String>> entries=new LinkedHashMap<>();found.get("").forEach((name,stages)->entries.put(name,new EnumMap<>(stages)));
                 dimension.getValue().forEach((name,stages)->entries.computeIfAbsent(name,unused->new EnumMap<>(Stage.class)).putAll(stages));
                 Map<String,Program> programs=new LinkedHashMap<>();
                 for(var entry:entries.entrySet()){
-                    EnumMap<Stage,ShaderPackIncludes.Source> sources=new EnumMap<>(Stage.class);for(var stage:entry.getValue().entrySet())sources.put(stage.getKey(),includes.expand(stage.getValue()));
+                    EnumMap<Stage,ShaderPackIncludes.Source> sources=new EnumMap<>(Stage.class);for(var stage:entry.getValue().entrySet()){var source=expanded.get(stage.getValue());if(source==null){source=includes.expand(stage.getValue());expanded.put(stage.getValue(),source);}sources.put(stage.getKey(),source);}
                     String name=entry.getKey();programs.put(name,new Program(name,phase(name),order(name),sources,drawBuffers(sources.get(Stage.FRAGMENT))));
                 }
                 dimensions.put(dimension.getKey(),Map.copyOf(programs));
@@ -55,7 +55,10 @@ public final class ShaderPack {
     private static int order(String name){Matcher suffix=Pattern.compile("(?:setup|begin|shadowcomp|prepare|deferred|composite)([0-9]*)(?:_([a-z]))?").matcher(name);if(!suffix.matches())return 0;int index=suffix.group(1).isEmpty()?0:Integer.parseInt(suffix.group(1));return index*32+(suffix.group(2)==null?31:suffix.group(2).charAt(0)-'a');}
     private static int[] drawBuffers(ShaderPackIncludes.Source fragment){
         if(fragment==null)return new int[]{0};
-        Matcher directives=OUTPUTS.matcher(ShaderPackPreprocessor.active(fragment.text()));
+        return drawBuffers(fragment.path(),ShaderPackPreprocessor.active(fragment.text()));
+    }
+    private static int[] drawBuffers(String path,String active){
+        Matcher directives=OUTPUTS.matcher(active);
         String kind=null,declaration=null;
         while(directives.find()){kind=directives.group(1);declaration=directives.group(2).replaceAll("\\s+","");}
         if(kind==null)return new int[]{0};
@@ -65,8 +68,8 @@ public final class ShaderPack {
         }else output=declaration.isEmpty()?new int[0]:Arrays.stream(declaration.split(",")).mapToInt(Integer::parseInt).toArray();
         Set<Integer> used=new HashSet<>();
         for(int value:output){
-            if(value< -1||value>15)throw new ShaderPackException(fragment.path()+": active "+kind+" selects unsupported color target "+value+" (0..15)");
-            if(value>=0&&!used.add(value))throw new ShaderPackException(fragment.path()+": duplicate color target "+value);
+            if(value< -1||value>15)throw new ShaderPackException(path+": active "+kind+" selects unsupported color target "+value+" (0..15)");
+            if(value>=0&&!used.add(value))throw new ShaderPackException(path+": duplicate color target "+value);
         }
         return output;
     }
@@ -74,6 +77,7 @@ public final class ShaderPack {
         var fragment=program.stages().get(Stage.FRAGMENT);if(fragment==null)return new int[]{0};
         return drawBuffers(new ShaderPackIncludes.Source(fragment.path(),options.apply(fragment.text(),values),fragment.sourceNames()));
     }
+    public static int[] drawBuffers(Program program,ShaderPackConfiguration configuration){var fragment=program.stages().get(Stage.FRAGMENT);return fragment==null?new int[]{0}:drawBuffers(fragment.path(),configuration.active(fragment));}
     private static Map<String,String> fallbacks(){
         Map<String,String> result=new HashMap<>();String[][] families={{"basic","line","textured","skybasic"},{"textured","textured_lit","skytextured","clouds","beaconbeam","armor_glint","spidereyes"},{"textured_lit","terrain","item","entities","particles","hand","weather"},{"terrain","terrain_solid","terrain_cutout","damagedblock","block","water"},{"entities","entities_translucent","entities_glowing","lightning"},{"particles","particles_translucent"},{"block","block_translucent"},{"hand","hand_water"}};
         for(String[] family:families)for(int i=1;i<family.length;i++)result.put("gbuffers_"+family[i],"gbuffers_"+family[0]);for(String shadow:new String[]{"solid","cutout","water","entities","block"})result.put("shadow_"+shadow,"shadow");result.put("shadow_lightning","shadow_entities");return Map.copyOf(result);
