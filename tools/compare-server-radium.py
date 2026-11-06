@@ -27,6 +27,7 @@ def main():
     parser.add_argument('--warmup', type=int, default=200)
     parser.add_argument('--samples', type=int, default=600)
     parser.add_argument('--rounds', type=int, default=1)
+    parser.add_argument('--support-ab', action='store_true', help='compare Radium with and without the support-block experiment')
     args = parser.parse_args()
     if args.warmup < 0 or args.samples < 1 or args.rounds < 1:
         parser.error('invalid tick counts')
@@ -41,8 +42,9 @@ def main():
     manifest = {'template_world_sha256': world_hash, 'warmup_ticks': args.warmup,
                 'sample_ticks': args.samples, 'rounds': args.rounds, 'radium_curseforge_file': 9434151,
                 'java_home': os.environ.get('JAVA_HOME'), 'runs': []}
+    labels = ('radium', 'support') if args.support_ab else ('baseline', 'radium')
     cases = [(round_no, name) for round_no in range(1, args.rounds + 1)
-             for name in (('baseline', 'radium') if round_no % 2 else ('radium', 'baseline'))]
+             for name in (labels if round_no % 2 else tuple(reversed(labels)))]
     for round_no, name in cases:
         folder = output / f'round-{round_no:02d}' / name
         folder.mkdir(parents=True)
@@ -58,8 +60,10 @@ def main():
                    '-PserverBaseline.sampleTicks=' + str(args.samples),
                    '-PserverBaseline.stopAfterSample=true', '-PserverBaseline.entityWorkload=true',
                    '-PserverBaseline.jfr', '--console', 'plain']
-        if name == 'radium':
+        if name in ('radium', 'support'):
             command.append('-PserverBaselineRadium')
+        if name == 'support':
+            command.append('-PserverBaseline.supportBlock')
         print(f'Running {name}: {folder}', flush=True)
         with (folder / 'gradle.log').open('w', encoding='utf-8') as log:
             result = subprocess.run(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, timeout=600)
@@ -68,8 +72,11 @@ def main():
         if result.returncode or 'Server baseline complete:' not in logs or 'All dimensions are saved' not in logs or len(csv_files) != 1:
             raise RuntimeError(f'{name} did not complete cleanly; inspect {folder / "gradle.log"}')
         radium_loaded = 'Loaded configuration file for Radium:' in logs
-        if radium_loaded != (name == 'radium'):
+        if radium_loaded != (name in ('radium', 'support')):
             raise RuntimeError(f'{name} has unexpected Radium load status; inspect {folder / "gradle.log"}')
+        support_loaded = 'VulkanForge experimental collision hook installed' in logs
+        if support_loaded != (name == 'support'):
+            raise RuntimeError(f'{name} has unexpected support experiment state; inspect {folder / "gradle.log"}')
         tick_match = re.search(r'Synthetic workload cow ticks: (\d+)', logs)
         expected_entity_ticks = 160 * (args.warmup + args.samples)
         if not tick_match or int(tick_match.group(1)) != expected_entity_ticks:

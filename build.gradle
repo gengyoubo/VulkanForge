@@ -185,7 +185,8 @@ minecraft {
                 property 'mixin.env.remapRefMap', 'true'
                 property 'mixin.env.refMapRemappingFile', project.file('build/createSrgToMcp/output.srg').absolutePath
                 property 'vulkanforge.serverBaseline', 'true'
-                ['warmupTicks', 'sampleTicks', 'stopAfterSample', 'entityWorkload'].each { option ->
+                if (project.hasProperty('serverBaseline.supportBlock')) property 'vulkanforge.experimental.supportBlock', 'true'
+                ['warmupTicks', 'sampleTicks', 'stopAfterSample', 'entityWorkload', 'parity'].each { option ->
                     if (project.hasProperty('serverBaseline.' + option))
                         property 'serverBaseline.' + option, project.property('serverBaseline.' + option)
                 }
@@ -391,10 +392,22 @@ def labJar = project(':vulkan-lab').tasks.named('fatJar')
 tasks.named('processResources', ProcessResources) {
     dependsOn labJar, 'nativeBootstrapJar'
     inputs.property 'version', project.version
+    inputs.property 'supportBlockExperiment', project.hasProperty('serverBaseline.supportBlock')
     filesMatching('META-INF/mods.toml') { expand version: project.version }
+    if (project.hasProperty('serverBaseline.supportBlock')) {
+        from('src/smoke/resources/support_probe.js') { into 'coremods' }
+    }
     from(labJar) { into 'vulkanforge'; rename { 'vulkan-lab.jar' } }
     from(tasks.named('nativeBootstrapJar')) { into 'vulkanforge' }
     from(project(':vulkan-lab').tasks.named('glSpirv')) { into 'assets/vulkanforge/shaders/gl46' }
+    doLast {
+        if (project.hasProperty('serverBaseline.supportBlock')) {
+            def coremodsFile = file("${destinationDir}/META-INF/coremods.json")
+            def coremods = new groovy.json.JsonSlurper().parse(coremodsFile)
+            coremods.vulkanforge_support_probe = 'coremods/support_probe.js'
+            coremodsFile.text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(coremods))
+        }
+    }
 }
 tasks.named('jar', Jar) {
     finalizedBy 'reobfJar'

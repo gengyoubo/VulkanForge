@@ -42,6 +42,7 @@ public final class EntityWorkload {
             cows.add(cow);
         }
         ticks = 0;
+        if (Boolean.getBoolean("serverBaseline.parity")) SupportBlockParity.verify(level, cows.iterator().next(), chunkX, chunkZ);
         VulkanForge.LOGGER.info("Synthetic workload created: {} cows, forced chunk {},{}", cows.size(), chunkX, chunkZ);
     }
 
