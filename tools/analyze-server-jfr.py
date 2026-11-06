@@ -3,9 +3,9 @@ import argparse
 from collections import Counter
 from datetime import datetime
 import json
-import os
 from pathlib import Path
-import subprocess
+
+from jfr_events import iter_events, frame_names
 
 
 def main():
@@ -17,14 +17,9 @@ def main():
     start, end = datetime.fromisoformat(args.start), datetime.fromisoformat(args.end)
     if start.tzinfo is None or end.tzinfo is None or start >= end:
         parser.error('timestamps must have offsets and start must precede end')
-    java_home = os.environ.get('JAVA_HOME')
-    executable = str(Path(java_home) / 'bin' / ('jfr.exe' if os.name == 'nt' else 'jfr')) if java_home else 'jfr'
-    data = subprocess.check_output([executable, 'print', '--json', '--events',
-                                    'jdk.ExecutionSample,jdk.ObjectAllocationSample', str(args.jfr)])
-    events = json.loads(data)['recording']['events']
-    counts = {'jdk.ExecutionSample': Counter(), 'jdk.ObjectAllocationSample': Counter()}
+    counts ={'jdk.ExecutionSample': Counter(), 'jdk.ObjectAllocationSample': Counter()}
     totals = Counter()
-    for event in events:
+    for event in iter_events(args.jfr, 'jdk.ExecutionSample', 'jdk.ObjectAllocationSample'):
         kind, value = event['type'], event['values']
         if kind not in counts:
             continue
@@ -34,14 +29,13 @@ def main():
         if not (start <= timestamp < end) or not thread or thread['javaName'] != 'Server thread' or not trace:
             continue
         totals[kind] += 1
-        methods = {frame['method']['type']['name'] + '.' + frame['method']['name'] for frame in trace['frames']}
-        counts[kind].update(methods)
+        counts[kind].update(set(frame_names(trace)))
     print(json.dumps({'start': args.start, 'end': args.end,
                       'note': 'Inclusive stack sample counts, not CPU time or exact allocation volume.',
                       'execution_samples': totals['jdk.ExecutionSample'],
-                      'execution_inclusive': counts['jdk.ExecutionSample'].most_common(30),
+                      'execution_inclusive': counts['jdk.ExecutionSample'].most_common(150),
                       'allocation_samples': totals['jdk.ObjectAllocationSample'],
-                      'allocation_inclusive': counts['jdk.ObjectAllocationSample'].most_common(30)}, indent=2))
+                      'allocation_inclusive': counts['jdk.ObjectAllocationSample'].most_common(150)}, indent=2))
 
 
 if __name__ == '__main__':

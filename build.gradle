@@ -186,7 +186,11 @@ minecraft {
                 property 'mixin.env.refMapRemappingFile', project.file('build/createSrgToMcp/output.srg').absolutePath
                 property 'vulkanforge.serverBaseline', 'true'
                 if (project.hasProperty('serverBaseline.supportBlock')) property 'vulkanforge.experimental.supportBlock', 'true'
-                ['warmupTicks', 'sampleTicks', 'stopAfterSample', 'entityWorkload', 'parity', 'microbench', 'crossChunk'].each { option ->
+                if (project.hasProperty('serverBaseline.countNodes')) property 'serverBaseline.countNodes', 'true'
+                if (project.hasProperty('serverBaseline.countPhases')) property 'serverBaseline.countPhases', 'true'
+                if (project.hasProperty('serverBaseline.goalDetails')) property 'serverBaseline.goalDetails', 'true'
+                if (project.hasProperty('serverBaseline.mekanismFast')) property 'serverBaseline.mekanismFast', 'true'
+                ['warmupTicks', 'sampleTicks', 'stopAfterSample', 'entityWorkload', 'parity', 'microbench', 'crossChunk', 'aiScenario', 'mekScenario'].each { option ->
                     if (project.hasProperty('serverBaseline.' + option))
                         property 'serverBaseline.' + option, project.property('serverBaseline.' + option)
                 }
@@ -194,6 +198,10 @@ minecraft {
                     def jfrFile = new File(serverBaselineDir, "logs/vulkanforge/server-baseline/profile-${UUID.randomUUID()}.jfr")
                     jfrFile.parentFile.mkdirs()
                     jvmArg "-XX:StartFlightRecording=filename=${jfrFile.absolutePath},settings=profile,dumponexit=true"
+                }
+                if (project.hasProperty('serverBaseline.debugSafepoints')) {
+                    jvmArg '-XX:+UnlockDiagnosticVMOptions'
+                    jvmArg '-XX:+DebugNonSafepoints'
                 }
                 mods { vulkanforge { source sourceSets.smoke } }
             }
@@ -213,6 +221,9 @@ dependencies {
     minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
     // Optional development-only comparison; never included in the production JAR.
     if (project.hasProperty('serverBaselineRadium')) runtimeOnly fg.deobf('curse.maven:radium-re-reforged-1649038:9434151')
+    if (project.hasProperty('serverBaselineCanary')) runtimeOnly fg.deobf('curse.maven:canary-665658:5089991')
+    if (project.hasProperty('serverBaselineChanged')) runtimeOnly fg.deobf('maven.modrinth:pqfVJxqj:3SDIZyYX')
+    if (project.hasProperty('serverBaselineMekanism')) runtimeOnly fg.deobf('maven.modrinth:Ce6I4WUE:uxe1WQp4')
     if (!project.hasProperty('withoutEmbeddium')&&!project.hasProperty('vanillaRendererBench')) implementation fg.deobf("curse.maven:embeddium-908741:5681725")
     // Reference implementation is never part of the production loader/runtime bundle.
     if(project.hasProperty('irisReference')||project.hasProperty('oculusSmoke'))implementation fg.deobf('maven.modrinth:oculus:1.20.1-1.8.0')
@@ -393,18 +404,38 @@ tasks.named('processResources', ProcessResources) {
     dependsOn labJar, 'nativeBootstrapJar'
     inputs.property 'version', project.version
     inputs.property 'supportBlockExperiment', project.hasProperty('serverBaseline.supportBlock')
+    inputs.property 'aiNodeCounting', project.hasProperty('serverBaseline.countNodes')
+    inputs.property 'entityPhaseCounting', project.hasProperty('serverBaseline.countPhases')
+    inputs.property 'goalDetailCounting', project.hasProperty('serverBaseline.goalDetails')
+    inputs.property 'mekanismFrequencyExperiment', project.hasProperty('serverBaseline.mekanismFast')
     filesMatching('META-INF/mods.toml') { expand version: project.version }
     if (project.hasProperty('serverBaseline.supportBlock')) {
         from('src/smoke/resources/support_probe.js') { into 'coremods' }
+    }
+    if (project.hasProperty('serverBaseline.countNodes')) {
+        from('src/smoke/resources/ai_count_nodes.js') { into 'coremods' }
+    }
+    if (project.hasProperty('serverBaseline.countPhases')) {
+        from('src/smoke/resources/entity_phases.js') { into 'coremods' }
+    }
+    if (project.hasProperty('serverBaseline.goalDetails')) {
+        from('src/smoke/resources/goal_details.js') { into 'coremods' }
+    }
+    if (project.hasProperty('serverBaseline.mekanismFast')) {
+        from('src/smoke/resources/mekanism_frequency.js') { into 'coremods' }
     }
     from(labJar) { into 'vulkanforge'; rename { 'vulkan-lab.jar' } }
     from(tasks.named('nativeBootstrapJar')) { into 'vulkanforge' }
     from(project(':vulkan-lab').tasks.named('glSpirv')) { into 'assets/vulkanforge/shaders/gl46' }
     doLast {
-        if (project.hasProperty('serverBaseline.supportBlock')) {
+        if (project.hasProperty('serverBaseline.supportBlock') || project.hasProperty('serverBaseline.countNodes') || project.hasProperty('serverBaseline.countPhases') || project.hasProperty('serverBaseline.goalDetails') || project.hasProperty('serverBaseline.mekanismFast')) {
             def coremodsFile = file("${destinationDir}/META-INF/coremods.json")
             def coremods = new groovy.json.JsonSlurper().parse(coremodsFile)
-            coremods.vulkanforge_support_probe = 'coremods/support_probe.js'
+            if (project.hasProperty('serverBaseline.supportBlock')) coremods.vulkanforge_support_probe = 'coremods/support_probe.js'
+            if (project.hasProperty('serverBaseline.countNodes')) coremods.vulkanforge_ai_nodes = 'coremods/ai_count_nodes.js'
+            if (project.hasProperty('serverBaseline.countPhases')) coremods.vulkanforge_entity_phases = 'coremods/entity_phases.js'
+            if (project.hasProperty('serverBaseline.goalDetails')) coremods.vulkanforge_goal_details = 'coremods/goal_details.js'
+            if (project.hasProperty('serverBaseline.mekanismFast')) coremods.vulkanforge_mekanism_frequency = 'coremods/mekanism_frequency.js'
             coremodsFile.text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(coremods))
         }
     }
