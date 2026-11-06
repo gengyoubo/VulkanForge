@@ -186,7 +186,7 @@ minecraft {
                 property 'mixin.env.refMapRemappingFile', project.file('build/createSrgToMcp/output.srg').absolutePath
                 property 'vulkanforge.serverBaseline', 'true'
                 if (project.hasProperty('serverBaseline.supportBlock')) property 'vulkanforge.experimental.supportBlock', 'true'
-                ['warmupTicks', 'sampleTicks', 'stopAfterSample', 'entityWorkload', 'parity'].each { option ->
+                ['warmupTicks', 'sampleTicks', 'stopAfterSample', 'entityWorkload', 'parity', 'microbench', 'crossChunk'].each { option ->
                     if (project.hasProperty('serverBaseline.' + option))
                         property 'serverBaseline.' + option, project.property('serverBaseline.' + option)
                 }

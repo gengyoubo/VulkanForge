@@ -16,7 +16,8 @@ import java.util.Random;
 /** Compares the experimental path against the original iterator and mapper. */
 final class SupportBlockParity {
     static void verify(ServerLevel level, Entity entity, int cx, int cz) {
-        int x = cx * 16 + 5, z = cz * 16 + 5;
+        int offset = Boolean.getBoolean("serverBaseline.crossChunk") ? 14 : 5;
+        int x = cx * 16 + offset, z = cz * 16 + offset;
         int y = Math.min(level.getMaxBuildHeight() - 5, entity.blockPosition().getY() + 8);
         BlockState[] shapes = {Blocks.STONE.defaultBlockState(), Blocks.AIR.defaultBlockState(),
                 Blocks.OAK_SLAB.defaultBlockState(), Blocks.OAK_FENCE.defaultBlockState(),
@@ -40,17 +41,20 @@ final class SupportBlockParity {
                 Optional<BlockPos> expected = reference(level, entity, box);
                 Optional<BlockPos> actual = level.findSupportingBlock(entity, box);
                 if (!expected.equals(actual)) throw new AssertionError("Support block mismatch at " + box + ": " + expected + " vs " + actual);
+                Optional<BlockPos> candidate = SupportBlockCandidate.find(level, entity, box, null);
+                if (!expected.equals(candidate)) throw new AssertionError("Candidate mismatch at " + box + ": " + expected + " vs " + candidate);
             }
-            if (Boolean.getBoolean("vulkanforge.experimental.supportBlock") && SupportBlockProbe.skippedMoves() == 0)
+            if (Boolean.getBoolean("serverBaseline.parity") && Boolean.getBoolean("vulkanforge.experimental.supportBlock") && SupportBlockProbe.skippedMoves() == 0)
                 throw new AssertionError("Experimental path did not skip any shape moves");
-            VulkanForge.LOGGER.info("SupportBlockParity passed: 2000 mixed-shape queries; skipped moves={}", SupportBlockProbe.skippedMoves());
+            VulkanForge.LOGGER.info("SupportBlockParity passed: 2000 mixed-shape queries, including iterator candidate; skipped moves={}", SupportBlockProbe.skippedMoves());
+            if (Boolean.getBoolean("serverBaseline.microbench")) CollisionMicrobench.run(level, entity, x, y, z);
         } finally {
             entity.setPos(initialPosition);
             for (int i = 0; i < positions.size(); i++) level.setBlock(positions.get(i), old.get(i), 2);
         }
     }
 
-    private static Optional<BlockPos> reference(ServerLevel level, Entity entity, AABB box) {
+    static Optional<BlockPos> reference(ServerLevel level, Entity entity, AABB box) {
         BlockPos best = null;
         double distance = Double.MAX_VALUE;
         BlockCollisions<BlockPos> iter = new BlockCollisions<>(level, entity, box, false, (pos, shape) -> pos);
