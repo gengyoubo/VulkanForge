@@ -97,7 +97,7 @@ minecraft {
                 property 'vulkanforge.startup', fpsMode == 'VK' ? 'VK:V1_4' : fpsMode == 'GL46' ? 'GL:GL_4_6' : 'GL:DEFAULT'
                 property 'vulkanforge.gameFps', fpsMode
                 property 'fps.output', project.file(project.findProperty('fps.output') ?: 'build/reports/game-fps/' + fpsMode).absolutePath
-                ['seconds','warmup','rounds','width','height','distance','cows','items','entityLimit','updates','hudCases','survivalHud'].each { option ->
+                ['seconds','warmup','rounds','width','height','distance','cows','items','entityLimit','updates','hudCases','survivalHud','gl46Cases','occluders','caseWarmup','timeline'].each { option ->
                     if (project.hasProperty('fps.' + option)) property 'fps.' + option, project.property('fps.' + option)
                 }
                 property 'vulkanforge.gl46.profileGpu', 'false'
@@ -139,7 +139,7 @@ minecraft {
             if (project.hasProperty('vulkan13Smoke')) property 'vulkanforge.startup', 'VULKAN:V1_3'
             property 'vulkanforge.directPresent', System.getProperty('vulkanforge.directPresent', 'true')
             property 'vulkanforge.legacyPresent', System.getProperty('vulkanforge.legacyPresent', 'false')
-            ['counterInterval', 'skipEmptyLayers', 'diffState', 'profileGpu', 'profileInterval'].each { option ->
+            ['counterInterval', 'skipEmptyLayers', 'diffState', 'profileGpu', 'profileInterval','profileCpu','cpuProfileInterval','legacyEntityRecords'].each { option ->
                 def key = 'vulkanforge.gl46.' + option
                 if (System.getProperty(key) != null) property key, System.getProperty(key)
             }
@@ -177,7 +177,26 @@ minecraft {
                 mods { vulkanforge { source sourceSets.smoke } }
             }
         }
-        server { args '--nogui' }
+        server {
+            args '--nogui'
+            if (project.hasProperty('serverBaseline')) {
+                def serverBaselineDir = project.file(project.findProperty('serverBaseline.dir') ?: 'run-server-baseline')
+                workingDirectory serverBaselineDir
+                property 'mixin.env.remapRefMap', 'true'
+                property 'mixin.env.refMapRemappingFile', project.file('build/createSrgToMcp/output.srg').absolutePath
+                property 'vulkanforge.serverBaseline', 'true'
+                ['warmupTicks', 'sampleTicks', 'stopAfterSample', 'entityWorkload'].each { option ->
+                    if (project.hasProperty('serverBaseline.' + option))
+                        property 'serverBaseline.' + option, project.property('serverBaseline.' + option)
+                }
+                if (project.hasProperty('serverBaseline.jfr')) {
+                    def jfrFile = new File(serverBaselineDir, "logs/vulkanforge/server-baseline/profile-${UUID.randomUUID()}.jfr")
+                    jfrFile.parentFile.mkdirs()
+                    jvmArg "-XX:StartFlightRecording=filename=${jfrFile.absolutePath},settings=profile,dumponexit=true"
+                }
+                mods { vulkanforge { source sourceSets.smoke } }
+            }
+        }
     }
 }
 repositories {
@@ -191,12 +210,16 @@ repositories {
 configurations { shaderRuntimeMods { transitive=false } }
 dependencies {
     minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
-    if (!project.hasProperty('withoutEmbeddium')) implementation fg.deobf("curse.maven:embeddium-908741:5681725")
+    // Optional development-only comparison; never included in the production JAR.
+    if (project.hasProperty('serverBaselineRadium')) runtimeOnly fg.deobf('curse.maven:radium-re-reforged-1649038:9434151')
+    if (!project.hasProperty('withoutEmbeddium')&&!project.hasProperty('vanillaRendererBench')) implementation fg.deobf("curse.maven:embeddium-908741:5681725")
     // Reference implementation is never part of the production loader/runtime bundle.
     if(project.hasProperty('irisReference')||project.hasProperty('oculusSmoke'))implementation fg.deobf('maven.modrinth:oculus:1.20.1-1.8.0')
-    implementation fg.deobf("curse.maven:chloride-931925:8462759")
-    implementation fg.deobf("curse.maven:magnesium-extras-558905:6041697")
-    implementation fg.deobf("curse.maven:flerovium-1142875:8284677")
+    if(!project.hasProperty('vanillaRendererBench')){
+        implementation fg.deobf("curse.maven:chloride-931925:8462759")
+        implementation fg.deobf("curse.maven:magnesium-extras-558905:6041697")
+        implementation fg.deobf("curse.maven:flerovium-1142875:8284677")
+    }
     nativeBootstrapImplementation 'org.ow2.asm:asm-tree:9.5'
     shaderRuntimeMods 'curse.maven:embeddium-908741:5681725'
 }
@@ -523,6 +546,13 @@ tasks.register('smokeEntityBatchBoundary', JavaExec) {
     dependsOn 'compileSmokeJava', 'processResources'
     classpath = sourceSets.smoke.runtimeClasspath
     mainClass = 'github.com.gengyoubo.vulkanforge.client.GlEntityBatchBoundarySmoke'
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+    systemProperty 'log4j.configurationFile', file('src/smoke/resources/offscreen-log4j2.xml').toURI().toString()
+}
+tasks.register('smokeGl46Records', JavaExec) {
+    dependsOn 'compileSmokeJava', 'processResources'
+    classpath = sourceSets.smoke.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.client.Gl46EntityRecordSmoke'
     javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
     systemProperty 'log4j.configurationFile', file('src/smoke/resources/offscreen-log4j2.xml').toURI().toString()
 }

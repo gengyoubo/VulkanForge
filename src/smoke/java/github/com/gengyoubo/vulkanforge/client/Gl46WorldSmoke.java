@@ -79,10 +79,12 @@ public final class Gl46WorldSmoke {
                     require(GlStateCache.verified() > 0, "State verification never ran");
                     log("PASS GL state cache matched glGet on " + GlStateCache.verified() + " snapshots");
                 }
+                var diagnostic=VulkanPreview.gl46Diagnostics();
+                long entitySamples=Math.max(1,diagnostic.getOrDefault("entityCpuFrames",0L)),terrainSamples=Math.max(1,diagnostic.getOrDefault("terrainCpuFrames",0L));
                 long frames = Math.max(1, stats[0]); // terrain frames: flushes per frame vary with splits
-                log(String.format("CPU entity capture %.1f us/frame (%.2f us/draw), flush %.1f us/frame (%.2f flushes/frame); terrain opaque %.1f us, translucent %.1f us per frame",
-                        entities[5] / 1e3 / frames, entities[5] / 1e3 / Math.max(1, entities[0]), entities[6] / 1e3 / frames, entities[1] / (double) frames,
-                        VulkanPreview.gl46Stats()[9] / 1e3 / Math.max(1, stats[0]), VulkanPreview.gl46Stats()[10] / 1e3 / Math.max(1, stats[0])));
+                log(String.format("CPU sampled entity capture %.1f us/frame (%.2f us/draw), flush %.1f us/frame (%.2f flushes/frame); terrain opaque %.1f us, translucent %.1f us per frame",
+                        entities[5] / 1e3 / entitySamples, entities[5] / 1e3 / Math.max(1, diagnostic.getOrDefault("entityCpuCalls",0L)), entities[6] / 1e3 / entitySamples, entities[1] / (double) frames,
+                        VulkanPreview.gl46Stats()[9] / 1e3 / terrainSamples, VulkanPreview.gl46Stats()[10] / 1e3 / terrainSamples));
                 long[] blockEntities = VulkanPreview.gl46BlockEntityStats(), hook = BlockEntityMeshes.stats();
                 // {cached meshes, recordings, instances drawn, instanced draws, animated, uncacheable, ns per cached call}
                 if (!Boolean.getBoolean("vulkanforge.gl46.noBlockEntityCache"))
@@ -98,8 +100,8 @@ public final class Gl46WorldSmoke {
                         stats[2], cull[1] / (double) cull[0], cull[2] / (double) cull[0], cull[3] / (double) cull[0], 100.0 * cull[3] / Math.max(1, cull[2]),
                         cull[4] / (double) cull[0], cull[7], cull[8]));
                 log("CPU per frame " + VulkanPreview.gl46Timers());
-                log("CPU us/frame breakdown: opaque {snapshot, cull, draws, fence, restore}=" + perFrame(VulkanPreview.gl46Phases(), stats[0])
-                        + " entity flush {snapshot, draws, restore, fences}=" + perFrame(VulkanPreview.gl46EntityPhases(), frames));
+                log("CPU us/sampled-frame breakdown: opaque {snapshot, cull, draws, fence, restore}=" + perFrame(VulkanPreview.gl46Phases(), terrainSamples)
+                        + " entity flush {snapshot, draws, restore, fences}=" + perFrame(VulkanPreview.gl46EntityPhases(), entitySamples));
                 screenshot(mc, "gl46.png");
                 VulkanPreview.toggle();
                 require(!VulkanPreview.gl46World(), "F8 did not turn GL 4.6 terrain off");

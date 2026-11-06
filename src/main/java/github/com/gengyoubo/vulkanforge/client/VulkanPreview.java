@@ -130,6 +130,15 @@ final class VulkanPreview {
         failed.close();
     }
     static long[] gl46EntityStats() { return glEntities != null ? glEntities.stats() : new long[7]; }
+    static Map<String,Long> gl46Diagnostics(){
+        Map<String,Long> out=new java.util.LinkedHashMap<>();if(gl!=null)out.putAll(gl.diagnostics());if(glEntities!=null)out.putAll(glEntities.diagnostics());
+        out.put("worldPublishedMeshes",WORLD.builds());out.put("worldAtlasPatches",WORLD.atlasPatches());out.put("worldLightUpdates",WORLD.lightUpdates());return out;
+    }
+    static void gl46Benchmark(String name){
+        if(!System.getProperty("vulkanforge.gameFps","").equals("GL46")||gl==null||glEntities==null)throw new IllegalStateException("GL46 benchmark unavailable");
+        gl.benchmarkHiZ(!name.equals("HIZ_OFF"));glEntities.benchmark(!name.equals("ADJACENT_RECORDS"),!name.equals("VANILLA_ENTITIES"));
+        Gl46CpuProfiler.benchmark(name.equals("CPU_EVERY_FRAME")?1:name.equals("CPU_OFF")?0:-1);
+    }
     static Map<String, Long> gl46EntityFallbacks() { return glEntities != null ? glEntities.fallbacks() : Map.of(); }
     private static void glFailed(RuntimeException error) {
         VulkanForge.LOGGER.error("OpenGL 4.6 terrain failed; vanilla terrain rendering resumes", error);

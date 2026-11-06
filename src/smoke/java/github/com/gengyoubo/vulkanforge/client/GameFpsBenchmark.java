@@ -38,7 +38,7 @@ public final class GameFpsBenchmark {
     private static final long[] periods=new long[1<<20];
     private static final List<Map<String,Object>> results=new ArrayList<>();
     private static final List<Map<String,Long>> timeline=new ArrayList<>();
-    private static final boolean TIMELINE=Boolean.getBoolean("vulkanforge.nativeProfile");
+    private static final boolean TIMELINE=Boolean.getBoolean("vulkanforge.nativeProfile")||Boolean.getBoolean("fps.timeline");
     private static final long launched=System.nanoTime();
     private static int stage,ticks,count,round;
     private static long warmStart,last,measureStart,presentedStart,startEpoch;
@@ -67,6 +67,7 @@ public final class GameFpsBenchmark {
                 if(mc.getWindow().isFullscreen())mc.getWindow().toggleFullScreen();
                 long handle=mc.getWindow().getWindow();GLFW.glfwRestoreWindow(handle);GLFW.glfwSetWindowAttrib(handle,GLFW.GLFW_DECORATED,GLFW.GLFW_FALSE);
                 GLFW.glfwSetWindowMonitor(handle,0,0,0,WIDTH,HEIGHT,GLFW.GLFW_DONT_CARE);GLFW.glfwFocusWindow(handle);
+                if(MODE.equals("GL46"))require(!net.minecraftforge.fml.ModList.get().isLoaded("embeddium"),"GL46 terrain benchmark requires vanilla chunk meshes: use -PvanillaRendererBench");
                 if(MODE.equals("VK"))require(NativeGameWindow.enabled()&&GLFW.glfwGetCurrentContext()==0,"Native VK absent / GL context exists");
                 else require(!NativeGameWindow.enabled()&&!NativeMainWindow.active(),"GL launch entered Vulkan/hybrid path");
                 String name="FPS "+MODE+" "+System.currentTimeMillis();
@@ -87,6 +88,7 @@ public final class GameFpsBenchmark {
                 scene.put("nativeHotbarCache",Boolean.getBoolean("vulkanforge.nativeHotbarCache"));scene.put("nativeGuiFastPath",Boolean.getBoolean("vulkanforge.nativeGuiFastPath"));scene.put("hudScopeProfiling",Boolean.getBoolean("vulkanforge.hudDiagnostics"));
                 boolean nativeFeatures=Boolean.getBoolean("vulkanforge.nativeModSubmission"),legacyFeatures=Boolean.getBoolean("vulkanforge.nativeLegacyModSubmission");
                 scene.put("nativeModFeatures",Map.of("regionBridge",(nativeFeatures||Boolean.getBoolean("vulkanforge.nativeRegionBridge"))&&!legacyFeatures,"dynamicBatching",(nativeFeatures||Boolean.getBoolean("vulkanforge.nativeDynamicBatching"))&&!legacyFeatures,"chlorideTopK",(nativeFeatures||Boolean.getBoolean("vulkanforge.nativeChlorideTopK"))&&!legacyFeatures));
+                scene.put("gl46CaseOrder",MODE.equals("GL46")?HUD_PLAN:List.of());scene.put("occluders",Boolean.getBoolean("fps.occluders"));scene.put("caseWarmupSeconds",Double.parseDouble(System.getProperty("fps.caseWarmup","6")));scene.put("gl46ProfileGpu",Boolean.getBoolean("vulkanforge.gl46.profileGpu"));scene.put("gl46ProfileCpu",Boolean.getBoolean("vulkanforge.gl46.profileCpu"));
                 scene.put("mods",net.minecraftforge.fml.ModList.get().getMods().stream().collect(java.util.stream.Collectors.toMap(mod->mod.getModId(),mod->mod.getVersion().toString())));
                 if(SURVIVAL_HUD){scene.put("hudCaseOrder",HUD_PLAN);scene.put("playerMode","SURVIVAL_WITH_FLIGHT");scene.put("hotbarSlots",9);scene.put("health",16);scene.put("food",17);}
                 if(net.minecraftforge.fml.ModList.get().isLoaded("chloride")){Object culling=Class.forName("me.srrapero720.chloride.ChlorideConfig").getField("culling").get(null);Map<String,Object> config=new LinkedHashMap<>();for(String key:new String[]{"entityLimit","entities","monsters","entityDistanceX","entityDistanceY","monsterDistanceX","monsterDistanceY"})config.put(key,culling.getClass().getField(key).get(culling));scene.put("chlorideCulling",config);}
@@ -119,14 +121,14 @@ public final class GameFpsBenchmark {
             if(stage==3) {
                 if(pendingHudFrames>0){if(--pendingHudFrames==0){selectHudCase(mc,HUD_PLAN.get(round));warmStart=System.nanoTime();}return;}
                 if(MODE.equals("GL46")&&VulkanPreview.capturedSections()<8){warmStart=now;return;}
-                if((now-warmStart)/1e9<(round==0?WARMUP:3))return;
+                if((now-warmStart)/1e9<(round==0?WARMUP:Double.parseDouble(System.getProperty("fps.caseWarmup","6"))))return;
                 com.mojang.logging.LogUtils.getLogger().info("FPS_MEASURE {} round {}",MODE,round+1);
                 count=0;presentedStart=MODE.equals("VK")?NativeGameWindow.stats()[0]:0;
-                diagnosticsStart=MODE.equals("VK")?NativeGameWindow.diagnostics():Map.of();timeline.clear();if(TIMELINE&&MODE.equals("VK"))sampleTimeline(0);allocatedStart=allocated();cpuStart=threadCpu();
+                diagnosticsStart=MODE.equals("VK")?NativeGameWindow.diagnostics():MODE.equals("GL46")?VulkanPreview.gl46Diagnostics():Map.of();timeline.clear();if(TIMELINE&&(MODE.equals("VK")||MODE.equals("GL46")))sampleTimeline(0);allocatedStart=allocated();cpuStart=threadCpu();
                 startEpoch=System.currentTimeMillis();measureStart=last=System.nanoTime();stage=4;return;
             }
             require(count<periods.length,"Frame sample capacity exceeded");periods[count++]=now-last;last=now;
-            if(TIMELINE&&MODE.equals("VK")&&count%120==0)sampleTimeline(count);
+            if(TIMELINE&&(MODE.equals("VK")||MODE.equals("GL46"))&&count%120==0)sampleTimeline(count);
             if((now-measureStart)/1e9>=SECONDS)finishRound(mc,now);
         }catch(Throwable error){fail(mc,error);}
     }
@@ -136,7 +138,7 @@ public final class GameFpsBenchmark {
         long[] sorted=Arrays.copyOf(periods,count);Arrays.sort(sorted);long total=0;for(long period:sorted)total+=period;
         int slow=Math.max(1,(count+99)/100);long tail=0;for(int i=count-slow;i<count;i++)tail+=sorted[i];
         Map<String,Object> row=new LinkedHashMap<>();row.put("mode",MODE);row.put("round",++round);row.put("frames",count);row.put("seconds",total/1e9);
-        if(!HUD_PLAN.isEmpty()){row.put("hudCase",selectedHud);row.put("hudBlock",1+(round-1)/new HashSet<>(HUD_PLAN).size());}
+        if(!HUD_PLAN.isEmpty()){row.put("hudCase",selectedHud);if(MODE.equals("GL46"))row.put("gl46Case",selectedHud);row.put("hudBlock",1+(round-1)/new HashSet<>(HUD_PLAN).size());}
         row.put("startEpochMs",startEpoch);row.put("endEpochMs",System.currentTimeMillis());
         row.put("fps",count*1e9/total);row.put("onePercentLowFps",slow*1e9/tail);row.put("frameP50Ms",sorted[(count-1)/2]/1e6);
         row.put("frameP95Ms",sorted[(count-1)*95/100]/1e6);row.put("frameP99Ms",sorted[(count-1)*99/100]/1e6);row.put("maxMs",sorted[count-1]/1e6);
@@ -147,18 +149,27 @@ public final class GameFpsBenchmark {
             require(System.getProperty("vulkanforge.forbiddenGlCalls","missing").equals("0"),"Forbidden GL attempt");
             row.put("nativeStats",stats);row.put("openGlContexts",0);row.put("forbiddenGlCalls",0);
             Map<String,Long> delta=new LinkedHashMap<>();NativeGameWindow.diagnostics().forEach((key,value)->delta.put(key,value-diagnosticsStart.getOrDefault(key,0L)));row.put("nativeDiagnostics",delta);
-        }else if(MODE.equals("GL46")){require(VulkanPreview.gl46World(),"GL46 was disabled");row.put("terrainStats",VulkanPreview.gl46Stats());}
+        }else if(MODE.equals("GL46")){require(VulkanPreview.gl46World(),"GL46 was disabled");row.put("terrainStats",VulkanPreview.gl46Stats());
+            Map<String,Long> delta=new LinkedHashMap<>(),last=new LinkedHashMap<>();VulkanPreview.gl46Diagnostics().forEach((key,value)->{if(key.contains("Last"))last.put(key,value);else delta.put(key,value-diagnosticsStart.getOrDefault(key,0L));});row.put("gl46Diagnostics",delta);row.put("gl46LastGpuSamples",last);
+            require(delta.getOrDefault("terrainFrames",0L)>0,"GL46 terrain did not draw");
+            if(selectedHud.equals("HIZ_OFF"))require(delta.get("hizBuilds")==0,"Hi-Z off still built a pyramid");
+            if(selectedHud.equals("HIZ_ON"))require(delta.get("hizBuilds")>0,"Hi-Z on did not run");
+            if(selectedHud.equals("VANILLA_ENTITIES"))require(delta.getOrDefault("entityCaptured",0L)==0,"Vanilla entities case was batched");
+        }
         else require(!VulkanPreview.gl46World(),"Vanilla GL unexpectedly used custom terrain");
         results.add(row);Files.writeString(output.resolve("results.json"),JSON.toJson(results));
         StringBuilder csv=new StringBuilder("frame,period_ns\n");for(int i=0;i<count;i++)csv.append(i).append(',').append(periods[i]).append('\n');
         Files.writeString(output.resolve("round-"+round+".csv"),csv);
-        if(TIMELINE&&MODE.equals("VK")){
+        if(TIMELINE&&(MODE.equals("VK")||MODE.equals("GL46"))){
             sampleTimeline(count);StringBuilder trace=new StringBuilder();List<String> keys=new ArrayList<>(timeline.get(0).keySet());trace.append(String.join(",",keys)).append('\n');
             for(var sample:timeline){for(int i=0;i<keys.size();i++){if(i>0)trace.append(',');trace.append(sample.getOrDefault(keys.get(i),0L));}trace.append('\n');}
             Files.writeString(output.resolve("timeline-"+round+".csv"),trace);
         }
         com.mojang.logging.LogUtils.getLogger().info("FPS_RESULT {}",JSON.toJson(row));
-        if(!HUD_PLAN.isEmpty()&&hudScreenshots.add(selectedHud))NativeGameWindow.captureNext(output.resolve("case-"+selectedHud+".png"));
+        if(!HUD_PLAN.isEmpty()&&hudScreenshots.add(selectedHud)){
+            if(MODE.equals("VK"))NativeGameWindow.captureNext(output.resolve("case-"+selectedHud+".png"));
+            else try(var image=net.minecraft.client.Screenshot.takeScreenshot(mc.getMainRenderTarget())){image.writeToFile(output.resolve("case-"+selectedHud+".png"));}
+        }
         if(round<ROUNDS){warmStart=System.nanoTime();stage=3;if(!HUD_PLAN.isEmpty())pendingHudFrames=2;}
         else {
             if(MODE.equals("VK"))NativeGameWindow.captureNext(output.resolve("screen.png"));
@@ -167,11 +178,11 @@ public final class GameFpsBenchmark {
         }
     }
 
-    private static List<String> hudPlan(){String raw=Boolean.getBoolean("fps.hotbarCompare")?"NO_ITEM_CACHE,ITEM_CACHE":Boolean.getBoolean("fps.guiCompare")?"LEGACY_GUI,FAST_GUI":System.getProperty("fps.hudCases","");if(raw.isBlank())return List.of();List<String> cases=List.of(raw.split(",")),plan=new ArrayList<>();var random=new Random(13013);for(int block=0;block<Integer.getInteger("fps.rounds",3);block++){var order=new ArrayList<>(cases);if(block>0)Collections.shuffle(order,random);plan.addAll(order);}return List.copyOf(plan);}
-    private static void selectHudCase(Minecraft mc,String name){selectedHud=name;if(name.equals("NO_ITEM_CACHE")||name.equals("ITEM_CACHE"))NativeHotbarCache.benchmarkEnabled(name.equals("ITEM_CACHE"));else if(name.equals("LEGACY_GUI")||name.equals("FAST_GUI"))NativeGuiBlitter.benchmarkEnabled(name.equals("FAST_GUI"));else NativeHudDiagnostics.select(name);mc.options.hideGui=name.equals("F1");com.mojang.logging.LogUtils.getLogger().info("HUD_ABLATION_CASE {}",name);}
+    private static List<String> hudPlan(){String raw=MODE.equals("GL46")?System.getProperty("fps.gl46Cases",""):Boolean.getBoolean("fps.hotbarCompare")?"NO_ITEM_CACHE,ITEM_CACHE":Boolean.getBoolean("fps.guiCompare")?"LEGACY_GUI,FAST_GUI":System.getProperty("fps.hudCases","");if(raw.isBlank())return List.of();List<String> cases=List.of(raw.split(",")),plan=new ArrayList<>();var random=new Random(13013);for(int block=0;block<Integer.getInteger("fps.rounds",3);block++){var order=new ArrayList<>(cases);if(block>0)Collections.shuffle(order,random);plan.addAll(order);}return List.copyOf(plan);}
+    private static void selectHudCase(Minecraft mc,String name){selectedHud=name;if(MODE.equals("GL46"))VulkanPreview.gl46Benchmark(name);else if(name.equals("NO_ITEM_CACHE")||name.equals("ITEM_CACHE"))NativeHotbarCache.benchmarkEnabled(name.equals("ITEM_CACHE"));else if(name.equals("LEGACY_GUI")||name.equals("FAST_GUI"))NativeGuiBlitter.benchmarkEnabled(name.equals("FAST_GUI"));else NativeHudDiagnostics.select(name);mc.options.hideGui=name.equals("F1");com.mojang.logging.LogUtils.getLogger().info("HUD_ABLATION_CASE {}",name);}
 
     /** Cumulative counters every 120 frames; GPU samples are collected later at the existing slot fence. No extra waits. */
-    private static void sampleTimeline(int frame){Map<String,Long> sample=new LinkedHashMap<>();sample.put("sampleFrame",(long)frame);sample.put("epochMs",System.currentTimeMillis());sample.putAll(NativeGameWindow.diagnostics());timeline.add(sample);}
+    private static void sampleTimeline(int frame){Map<String,Long> sample=new LinkedHashMap<>();sample.put("sampleFrame",(long)frame);sample.put("epochMs",System.currentTimeMillis());sample.putAll(MODE.equals("VK")?NativeGameWindow.diagnostics():VulkanPreview.gl46Diagnostics());timeline.add(sample);}
 
     private static void buildScene(Minecraft mc) {
         var server=mc.getSingleplayerServer();var uuid=mc.player.getUUID();server.execute(()->{
@@ -183,6 +194,10 @@ public final class GameFpsBenchmark {
             for(int x=-8;x<=-4;x++)for(int z=4;z<=8;z++)level.setBlock(new BlockPos(x,65,z),(x==-8||x==-4||z==4||z==8?Blocks.STONE_BRICKS:Blocks.WATER).defaultBlockState(),3);
             for(int x=-1;x<=1;x++)for(int y=65;y<=66;y++)level.setBlock(new BlockPos(x,y,7),Blocks.LIGHT_BLUE_STAINED_GLASS.defaultBlockState(),3);
             level.setBlock(new BlockPos(3,65,6),Blocks.CHEST.defaultBlockState(),3);
+            if(Boolean.getBoolean("fps.occluders")){
+                for(int x=-16;x<=16;x++)for(int y=65;y<85;y++)level.setBlock(new BlockPos(x,y,1),Blocks.STONE_BRICKS.defaultBlockState(),3);
+                for(int x=-16;x<=16;x+=4)for(int z=-8;z>=-80;z-=4)for(int y=65;y<69;y++)level.setBlock(new BlockPos(x,y,z),Blocks.STONE.defaultBlockState(),3);
+            }
             for(int i=0;i<COWS;i++){int x=-9+(i/6%10)*2,z=-3-i%6*2;var cow=net.minecraft.world.entity.EntityType.COW.spawn(level,new BlockPos(x,65+i/60,z),net.minecraft.world.entity.MobSpawnType.COMMAND);if(cow!=null){cow.setNoAi(true);cow.setYRot(x*9);}}
             for(int i=0;i<ITEMS;i++){var stack=new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.DIAMOND);stack.getOrCreateTag().putInt("VulkanForgeBenchId",i);var item=new net.minecraft.world.entity.item.ItemEntity(level,-8+(i%16),66+(i/16%4)*.25,-2-(i/64),stack);item.setNoGravity(true);item.setDeltaMovement(net.minecraft.world.phys.Vec3.ZERO);item.setUnlimitedLifetime();level.addFreshEntity(item);}
             var player=server.getPlayerList().getPlayer(uuid);player.teleportTo(level,.5,68,11,180,18);player.getAbilities().flying=true;player.onUpdateAbilities();

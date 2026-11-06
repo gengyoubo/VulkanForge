@@ -123,6 +123,8 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
     private long vanillaMarked;
     /** Previous frame's depth pyramid (R32F, max of 2x2) and the camera it was built with. */
     private static final boolean HIZ = !Boolean.getBoolean("vulkanforge.gl46.noHiZ");
+    private boolean benchmarkHiZ=true,cpuSample;
+    private long cpuFrames;
     private static final float MAX_TURN_DEGREES = 10, MAX_MOVE_BLOCKS = 2, MAX_PROJECTION_CHANGE = .02f;
     private int pyramid, pyramidWidth, pyramidHeight, pyramidLevels, pyramidParameters, readback, readbackFrame;
     private int depthWidth, depthHeight;
@@ -377,13 +379,14 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
     boolean drawOpaque(int atlas, int light) {
         uploads.flush(); // this frame's section uploads, before anything reads them
         if (!ready()) return false;
+        cpuSample=Gl46CpuProfiler.sample(frameCount);if(cpuSample)cpuFrames++;
         if (slotCount == 0) { frameCount++; return true; }
-        long start = System.nanoTime();
+        long start = Gl46CpuProfiler.stamp(cpuSample);
         Gl46State saved = new Gl46State();
-        long t1 = System.nanoTime(), t2 = t1, t3 = t1;
+        long t1 = Gl46CpuProfiler.stamp(cpuSample), t2 = t1, t3 = t1;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             prepareCounts();
-            cullGpu.begin();
+            cullGpu.begin(frameCount);
             bindFrame(atlas, light, CUTOFF[0], mipSampler);
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, drawBuffer);
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, countBuffer);
@@ -398,8 +401,8 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
             glMemoryBarrier(GL_COMMAND_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
             cullGpu.end();
             glBindTextureUnit(2, light); glBindSampler(2, lightSampler); // the pyramid sat on unit 2 for the cull
-            t2 = System.nanoTime();
-            drawsGpu.begin();
+            t2 = Gl46CpuProfiler.stamp(cpuSample);
+            drawsGpu.begin(frameCount);
             glUseProgram(opaque.id());
             bindVertexArray(opaqueVao);
             glBindBuffer(GL_DRAW_INDIRECT_BUFFER, drawBuffer);
@@ -413,18 +416,18 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
                 glMultiDrawElementsIndirectCount(GL_TRIANGLES, GL_UNSIGNED_INT, (long) layer * MAX_SECTIONS * COMMAND_BYTES, layer * 4L, slotCount, COMMAND_BYTES);
                 opaqueLayerCalls++;
             }
-            t3 = System.nanoTime();
+            t3 = Gl46CpuProfiler.stamp(cpuSample);
             drawsGpu.end();
             collectCounts();
             frames.submit();
         } finally {
             cullGpu.end(); drawsGpu.end();
-            long t4 = System.nanoTime();
+            long t4 = Gl46CpuProfiler.stamp(cpuSample);
             saved.close();
-            long t5 = System.nanoTime();
+            long t5 = Gl46CpuProfiler.stamp(cpuSample);
             phases[0] += t1 - start; phases[1] += t2 - t1; phases[2] += t3 - t2; phases[3] += t4 - t3; phases[4] += t5 - t4;
         }
-        long spent = System.nanoTime() - start;
+        long spent = Gl46CpuProfiler.elapsed(start);
         opaqueNanos += spent; opaqueTimer.add(spent); opaqueTimer.frame();
         frameCount++;
         checkErrors("opaque");
@@ -584,7 +587,7 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
         return true;
     }
     private boolean occlusionUsable() {
-        if (pyramid == 0 || previousCamera == null || previousEpoch != epoch) return false;
+        if (!benchmarkHiZ || pyramid == 0 || previousCamera == null || previousEpoch != epoch) return false;
         double dx = camera.x() - previousCamera.x(), dy = camera.y() - previousCamera.y(), dz = camera.z() - previousCamera.z();
         if (dx * dx + dy * dy + dz * dz > MAX_MOVE_BLOCKS * MAX_MOVE_BLOCKS) return false;
         if (Math.abs(net.minecraft.util.Mth.wrapDegrees(yaw - previousYaw)) > MAX_TURN_DEGREES || Math.abs(pitch - previousPitch) > MAX_TURN_DEGREES) return false;
@@ -593,7 +596,7 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
     }
     /** Sampled telemetry only. Never waits and never controls any draw's visible count. 0 disables sampling. */
     private void prepareCounts() {
-        long start = System.nanoTime();
+        long start = Gl46CpuProfiler.stamp(cpuSample);
         pollCounts();
         long frame = counterFrames++;
         counterSlot = -1;
@@ -604,16 +607,16 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
             }
             if (counterSlot < 0) counterBusyDrops++;
         }
-        counterCpu.add(System.nanoTime() - start);
+        counterCpu.add(Gl46CpuProfiler.elapsed(start));
     }
     private void collectCounts() {
-        long start = System.nanoTime();
+        long start = Gl46CpuProfiler.stamp(cpuSample);
         if (counterSlot >= 0) {
             GlCompat.copyCounterReadback(countBuffer, readback, counterSlot * 32L, COUNT_BYTES);
             counterFences[counterSlot] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
             readbackFrame = (counterSlot + 1) % READBACK_SLOTS; counterCopies++;
         }
-        counterCpu.add(System.nanoTime() - start); counterCpu.frame();
+        counterCpu.add(Gl46CpuProfiler.elapsed(start)); counterCpu.frame();
     }
     private void pollCounts() {
         for (int slot = 0; slot < READBACK_SLOTS; slot++) {
@@ -643,8 +646,8 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
      * no entity has drawn yet. Builds next frame's occluder pyramid from it.
      */
     void buildHiZ(int depthTexture, int width, int height) {
-        if (hiz == null || !ready() || width <= 0 || height <= 0) return;
-        long start = System.nanoTime();
+        if (!benchmarkHiZ || hiz == null || !ready() || width <= 0 || height <= 0) return;
+        long start = Gl46CpuProfiler.stamp(cpuSample);
         int levelWidth = (width + 1) / 2, levelHeight = (height + 1) / 2;
         if (pyramid == 0 || depthWidth != width || depthHeight != height) {
             depthWidth = width; depthHeight = height;
@@ -668,7 +671,7 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
             previousCamera = null; // a pyramid of another size never describes the next frame
         }
         try (Gl46State ignored = new Gl46State()) {
-            hizGpu.begin();
+            hizGpu.begin(frameCount-1);
             glUseProgram(hiz.id());
             glBindSampler(0, 0);
             glBindTextureUnit(0, depthTexture);
@@ -686,12 +689,21 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
         } finally { hizGpu.end(); }
         previousCamera = camera; previousEpoch = epoch; previousYaw = yaw; previousPitch = pitch;
         System.arraycopy(projection, 0, previousProjection, 0, 16);
-        hizBuilds++; long spent = System.nanoTime() - start; hizNanos += spent; hizCpu.sample(spent);
+        hizBuilds++; long spent = Gl46CpuProfiler.elapsed(start); hizNanos += spent;if(start!=0)hizCpu.sample(spent);
         checkErrors("hiz");
     }
     /** {cull frames, tested (vanilla-visible), frustumVisible, occluded, layerDraws, vanillaMarked, hizBuilds, hizFrames, hizSkipped}. */
     long[] cullStats() {
         return new long[]{culling[0], culling[1], culling[2], culling[3], culling[4], vanillaMarked, hizBuilds, hizFrames, hizSkipped};
+    }
+
+    void benchmarkHiZ(boolean enabled){if(benchmarkHiZ!=enabled)previousCamera=null;benchmarkHiZ=enabled;}
+    Map<String,Long> diagnostics(){
+        Map<String,Long> out=new LinkedHashMap<>();
+        out.put("terrainFrames",frameCount);out.put("terrainCpuFrames",cpuFrames);out.put("terrainOpaqueNs",opaqueNanos);out.put("terrainTranslucentNs",translucentNanos);out.put("hizBuilds",hizBuilds);out.put("hizCpuNs",hizNanos);out.put("hizDispatches",hizDispatches);out.put("hizBarriers",hizBarriers);
+        out.put("cullSamples",culling[0]);out.put("cullTested",culling[1]);out.put("cullFrustum",culling[2]);out.put("cullOccluded",culling[3]);out.put("cullLayerDraws",culling[4]);out.put("terrainIndirectCalls",opaqueLayerCalls);out.put("terrainMeshes",meshes);
+        out.put("terrainUploadBytes",vertices.uploadedBytes()+indices.uploadedBytes());out.put("terrainStagingWaitNs",uploads.staging.stats()[2]);
+        out.putAll(cullGpu.diagnostics("gpuCull"));out.putAll(drawsGpu.diagnostics("gpuIndirect"));out.putAll(hizGpu.diagnostics("gpuHiz"));return out;
     }
 
     long[] growStats() { return vertices != null ? vertices.growStats() : new long[3]; }
@@ -761,8 +773,8 @@ final class Gl46Terrain implements WorldSink, AutoCloseable {
             }
             frames.submit(); commands.submit();
         }
-        long spent = System.nanoTime() - start;
-        translucentNanos += spent; translucentTimer.add(spent); translucentTimer.frame();
+        long spent = cpuSample?System.nanoTime() - start:0;
+        if(cpuSample){translucentNanos += spent;translucentTimer.sample(spent);}
         // GPU path: candidate draws before on-device culling (the visible count is not read back).
         translucentFrames++; translucentDraws += ordered.size();
         checkErrors("translucent");

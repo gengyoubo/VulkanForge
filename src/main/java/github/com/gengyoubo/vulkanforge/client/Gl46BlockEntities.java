@@ -76,7 +76,7 @@ final class Gl46BlockEntities implements AutoCloseable {
     private java.nio.FloatBuffer instanceFloats;
     private long uploadedBytes, ringGrows;
     private int vao, vaoBuffer;
-    private long instancesDrawn, instancedDraws, animated, uncacheable, recordings, cachedNanos, cachedCalls;
+    private long instancesDrawn, instancedDraws, animated, uncacheable, recordings, cachedNanos, cachedCalls, sampledCalls;
 
     Gl46BlockEntities(Gl46Entities owner, int quadIndices) {
         this.owner = owner;
@@ -100,7 +100,7 @@ final class Gl46BlockEntities implements AutoCloseable {
     /** True when the block entity became an instance; false: vanilla must render it. */
     boolean render(BlockEntityRenderer<?> renderer, BlockEntity entity, float partial, PoseStack stack, int light, int overlay) {
         if (renderer.getClass() != ChestRenderer.class || entity.getLevel() == null || !(entity instanceof LidBlockEntity lid)) return false;
-        long start = System.nanoTime();
+        long start = Gl46CpuProfiler.stamp(owner.cpuSampled());
         BlockState state = entity.getBlockState();
         if (!(state.getBlock() instanceof AbstractChestBlock<?> block)) return false;
         // ChestRenderer's own inputs: openness and light through the double-chest combiner.
@@ -118,7 +118,7 @@ final class Gl46BlockEntities implements AutoCloseable {
         stack.last().pose().get(pose);
         stack.last().normal().get(normal);
         for (Part part : parts) add(part, combinedLight, overlay);
-        cachedNanos += System.nanoTime() - start; cachedCalls++;
+        cachedNanos += Gl46CpuProfiler.elapsed(start);cachedCalls++;if(start!=0)sampledCalls++;
         return true;
     }
 
@@ -249,11 +249,11 @@ final class Gl46BlockEntities implements AutoCloseable {
 
     /** {cached meshes, recordings, instances drawn, instanced draws, animated (vanilla), uncacheable (vanilla), cached-path ns per call}. */
     long[] stats() {
-        return new long[]{meshes.size(), recordings, instancesDrawn, instancedDraws, animated, uncacheable, cachedCalls == 0 ? 0 : cachedNanos / cachedCalls};
+        return new long[]{meshes.size(), recordings, instancesDrawn, instancedDraws, animated, uncacheable, sampledCalls == 0 ? 0 : cachedNanos / sampledCalls};
     }
 
     @Override public void close() {
-        if (arena != null) Gl46Context.report("BLOCK_ENTITY_CLOSE {meshes,recordings,instances,instancedDraws,animated,uncacheable,nsPerCall}=" + Arrays.toString(stats()));
+        if (arena != null) Gl46Context.report("BLOCK_ENTITY_CLOSE {meshes,recordings,instances,instancedDraws,animated,uncacheable,nsPerSampledCall}=" + Arrays.toString(stats()));
         if (instances != null) Gl46Context.report("BLOCK_ENTITY_UPLOADS bytes=" + uploadedBytes + " ringGrows=" + ringGrows + " ring=" + Arrays.toString(instances.stats()));
         active.clear(); meshes.clear();
         if (program != null) glDeleteProgram(program.id());

@@ -11,8 +11,13 @@ final class Gl46GpuTimer implements AutoCloseable {
     private final Gl46Timer elapsed = new Gl46Timer();
     private int current = -1, next;
     private long attempts, dropped, total;
+    private final long[] tags=new long[8];
+    private long lastTag=-1,lastNanos;
 
     void begin() {
+        begin(-1);
+    }
+    void begin(long frame) {
         if (!ENABLED) return;
         poll();
         if (attempts++ % INTERVAL != 0) return;
@@ -21,6 +26,7 @@ final class Gl46GpuTimer implements AutoCloseable {
             if (pending[slot]) continue;
             if (queries[slot][0] == 0) glGenQueries(queries[slot]);
             current = slot; next = (slot + 1) % pending.length;
+            tags[slot]=frame;
             glQueryCounter(queries[slot][0], GL_TIMESTAMP);
             return;
         }
@@ -38,7 +44,13 @@ final class Gl46GpuTimer implements AutoCloseable {
             if (!pending[slot] || glGetQueryObjecti(queries[slot][1], GL_QUERY_RESULT_AVAILABLE) == 0) continue;
             long nanos = glGetQueryObjectui64(queries[slot][1], GL_QUERY_RESULT) - glGetQueryObjectui64(queries[slot][0], GL_QUERY_RESULT);
             elapsed.sample(nanos); total += nanos; pending[slot] = false;
+            if(tags[slot]>=lastTag){lastTag=tags[slot];lastNanos=nanos;}
         }
+    }
+
+    java.util.Map<String,Long> diagnostics(String prefix){
+        if(ENABLED)poll();
+        return java.util.Map.of(prefix+"Samples",elapsed.frames(),prefix+"TotalNs",total,prefix+"LastFrame",lastTag,prefix+"LastNs",lastNanos,prefix+"Dropped",dropped);
     }
 
     @Override public String toString() {

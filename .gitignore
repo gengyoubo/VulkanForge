@@ -3,6 +3,7 @@
 *.iml
 **/build/
 run/
+run-server-baseline/
 run-native/
 run-gl46/
 run-fps/
