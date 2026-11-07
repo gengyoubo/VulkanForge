@@ -1,0 +1,20 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+[[mods]]
+modId="vf_ae2_controller_probe"
+version="0.0.1"
+displayName="VulkanForge AE2 Controller Experiment"
+description='''Temporary, property-controlled development experiment.'''
+[[dependencies.vf_ae2_controller_probe]]
+modId="ae2"
+mandatory=true
+versionRange="[15.4.12,15.4.13)"
+ordering="AFTER"
+side="BOTH"
+[[dependencies.vf_ae2_controller_probe]]
+modId="ae2_overclocked"
+mandatory=true
+versionRange="[1.2.3-fix3]"
+ordering="AFTER"
+side="BOTH"

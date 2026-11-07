@@ -18,6 +18,10 @@ sourceSets {
         runtimeClasspath += output + compileClasspath
     }
     nativeBootstrap { }
+    ae2Experiment {
+        compileClasspath += sourceSets.main.compileClasspath
+        runtimeClasspath += output + compileClasspath
+    }
     nativeBootstrapTest {
         compileClasspath += sourceSets.nativeBootstrap.output + sourceSets.nativeBootstrap.runtimeClasspath
         runtimeClasspath += output + compileClasspath
@@ -190,6 +194,8 @@ minecraft {
                 if (project.hasProperty('serverBaseline.countPhases')) property 'serverBaseline.countPhases', 'true'
                 if (project.hasProperty('serverBaseline.goalDetails')) property 'serverBaseline.goalDetails', 'true'
                 if (project.hasProperty('serverBaseline.mekanismFast')) property 'serverBaseline.mekanismFast', 'true'
+                if (project.hasProperty('serverBaseline.transferCache')) property 'serverBaseline.transferCache', 'true'
+                if (project.hasProperty('serverBaseline.ae2ControllerReflection')) property 'serverBaseline.ae2ControllerReflection', 'true'
                 ['warmupTicks', 'sampleTicks', 'stopAfterSample', 'entityWorkload', 'parity', 'microbench', 'crossChunk', 'aiScenario', 'mekScenario'].each { option ->
                     if (project.hasProperty('serverBaseline.' + option))
                         property 'serverBaseline.' + option, project.property('serverBaseline.' + option)
@@ -224,6 +230,11 @@ dependencies {
     if (project.hasProperty('serverBaselineCanary')) runtimeOnly fg.deobf('curse.maven:canary-665658:5089991')
     if (project.hasProperty('serverBaselineChanged')) runtimeOnly fg.deobf('maven.modrinth:pqfVJxqj:3SDIZyYX')
     if (project.hasProperty('serverBaselineMekanism')) runtimeOnly fg.deobf('maven.modrinth:Ce6I4WUE:uxe1WQp4')
+    if (project.hasProperty('serverBaselineAe2Fixture')) {
+        runtimeOnly fg.deobf('maven.modrinth:vf-local-ae2:15.4.12')
+        runtimeOnly fg.deobf('maven.modrinth:vf-local-ae2oc:1.2.3-fix3')
+        runtimeOnly fg.deobf('maven.modrinth:vf-local-guideme:20.1.15')
+    }
     if (!project.hasProperty('withoutEmbeddium')&&!project.hasProperty('vanillaRendererBench')) implementation fg.deobf("curse.maven:embeddium-908741:5681725")
     // Reference implementation is never part of the production loader/runtime bundle.
     if(project.hasProperty('irisReference')||project.hasProperty('oculusSmoke'))implementation fg.deobf('maven.modrinth:oculus:1.20.1-1.8.0')
@@ -273,6 +284,36 @@ tasks.register('smokeNativeBuffers', JavaExec) {
     classpath = sourceSets.smoke.runtimeClasspath
     mainClass = 'github.com.gengyoubo.vulkanforge.client.NativeBuffersSmoke'
     systemProperty 'vulkanforge.nativeBootstrap', 'true'
+}
+
+tasks.register('benchmarkChunkSaveSimulation', JavaExec) {
+    dependsOn 'smokeClasses'
+    classpath = sourceSets.smoke.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.server.ChunkSaveSimulation'
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+    jvmArgs '-Xms512m', '-Xmx512m'
+    args layout.buildDirectory.dir('reports/chunk-save-simulation/tmp').get().asFile.absolutePath
+}
+
+tasks.register('benchmarkTransferReflectionSimulation', JavaExec) {
+    dependsOn 'smokeClasses'
+    classpath = sourceSets.smoke.runtimeClasspath
+    mainClass = 'github.com.gengyoubo.vulkanforge.server.TransferReflectionSimulation'
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+    jvmArgs '-Xms512m', '-Xmx512m'
+}
+
+// Standalone test artifact for a disposable instance; it is not bundled into VulkanForge.
+tasks.register('ae2ControllerExperimentJar', Jar) {
+    dependsOn 'smokeClasses', 'ae2ExperimentClasses'
+    archiveFileName = 'vf-ae2-controller-experiment.jar'
+    destinationDirectory = layout.buildDirectory.dir('reports/ae2-controller-reflection/artifact')
+    from(sourceSets.ae2Experiment.output)
+    from(sourceSets.main.output.classesDirs) {
+        include 'github/com/gengyoubo/vulkanforge/ae2experiment/Ae2ControllerReflectionFastPath*.class'
+    }
+    from('src/smoke/ae2-experiment')
+    from('src/main/resources/coremods/ae2_controller_reflection.js') { into 'coremods' }
 }
 
 tasks.register('smokeShaderPack', JavaExec) {
@@ -408,6 +449,8 @@ tasks.named('processResources', ProcessResources) {
     inputs.property 'entityPhaseCounting', project.hasProperty('serverBaseline.countPhases')
     inputs.property 'goalDetailCounting', project.hasProperty('serverBaseline.goalDetails')
     inputs.property 'mekanismFrequencyExperiment', project.hasProperty('serverBaseline.mekanismFast')
+    inputs.property 'mekanismTransferCacheExperiment', project.hasProperty('serverBaseline.transferCache')
+    inputs.property 'ae2ControllerReflectionExperiment', project.hasProperty('serverBaseline.ae2ControllerReflection')
     filesMatching('META-INF/mods.toml') { expand version: project.version }
     if (project.hasProperty('serverBaseline.supportBlock')) {
         from('src/smoke/resources/support_probe.js') { into 'coremods' }
@@ -424,11 +467,14 @@ tasks.named('processResources', ProcessResources) {
     if (project.hasProperty('serverBaseline.mekanismFast')) {
         from('src/smoke/resources/mekanism_frequency.js') { into 'coremods' }
     }
+    if (project.hasProperty('serverBaseline.transferCache')) {
+        from('src/smoke/resources/mekanism_transfer_cache.js') { into 'coremods' }
+    }
     from(labJar) { into 'vulkanforge'; rename { 'vulkan-lab.jar' } }
     from(tasks.named('nativeBootstrapJar')) { into 'vulkanforge' }
     from(project(':vulkan-lab').tasks.named('glSpirv')) { into 'assets/vulkanforge/shaders/gl46' }
     doLast {
-        if (project.hasProperty('serverBaseline.supportBlock') || project.hasProperty('serverBaseline.countNodes') || project.hasProperty('serverBaseline.countPhases') || project.hasProperty('serverBaseline.goalDetails') || project.hasProperty('serverBaseline.mekanismFast')) {
+        if (project.hasProperty('serverBaseline.supportBlock') || project.hasProperty('serverBaseline.countNodes') || project.hasProperty('serverBaseline.countPhases') || project.hasProperty('serverBaseline.goalDetails') || project.hasProperty('serverBaseline.mekanismFast') || project.hasProperty('serverBaseline.transferCache') || project.hasProperty('serverBaseline.ae2ControllerReflection')) {
             def coremodsFile = file("${destinationDir}/META-INF/coremods.json")
             def coremods = new groovy.json.JsonSlurper().parse(coremodsFile)
             if (project.hasProperty('serverBaseline.supportBlock')) coremods.vulkanforge_support_probe = 'coremods/support_probe.js'
@@ -436,6 +482,7 @@ tasks.named('processResources', ProcessResources) {
             if (project.hasProperty('serverBaseline.countPhases')) coremods.vulkanforge_entity_phases = 'coremods/entity_phases.js'
             if (project.hasProperty('serverBaseline.goalDetails')) coremods.vulkanforge_goal_details = 'coremods/goal_details.js'
             if (project.hasProperty('serverBaseline.mekanismFast')) coremods.vulkanforge_mekanism_frequency = 'coremods/mekanism_frequency.js'
+            if (project.hasProperty('serverBaseline.transferCache')) coremods.vulkanforge_mekanism_transfer_cache = 'coremods/mekanism_transfer_cache.js'
             coremodsFile.text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(coremods))
         }
     }

@@ -7,5 +7,6 @@
   "vulkanforge_post": "coremods/post.js",
   "vulkanforge_render_targets": "coremods/render_targets.js",
   "vulkanforge_tail_diagnostics": "coremods/tail_diagnostics.js",
-  "vulkanforge_shader_packs": "coremods/shader_packs.js"
+  "vulkanforge_shader_packs": "coremods/shader_packs.js",
+  "vulkanforge_ae2_controller_reflection": "coremods/ae2_controller_reflection.js"
 }
